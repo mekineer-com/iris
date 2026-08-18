@@ -1,6 +1,5 @@
 import {describe, expect, test} from "bun:test"
 
-import {MockProvider} from "./MockProvider"
 import {SessionController} from "./SessionController"
 
 type Snapshot = {mode: string; connection: string; lastError: string | null}
@@ -101,7 +100,8 @@ describe("SessionController", () => {
     session.micHandler?.({data: silentPcm()})
     session.micHandler?.({data: silentPcm()})
     session.micHandler?.({data: silentPcm()})
-    await new Promise((resolve) => setTimeout(resolve, 0))
+    await Promise.resolve()
+    await Promise.resolve()
     expect(session.streams.length).toBe(2)
     expect(session.streams[1]?.writes.length).toBe(1)
     await session.handlers["openalma:stop"]({})
@@ -114,7 +114,7 @@ describe("SessionController", () => {
     const session = new FakeSession()
     const controller = new SessionController(session as never, {
       watchdogMs: 5000,
-      provider: new MockProvider({loopbackAfterFrames: 1}),
+      loopbackAfterFrames: 1,
     })
     controller.start()
     await session.handlers["openalma:start"]({mode: "continuous"})
@@ -211,7 +211,7 @@ describe("SessionController", () => {
     const session = new FakeSession()
     const controller = new SessionController(session as never, {
       watchdogMs: 5000,
-      provider: new MockProvider({loopbackAfterFrames: 1}),
+      loopbackAfterFrames: 1,
     })
     controller.start()
     await session.handlers["openalma:start"]({mode: "continuous"})

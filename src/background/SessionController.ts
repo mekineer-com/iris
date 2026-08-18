@@ -3,9 +3,7 @@ import type {MiniappSession, UnsubscribeFn} from "@mentra/miniapp/background"
 import type {Channels} from "../shared/channels"
 import type {ConnectionState, EarconName, SessionMode, SessionSnapshot} from "../shared/types"
 import {approxBase64ByteLength} from "./audioHelpers"
-import {EARCON_SAMPLE_RATE, EARCONS} from "./earcons"
-import type {LiveProvider} from "./liveProvider"
-import {MockProvider} from "./MockProvider"
+import {EARCON_SAMPLE_RATE, EARCONS, LOOPBACK_PCM} from "./earcons"
 
 type Send = <C extends keyof Channels & string>(channel: C, payload: Channels[C]) => void
 
@@ -17,7 +15,7 @@ type SpeakerWriter = {
 
 export type SessionControllerOptions = {
   watchdogMs?: number
-  provider?: LiveProvider
+  loopbackAfterFrames?: number
 }
 
 const ACTIVE: ReadonlySet<ConnectionState> = new Set(["starting", "listening", "speaking"])
@@ -37,20 +35,19 @@ export class SessionController {
   private speakerOpenPromise: Promise<SpeakerWriter | null> | null = null
   private micUnsub: UnsubscribeFn | null = null
   private firstPcmTimeout: ReturnType<typeof setTimeout> | null = null
-  private sawMicFrame = false
-  private writeInFlight = false
-  private audioEnded = false
+  private micFrames = 0
+  private loopbackStarted = false
   private disconnectedPlayed = false
   private teardownKind: "stop" | "fail" | null = null
   private readonly watchdogMs: number
-  private readonly provider: LiveProvider
+  private readonly loopbackAfterFrames: number
 
   constructor(
     private readonly session: MiniappSession,
     options: SessionControllerOptions = {},
   ) {
     this.watchdogMs = options.watchdogMs ?? 3000
-    this.provider = options.provider ?? new MockProvider()
+    this.loopbackAfterFrames = options.loopbackAfterFrames ?? 3
   }
 
   start(): void {
@@ -96,7 +93,9 @@ export class SessionController {
 
   async interrupt(): Promise<void> {
     this.speakerEpoch += 1
-    this.provider.interrupt()
+    this.cancelLoopback()
+    this.loopbackStarted = false
+    this.micFrames = 0
     await this.abortCurrentWriter()
     if (this.connection === "speaking") {
       this.connection = "listening"
@@ -153,7 +152,8 @@ export class SessionController {
     this.mode = mode
     this.lastError = null
     this.disconnectedPlayed = false
-    this.sawMicFrame = false
+    this.micFrames = 0
+    this.loopbackStarted = false
     this.connection = "starting"
     this.pushSnapshot()
 
@@ -162,20 +162,6 @@ export class SessionController {
       if (generation !== this.startGeneration) return
       this.subscribeMic()
       if (generation !== this.startGeneration) {
-        this.stopMic()
-        return
-      }
-      await this.provider.connect({
-        onAudio: (pcm) => this.onProviderAudio(pcm),
-        onAudioEnd: () => this.onProviderAudioEnd(),
-        onTranscript: () => {},
-        onToolCall: () => {},
-        onError: (error) => {
-          void this.fail(error)
-        },
-      })
-      if (generation !== this.startGeneration) {
-        this.provider.close()
         this.stopMic()
         return
       }
@@ -195,7 +181,7 @@ export class SessionController {
     this.startGeneration += 1
     this.startInFlight = false
     this.clearFirstPcmTimeout()
-    this.provider.close()
+    this.cancelLoopback()
     this.stopMic()
     this.speakerEpoch += 1
     return this.startGeneration
@@ -271,13 +257,7 @@ export class SessionController {
   private subscribeMic(): void {
     this.stopMic()
     this.micUnsub = this.session.mic.onAudioChunk((chunk) => {
-      if (!ACTIVE.has(this.connection) && this.connection !== "starting") return
-      if (approxBase64ByteLength(chunk.data) < 1) return
-      if (!this.sawMicFrame) {
-        this.sawMicFrame = true
-        this.clearFirstPcmTimeout()
-      }
-      this.provider.sendPcm(chunk.data, chunk.sampleRate, chunk.format)
+      this.handlePcmFrame(chunk.data)
     })
     this.startFirstPcmWatchdog()
   }
@@ -315,54 +295,27 @@ export class SessionController {
     }, this.watchdogMs)
   }
 
-  private onProviderAudio(pcm: Uint8Array): void {
-    this.audioEnded = false
-    if (this.connection === "listening" || this.connection === "speaking") {
-      if (this.connection !== "speaking") {
-        this.connection = "speaking"
-        this.pushSnapshot()
-      }
+  private handlePcmFrame(base64Pcm: string): void {
+    if (!ACTIVE.has(this.connection) && this.connection !== "starting") return
+    if (approxBase64ByteLength(base64Pcm) < 1) return
+    this.micFrames += 1
+    if (this.micFrames === 1) this.clearFirstPcmTimeout()
+    if (!this.loopbackStarted && this.micFrames >= this.loopbackAfterFrames) {
+      this.loopbackStarted = true
+      void this.playLoopback()
     }
-    void this.writeSpeech(pcm)
   }
 
-  private onProviderAudioEnd(): void {
-    this.audioEnded = true
-    this.maybeEndSpeech()
+  private cancelLoopback(): void {
+    this.loopbackStarted = true
   }
 
-  private maybeEndSpeech(): void {
-    if (!this.audioEnded || this.writeInFlight || this.connection !== "speaking") return
-    this.connection = "listening"
-    this.pushSnapshot()
-  }
-
-  private async writeSpeech(pcm: Uint8Array): Promise<void> {
+  private async playLoopback(): Promise<void> {
     const epoch = this.speakerEpoch
-    this.writeInFlight = true
-    try {
-      const writer = await this.ensureSpeechWriter(epoch)
-      if (!writer || epoch !== this.speakerEpoch) return
-      if (this.connection === "listening") {
-        this.connection = "speaking"
-        this.pushSnapshot()
-      }
-      if (epoch !== this.speakerEpoch) return
-      await writer.write(pcm)
-    } catch {
-      if (epoch === this.speakerEpoch) await this.fail(new Error("speaker write failed"))
-    } finally {
-      this.writeInFlight = false
-      if (epoch === this.speakerEpoch) this.maybeEndSpeech()
-    }
-  }
-
-  private async ensureSpeechWriter(epoch: number): Promise<SpeakerWriter | null> {
-    if (this.speakerWriter && epoch === this.speakerEpoch) return this.speakerWriter
     if (this.speakerOpenPromise) {
       const existing = await this.speakerOpenPromise
-      if (epoch !== this.speakerEpoch) return null
-      return existing
+      if (epoch !== this.speakerEpoch) return
+      if (existing) return
     }
     this.speakerOpenPromise = (async () => {
       const writer = (await this.session.speaker.createStream({
@@ -382,6 +335,17 @@ export class SessionController {
     })()
     const writer = await this.speakerOpenPromise
     this.speakerOpenPromise = null
-    return writer
+    if (!writer || epoch !== this.speakerEpoch) return
+    this.connection = "speaking"
+    this.pushSnapshot()
+    try {
+      if (epoch !== this.speakerEpoch) return
+      await writer.write(LOOPBACK_PCM)
+      if (epoch !== this.speakerEpoch) return
+      this.connection = "listening"
+      this.pushSnapshot()
+    } catch {
+      if (epoch === this.speakerEpoch) await this.fail(new Error("speaker write failed"))
+    }
   }
 }

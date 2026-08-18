@@ -2,7 +2,7 @@ import type {EarconName} from "../shared/types"
 
 export const EARCON_SAMPLE_RATE = 24000
 
-export function pcmTone(hz: number, ms: number, amplitude = 4000): Uint8Array {
+function tone(hz: number, ms: number, amplitude = 4000): Uint8Array {
   const samples = Math.max(1, Math.round((EARCON_SAMPLE_RATE * ms) / 1000))
   const out = new Uint8Array(samples * 2)
   const view = new DataView(out.buffer)
@@ -15,7 +15,10 @@ export function pcmTone(hz: number, ms: number, amplitude = 4000): Uint8Array {
 }
 
 export const EARCONS: Record<EarconName, Uint8Array> = {
-  "listen-start": pcmTone(660, 80),
-  "listen-stop": pcmTone(440, 80),
-  disconnected: pcmTone(220, 120),
+  "listen-start": tone(660, 80),
+  "listen-stop": tone(440, 80),
+  disconnected: tone(220, 120),
 }
+
+/** Short 24 kHz PCM16 burst used as the inlined mock speech reply. */
+export const LOOPBACK_PCM = tone(520, 60, 2500)
