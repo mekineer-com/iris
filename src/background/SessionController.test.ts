@@ -22,6 +22,7 @@ class FakeSession {
   onOpenCb: (() => void) | null = null
   snapshots: Snapshot[] = []
   createGate: Promise<void> | null = null
+  events: string[] = []
 
   ui = {
     send: (channel: string, payload: Snapshot) => {
@@ -63,17 +64,21 @@ class FakeSession {
       }
       const rec = {opts, writes: [] as unknown[], aborted: false, closed: false}
       this.streams.push(rec)
+      this.events.push("create")
       return {
         write: async (chunk: unknown) => {
           rec.writes.push(chunk)
+          this.events.push("write")
           return {bufferedMs: 0}
         },
         close: async () => {
           rec.closed = true
+          this.events.push("close")
           return {}
         },
         abort: async () => {
           rec.aborted = true
+          this.events.push("abort")
         },
       }
     },
@@ -124,10 +129,8 @@ describe("SessionController", () => {
     release()
     await Promise.resolve()
     await Promise.resolve()
-    session.micHandler?.({data: silentPcm()})
-    await Promise.resolve()
     expect(session.streams.length).toBe(during + 1)
-    expect(session.streams.at(-1)?.aborted).toBe(true)
+    expect(session.streams[session.streams.length - 1]?.aborted).toBe(true)
   })
 
   test("stop during starting skips mic subscribe", async () => {
@@ -212,11 +215,32 @@ describe("SessionController", () => {
     })
     controller.start()
     await session.handlers["openalma:start"]({mode: "continuous"})
-    expect(session.streams[0]?.closed).toBe(true)
     session.micHandler?.({data: silentPcm()})
     await Promise.resolve()
     await Promise.resolve()
+    const speechCreate = session.events.lastIndexOf("create")
+    const earconClose = session.events.indexOf("close")
     expect(session.streams.length).toBe(2)
-    expect(session.streams[0]?.closed).toBe(true)
+    expect(earconClose).toBeGreaterThanOrEqual(0)
+    expect(earconClose).toBeLessThan(speechCreate)
+  })
+
+  test("stop during fail leaves idle not error", async () => {
+    const session = new FakeSession()
+    const controller = new SessionController(session as never, {watchdogMs: 15})
+    controller.start()
+    await session.handlers["openalma:start"]({mode: "continuous"})
+    let release!: () => void
+    session.createGate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    expect(lastSnapshot(session)?.connection).toBe("stopping")
+    await session.handlers["openalma:stop"]({})
+    release()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(lastSnapshot(session)?.connection).toBe("idle")
+    expect(lastSnapshot(session)?.lastError).toBeNull()
   })
 })

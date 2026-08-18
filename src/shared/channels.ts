@@ -7,3 +7,7 @@ export interface Channels {
   "openalma:stop": Rpc<Record<string, never>, {ok: true}>
   "openalma:set-mode": Rpc<{mode: SessionMode}, {ok: true}>
 }
+
+declare global {
+  var mentra: import("@mentra/miniapp/ui").MentraTyped<Channels>
+}

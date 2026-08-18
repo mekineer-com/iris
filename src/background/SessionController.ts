@@ -35,10 +35,10 @@ export class SessionController {
   private speakerOpenPromise: Promise<SpeakerWriter | null> | null = null
   private micUnsub: UnsubscribeFn | null = null
   private firstPcmTimeout: ReturnType<typeof setTimeout> | null = null
-  private loopbackTimer: ReturnType<typeof setTimeout> | null = null
   private micFrames = 0
   private loopbackStarted = false
   private disconnectedPlayed = false
+  private teardownKind: "stop" | "fail" | null = null
   private readonly watchdogMs: number
   private readonly loopbackAfterFrames: number
 
@@ -69,6 +69,9 @@ export class SessionController {
       ui.handle("openalma:start", async (payload) => {
         const mode = (payload as {mode?: SessionMode} | null)?.mode ?? this.mode
         await this.startSession(mode)
+        if (this.connection === "error") {
+          throw new Error(this.lastError || "start failed")
+        }
         return {ok: true as const}
       }),
     )
@@ -91,16 +94,9 @@ export class SessionController {
   async interrupt(): Promise<void> {
     this.speakerEpoch += 1
     this.cancelLoopback()
-    const writer = this.speakerWriter
-    this.speakerWriter = null
-    this.speakerOpenPromise = null
-    if (writer) {
-      try {
-        await writer.abort()
-      } catch {
-        /* host may reject a stale abort */
-      }
-    }
+    this.loopbackStarted = false
+    this.micFrames = 0
+    await this.abortCurrentWriter()
     if (this.connection === "speaking") {
       this.connection = "listening"
       this.pushSnapshot()
@@ -122,6 +118,7 @@ export class SessionController {
       }
       return
     }
+    this.speakerWriter = writer
     try {
       await writer.write(pcm)
       if (epoch !== this.speakerEpoch) return
@@ -132,6 +129,8 @@ export class SessionController {
       } catch {
         /* ignore */
       }
+    } finally {
+      if (this.speakerWriter === writer) this.speakerWriter = null
     }
   }
 
@@ -176,26 +175,49 @@ export class SessionController {
     }
   }
 
-  private async stopSession(_reason: "user" | "error"): Promise<void> {
-    if (this.connection === "idle" || this.connection === "stopping") return
-    const userStop = _reason === "user"
+  private beginTeardown(kind: "stop" | "fail"): number {
     this.connection = "stopping"
+    this.teardownKind = kind
     this.startGeneration += 1
     this.startInFlight = false
     this.clearFirstPcmTimeout()
     this.cancelLoopback()
     this.stopMic()
     this.speakerEpoch += 1
+    return this.startGeneration
+  }
+
+  private async abortCurrentWriter(): Promise<void> {
     const writer = this.speakerWriter
     this.speakerWriter = null
     this.speakerOpenPromise = null
-    if (writer) {
-      try {
-        await writer.abort()
-      } catch {
-        /* ignore */
-      }
+    if (!writer) return
+    try {
+      await writer.abort()
+    } catch {
+      /* host may reject a stale abort */
     }
+  }
+
+  private async stopSession(_reason: "user" | "error"): Promise<void> {
+    if (this.connection === "idle") return
+    if (this.connection === "stopping") {
+      if (this.teardownKind !== "fail") return
+      this.startGeneration += 1
+      this.speakerEpoch += 1
+      this.teardownKind = "stop"
+      this.lastError = null
+      this.connection = "idle"
+      this.pushSnapshot()
+      void this.abortCurrentWriter()
+      return
+    }
+    const userStop = _reason === "user"
+    const generation = this.beginTeardown("stop")
+    if (userStop) this.lastError = null
+    this.pushSnapshot()
+    await this.abortCurrentWriter()
+    if (generation !== this.startGeneration) return
     if (userStop) {
       try {
         await this.playEarcon("listen-stop")
@@ -203,26 +225,21 @@ export class SessionController {
         /* ignore */
       }
     }
+    if (generation !== this.startGeneration) return
+    this.teardownKind = null
     this.connection = "idle"
     this.pushSnapshot()
   }
 
   private async fail(error: unknown): Promise<void> {
-    this.lastError = error instanceof Error ? error.message : String(error)
-    this.clearFirstPcmTimeout()
-    this.cancelLoopback()
-    this.stopMic()
-    this.speakerEpoch += 1
-    const writer = this.speakerWriter
-    this.speakerWriter = null
-    this.speakerOpenPromise = null
-    if (writer) {
-      try {
-        await writer.abort()
-      } catch {
-        /* ignore */
-      }
+    if (this.connection === "idle" || this.connection === "stopping" || this.connection === "error") {
+      return
     }
+    this.lastError = error instanceof Error ? error.message : String(error)
+    const generation = this.beginTeardown("fail")
+    this.pushSnapshot()
+    await this.abortCurrentWriter()
+    if (generation !== this.startGeneration) return
     if (!this.disconnectedPlayed) {
       this.disconnectedPlayed = true
       try {
@@ -231,8 +248,9 @@ export class SessionController {
         /* ignore */
       }
     }
+    if (generation !== this.startGeneration) return
+    this.teardownKind = null
     this.connection = "error"
-    this.startInFlight = false
     this.pushSnapshot()
   }
 
@@ -290,10 +308,6 @@ export class SessionController {
 
   private cancelLoopback(): void {
     this.loopbackStarted = true
-    if (this.loopbackTimer) {
-      clearTimeout(this.loopbackTimer)
-      this.loopbackTimer = null
-    }
   }
 
   private async playLoopback(): Promise<void> {
