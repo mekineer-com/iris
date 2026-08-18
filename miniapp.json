@@ -1,0 +1,33 @@
+{
+  "packageName": "com.openalma.mentra",
+  "version": "0.1.0",
+  "name": "OpenAlma",
+  "description": "OpenAlma speech client for Mentra Live",
+  "icon": "icon.png",
+  "type": "standard",
+  "sdkVersion": "0.3.0",
+  "minHostVersion": "2.13.0",
+  "entry": {
+    "background": "background/index.js",
+    "ui": "ui/index.html"
+  },
+  "permissions": [
+    {
+      "type": "MICROPHONE",
+      "description": "Captures speech for the OpenAlma conversation"
+    }
+  ],
+  "hardwareRequirements": [
+    {
+      "type": "MICROPHONE",
+      "level": "REQUIRED",
+      "description": "Captures speech"
+    },
+    {
+      "type": "SPEAKER",
+      "level": "REQUIRED",
+      "description": "Plays the soul's voice and status earcons"
+    }
+  ],
+  "port": 3141
+}
