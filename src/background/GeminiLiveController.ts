@@ -3,6 +3,7 @@ import type {OpenAlmaConfig} from "./openAlmaConfig"
 
 type StartResponse = {
   session_id: string
+  next_transcript_sequence: number
   ephemeral_token: string
   websocket: {
     api_version: string
@@ -17,7 +18,17 @@ export type GeminiCallbacks = {
   onAudio: (base64Pcm: string) => void
   onTurnComplete: () => void
   onInterrupted: () => void
+  onPersistenceError: (message: string | null) => void
   onError: (error: Error) => void
+}
+
+type TranscriptEvent = {
+  event_id: string
+  sequence: number
+  event_kind: "transcript" | "sitting_summary"
+  role: "user" | "assistant"
+  content: string
+  status?: "complete" | "interrupted"
 }
 
 type SocketLike = {
@@ -36,6 +47,9 @@ export type GeminiLiveControllerOptions = {
 
 const WS_OPEN = 1
 const REQUEST_TIMEOUT_MS = 10_000
+const REFLECTION_TIMEOUT_MS = 8_000
+export const SITTING_REFLECTION_PROMPT =
+  "Reflect briefly in first person on the emotional tone, subtext, or meaningful shift in this sitting that the literal transcript may not preserve. Do not recap the conversation. Respond with one or two natural sentences, or exactly NO_SUMMARY if nothing worthwhile would be added."
 
 export class GeminiLiveController {
   private readonly fetchFn: typeof fetch
@@ -45,6 +59,7 @@ export class GeminiLiveController {
   private socket: SocketLike | null = null
   private token = ""
   private sessionId = ""
+  private nextTranscriptSequence = 1
   private resumptionHandle = ""
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private stopping = false
@@ -53,6 +68,15 @@ export class GeminiLiveController {
   private errorReported = false
   private inputTranscript = ""
   private outputTranscript = ""
+  private interruptionFinalized = false
+  private turnActive = false
+  private completeUserTurns = 0
+  private pendingEvents: TranscriptEvent[] = []
+  private appendTail: Promise<void> = Promise.resolve()
+  private persistenceFatal = false
+  private reflecting = false
+  private reflectionResolve: ((value: string | null) => void) | null = null
+  private stopPromise: Promise<void> | null = null
   private generation = 0
   private ready = false
 
@@ -75,10 +99,24 @@ export class GeminiLiveController {
     this.resumptionHandle = ""
     this.reconnectAttempted = false
     this.errorReported = false
+    this.inputTranscript = ""
+    this.outputTranscript = ""
+    this.interruptionFinalized = false
+    this.turnActive = false
+    this.completeUserTurns = 0
+    this.pendingEvents = []
+    this.appendTail = Promise.resolve()
+    this.persistenceFatal = false
+    this.reflecting = false
+    this.reflectionResolve = null
+    this.stopPromise = null
     try {
       const response = await this.requestStart()
       this.token = response.ephemeral_token
-      if (generation !== this.generation) throw new Error("Gemini start cancelled")
+      if (generation !== this.generation) {
+        await this.endLease()
+        throw new Error("Gemini start cancelled")
+      }
       await this.connectSocket("")
       if (generation !== this.generation) throw new Error("Gemini start cancelled")
       this.heartbeatTimer = setInterval(
@@ -104,15 +142,41 @@ export class GeminiLiveController {
     )
   }
 
-  async stop(): Promise<void> {
-    this.generation += 1
-    this.stopping = true
-    this.ready = false
-    this.clearHeartbeat()
-    const socket = this.socket
-    this.socket = null
-    socket?.close()
-    await this.endLease()
+  stop(graceful = false): Promise<void> {
+    this.stopPromise ??= this.performStop(graceful)
+    return this.stopPromise
+  }
+
+  private async performStop(graceful: boolean): Promise<void> {
+    try {
+      const stoppedMidTurn = this.turnActive
+      if (this.inputTranscript.trim() || this.outputTranscript.trim()) {
+        this.finalizeInterruptedTurn()
+        this.interruptionFinalized = false
+      }
+      if (graceful && !stoppedMidTurn && this.ready && this.completeUserTurns >= 2) {
+        const reflection = await this.requestReflection()
+        if (reflection && reflection !== "NO_SUMMARY") {
+          this.enqueueEvent("sitting_summary", "assistant", reflection)
+        }
+      }
+      this.stopping = true
+      this.ready = false
+      await this.appendTail
+      if (!this.persistenceFatal) await this.flushPendingEvents()
+    } catch (error) {
+      this.persistenceFatal = true
+      this.reportError(error instanceof Error ? error : new Error(String(error)))
+    } finally {
+      this.generation += 1
+      this.stopping = true
+      this.ready = false
+      this.clearHeartbeat()
+      const socket = this.socket
+      this.socket = null
+      socket?.close()
+      await this.endLease()
+    }
   }
 
   private async requestStart(): Promise<StartResponse> {
@@ -123,13 +187,17 @@ export class GeminiLiveController {
       mode: "continuous",
     })
     if (!response.ok) throw new Error(`OpenAlma Start failed (${response.status})`)
-    this.sessionId = this.config.deviceSessionId
-    this.ended = false
     const body = (await response.json()) as Partial<StartResponse>
+    if (typeof body.session_id === "string" && body.session_id.trim()) {
+      this.sessionId = body.session_id
+      this.ended = false
+    }
     const ws = body.websocket
     if (
       typeof body.session_id !== "string" ||
-      body.session_id !== this.config.deviceSessionId ||
+      !body.session_id.trim() ||
+      !Number.isSafeInteger(body.next_transcript_sequence) ||
+      Number(body.next_transcript_sequence) < 1 ||
       typeof body.ephemeral_token !== "string" ||
       !body.ephemeral_token ||
       !ws ||
@@ -143,6 +211,7 @@ export class GeminiLiveController {
     ) {
       throw new Error("OpenAlma Start returned an invalid session contract")
     }
+    this.nextTranscriptSequence = Number(body.next_transcript_sequence)
     return body as StartResponse
   }
 
@@ -217,10 +286,11 @@ export class GeminiLiveController {
     if (content === undefined) return
     if (!content || typeof content !== "object") throw new Error("Gemini returned malformed server content")
     const interrupted = content.interrupted === true
-    if (interrupted) this.callbacks.onInterrupted()
-
     const parts = content.modelTurn?.parts
     if (parts !== undefined && !Array.isArray(parts)) throw new Error("Gemini returned malformed model parts")
+    if (content.modelTurn !== undefined || content.inputTranscription !== undefined || content.outputTranscription !== undefined) {
+      this.turnActive = true
+    }
     for (const part of interrupted ? [] : (parts ?? [])) {
       const inline = part?.inlineData
       if (inline === undefined) continue
@@ -236,12 +306,38 @@ export class GeminiLiveController {
       this.callbacks.onAudio(inline.data)
     }
 
-    this.inputTranscript += this.transcriptText(content.inputTranscription, "input")
-    this.outputTranscript += this.transcriptText(content.outputTranscription, "output")
+    const input = this.transcriptText(content.inputTranscription, "input")
+    const output = this.transcriptText(content.outputTranscription, "output")
+    if (this.reflecting) {
+      if (input) throw new Error("Gemini returned input transcription during reflection")
+      this.outputTranscript += output
+      if (interrupted) {
+        this.callbacks.onInterrupted()
+        this.finishReflection(null)
+      } else if (content.turnComplete === true) {
+        this.callbacks.onTurnComplete()
+        this.finishReflection(this.outputTranscript.trim() || null)
+      }
+      return
+    }
+
+    if (input) {
+      if (this.inputTranscript) throw new Error("Gemini returned multiple input transcription fields")
+      this.inputTranscript = input
+    }
+    this.outputTranscript += output
+    if (interrupted) {
+      this.finalizeInterruptedTurn()
+      this.callbacks.onInterrupted()
+    }
     if (content.turnComplete === true) {
+      if (this.interruptionFinalized) {
+        this.interruptionFinalized = false
+      } else {
+        this.finalizeCompleteTurn()
+      }
+      this.turnActive = false
       this.callbacks.onTurnComplete()
-      this.inputTranscript = ""
-      this.outputTranscript = ""
     }
   }
 
@@ -251,6 +347,119 @@ export class GeminiLiveController {
       throw new Error(`Gemini returned malformed ${label} transcription`)
     }
     return (value as {text: string}).text
+  }
+
+  private finalizeCompleteTurn(): void {
+    const input = this.inputTranscript.trim()
+    const output = this.outputTranscript.trim()
+    this.clearTurn()
+    if (!input || !output) throw new Error("Gemini completed a turn without both transcriptions")
+    this.enqueueEvent("transcript", "user", input, "complete")
+    this.enqueueEvent("transcript", "assistant", output, "complete")
+    this.completeUserTurns += 1
+    this.scheduleAppend()
+  }
+
+  private finalizeInterruptedTurn(): void {
+    const input = this.inputTranscript.trim()
+    const output = this.outputTranscript.trim()
+    this.clearTurn()
+    if (input) this.enqueueEvent("transcript", "user", input, "interrupted")
+    if (output) this.enqueueEvent("transcript", "assistant", output, "interrupted")
+    this.interruptionFinalized = true
+    if (input || output) this.scheduleAppend()
+  }
+
+  private clearTurn(): void {
+    this.inputTranscript = ""
+    this.outputTranscript = ""
+  }
+
+  private enqueueEvent(
+    eventKind: TranscriptEvent["event_kind"],
+    role: TranscriptEvent["role"],
+    content: string,
+    status?: TranscriptEvent["status"],
+  ): void {
+    const sequence = this.nextTranscriptSequence++
+    this.pendingEvents.push({
+      event_id: `${this.sessionId}:${sequence}`,
+      sequence,
+      event_kind: eventKind,
+      role,
+      content,
+      ...(status ? {status} : {}),
+    })
+  }
+
+  private scheduleAppend(): void {
+    this.appendTail = this.appendTail.then(() => this.flushPendingEvents()).catch((error) => {
+      this.persistenceFatal = true
+      this.reportError(error instanceof Error ? error : new Error(String(error)))
+    })
+  }
+
+  private async flushPendingEvents(): Promise<void> {
+    while (this.pendingEvents.length && !this.persistenceFatal) {
+      const batch = this.pendingEvents.slice(0, 16)
+      let response: Response
+      try {
+        response = await this.request(`/integration/mentra/session/${this.sessionId}/transcripts/append`, {
+          user_id: this.config.userId,
+          soul_id: this.config.soulId,
+          events: batch,
+        })
+      } catch {
+        this.callbacks.onPersistenceError("Transcript sync failed; retrying")
+        return
+      }
+      if (response.status >= 500) {
+        this.callbacks.onPersistenceError("Transcript sync failed; retrying")
+        return
+      }
+      if (!response.ok) throw new Error(`OpenAlma transcript append failed (${response.status})`)
+      const result = (await response.json()) as {ack_sequence?: unknown}
+      const ack = result.ack_sequence
+      if (!Number.isSafeInteger(ack) || Number(ack) !== batch[batch.length - 1].sequence) {
+        throw new Error("OpenAlma transcript append returned an invalid acknowledgement")
+      }
+      this.pendingEvents = this.pendingEvents.filter((event) => event.sequence > Number(ack))
+    }
+    this.callbacks.onPersistenceError(null)
+  }
+
+  private requestReflection(): Promise<string | null> {
+    this.reflecting = true
+    this.clearTurn()
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => this.finishReflection(null), REFLECTION_TIMEOUT_MS)
+      this.reflectionResolve = (value) => {
+        clearTimeout(timeout)
+        resolve(value)
+      }
+      try {
+        this.socket!.send(
+          JSON.stringify({
+            clientContent: {
+              turns: [{role: "user", parts: [{text: SITTING_REFLECTION_PROMPT}]}],
+              turnComplete: true,
+            },
+          }),
+        )
+      } catch {
+        this.finishReflection(null)
+      }
+    })
+  }
+
+  private finishReflection(value: string | null): void {
+    if (!this.reflecting) return
+    this.reflecting = false
+    this.turnActive = false
+    this.clearTurn()
+    const resolve = this.reflectionResolve
+    this.reflectionResolve = null
+    resolve?.(value)
   }
 
   private async handleUnexpectedClose(): Promise<void> {
@@ -294,7 +503,7 @@ export class GeminiLiveController {
     }
   }
 
-  private request(path: string, body: Record<string, string>): Promise<Response> {
+  private request(path: string, body: unknown): Promise<Response> {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
     return this.fetchFn(`${this.config.baseUrl}${path}`, {
@@ -317,7 +526,6 @@ export class GeminiLiveController {
     if (this.stopping || this.errorReported) return
     this.errorReported = true
     this.clearHeartbeat()
-    void this.endLease()
     this.callbacks.onError(error)
   }
 }

@@ -57,6 +57,7 @@ function harness(
     startStatus?: number
     startBody?: unknown
     leaseSeconds?: number
+    appendStatuses?: number[]
   } = {},
 ) {
   const sockets: FakeSocket[] = []
@@ -64,6 +65,8 @@ function harness(
   const audio: string[] = []
   const events: string[] = []
   const errors: string[] = []
+  const persistenceErrors: Array<string | null> = []
+  const appendStatuses = [...(options.appendStatuses ?? [])]
   const fetchFn = async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input)
     const body = JSON.parse(String(init?.body ?? "{}"))
@@ -72,7 +75,8 @@ function harness(
       if (options.startGate) await options.startGate
       return Response.json(
         options.startBody ?? {
-          session_id: "test-phone",
+          session_id: "sitting-1",
+          next_transcript_sequence: 41,
           ephemeral_token: "ephemeral/test",
           websocket: {
             api_version: "v1alpha",
@@ -86,6 +90,12 @@ function harness(
       )
     }
     if (url.endsWith("/heartbeat")) return Response.json({ok: true}, {status: options.heartbeatStatus ?? 200})
+    if (url.endsWith("/transcripts/append")) {
+      return Response.json(
+        {ok: true, ack_sequence: body.events.at(-1)?.sequence ?? 0},
+        {status: appendStatuses.shift() ?? 200},
+      )
+    }
     return Response.json({ok: true})
   }
   const controller = new GeminiLiveController(
@@ -94,6 +104,7 @@ function harness(
       onAudio: (data) => audio.push(data),
       onTurnComplete: () => events.push("turnComplete"),
       onInterrupted: () => events.push("interrupted"),
+      onPersistenceError: (message) => persistenceErrors.push(message),
       onError: (error) => errors.push(error.message),
     },
     {
@@ -107,7 +118,7 @@ function harness(
       setupTimeoutMs: options.setupTimeoutMs,
     },
   )
-  return {controller, sockets, requests, audio, events, errors}
+  return {controller, sockets, requests, audio, events, errors, persistenceErrors}
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -122,6 +133,16 @@ async function start(h: ReturnType<typeof harness>): Promise<void> {
   expect(JSON.parse(h.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
   h.sockets[0].message({setupComplete: {}})
   await starting
+}
+
+function completeTurn(h: ReturnType<typeof harness>, input = "hello", output = "hi"): void {
+  h.sockets.at(-1)!.message({
+    serverContent: {
+      inputTranscription: {text: input},
+      outputTranscription: {text: output},
+      turnComplete: true,
+    },
+  })
 }
 
 describe("GeminiLiveController", () => {
@@ -143,7 +164,7 @@ describe("GeminiLiveController", () => {
       realtimeInput: {audio: {data: "AAAA", mimeType: "audio/pcm;rate=16000"}},
     })
     await h.controller.stop()
-    expect(h.requests.filter((request) => request.url.endsWith("/end"))).toHaveLength(1)
+    expect(h.requests.filter((request) => request.url.endsWith("/sitting-1/end"))).toHaveLength(1)
   })
 
   test("iterates audio, transcript, interruption, and turn completion independently", async () => {
@@ -161,6 +182,30 @@ describe("GeminiLiveController", () => {
     })
     expect(h.audio).toEqual(["AAAAAA==", "AAAAAA=="])
     expect(h.events).toEqual(["turnComplete"])
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+    const append = h.requests.find((request) => request.url.endsWith("/transcripts/append"))!
+    expect(append.body).toEqual({
+      user_id: "Test User",
+      soul_id: "Test Soul",
+      events: [
+        {
+          event_id: "sitting-1:41",
+          sequence: 41,
+          event_kind: "transcript",
+          role: "user",
+          content: "hello",
+          status: "complete",
+        },
+        {
+          event_id: "sitting-1:42",
+          sequence: 42,
+          event_kind: "transcript",
+          role: "assistant",
+          content: "hi",
+          status: "complete",
+        },
+      ],
+    })
     await h.controller.stop()
   })
 
@@ -176,6 +221,164 @@ describe("GeminiLiveController", () => {
     expect(h.events).toEqual(["interrupted"])
     expect(h.audio).toEqual([])
     await h.controller.stop()
+  })
+
+  test("finalizes interrupted text once and does not leak it into the next turn", async () => {
+    const h = harness()
+    await start(h)
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "first question"}}})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
+    h.sockets[0].message({serverContent: {interrupted: true}})
+    h.sockets[0].message({serverContent: {turnComplete: true}})
+    completeTurn(h, "second question", "second answer")
+
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+    const appends = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
+    expect(appends[0].body.events.map((event: any) => [event.content, event.status])).toEqual([
+      ["first question", "interrupted"],
+      ["partial answer", "interrupted"],
+      ["second question", "complete"],
+      ["second answer", "complete"],
+    ])
+    expect(h.events).toEqual(["interrupted", "turnComplete", "turnComplete"])
+    await h.controller.stop()
+  })
+
+  test("fails loud when a completed turn lacks either transcript side", async () => {
+    const h = harness()
+    await start(h)
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "only one side"}, turnComplete: true}})
+    expect(h.errors).toEqual(["Gemini completed a turn without both transcriptions"])
+    expect(h.requests.some((request) => request.url.endsWith("/transcripts/append"))).toBe(false)
+    await h.controller.stop()
+  })
+
+  test("retains a failed append and retries the whole contiguous queue on the next turn", async () => {
+    const h = harness({appendStatuses: [503, 200]})
+    await start(h)
+    completeTurn(h, "one", "answer one")
+    await waitFor(() => h.persistenceErrors.length === 1)
+    completeTurn(h, "two", "answer two")
+    await waitFor(() => h.persistenceErrors.at(-1) === null)
+
+    const appends = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
+    expect(appends.map((request) => request.body.events.length)).toEqual([2, 4])
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("drains a retained queue in server-sized batches", async () => {
+    const h = harness({appendStatuses: [503, 200, 200]})
+    await start(h)
+    completeTurn(h, "one", "answer one")
+    await waitFor(() => h.persistenceErrors.length === 1)
+    for (let turn = 2; turn <= 9; turn++) completeTurn(h, `question ${turn}`, `answer ${turn}`)
+    await waitFor(() => h.persistenceErrors.at(-1) === null)
+
+    const appends = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
+    expect(appends.map((request) => request.body.events.length)).toEqual([2, 16, 2])
+    expect(appends.every((request) => request.body.events.length <= 16)).toBe(true)
+    await h.controller.stop()
+  })
+
+  test("treats a transcript contract rejection as fatal", async () => {
+    const h = harness({appendStatuses: [409]})
+    await start(h)
+    completeTurn(h)
+    await waitFor(() => h.errors.length === 1)
+    expect(h.errors).toEqual(["OpenAlma transcript append failed (409)"])
+    await h.controller.stop()
+  })
+
+  test("Stop persists proven partial text as interrupted before End", async () => {
+    const h = harness()
+    await start(h)
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "partial question"}}})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
+    await h.controller.stop()
+
+    const append = h.requests.find((request) => request.url.endsWith("/transcripts/append"))!
+    expect(append.body.events.map((event: any) => [event.content, event.status])).toEqual([
+      ["partial question", "interrupted"],
+      ["partial answer", "interrupted"],
+    ])
+    expect(h.requests.findIndex((request) => request.url.endsWith("/transcripts/append"))).toBeLessThan(
+      h.requests.findIndex((request) => request.url.endsWith("/end")),
+    )
+  })
+
+  test("graceful Stop skips reflection while a normal turn is unfinished", async () => {
+    const h = harness()
+    await start(h)
+    completeTurn(h, "one", "answer one")
+    completeTurn(h, "two", "answer two")
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "partial question"}}})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
+
+    await h.controller.stop(true)
+    expect(h.sockets[0].sent.some((value) => JSON.parse(value).clientContent)).toBe(false)
+    const events = h.requests
+      .filter((request) => request.url.endsWith("/transcripts/append"))
+      .flatMap((request) => request.body.events)
+    expect(events.slice(-2).map((event: any) => event.status)).toEqual(["interrupted", "interrupted"])
+  })
+
+  test("graceful Stop plays and persists one bounded reflection", async () => {
+    const h = harness()
+    await start(h)
+    completeTurn(h, "one", "answer one")
+    completeTurn(h, "two", "answer two")
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+
+    const stopping = h.controller.stop(true)
+    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    h.sockets[0].message({
+      serverContent: {
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
+        outputTranscription: {text: "I noticed warmth."},
+        turnComplete: true,
+      },
+    })
+    await stopping
+
+    const appends = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
+    expect(appends.at(-1)?.body.events).toEqual([
+      {
+        event_id: "sitting-1:45",
+        sequence: 45,
+        event_kind: "sitting_summary",
+        role: "assistant",
+        content: "I noticed warmth.",
+      },
+    ])
+    expect(h.audio.at(-1)).toBe("AAAAAA==")
+    expect(h.requests.filter((request) => request.url.endsWith("/sitting-1/end"))).toHaveLength(1)
+  })
+
+  test("graceful Stop may speak NO_SUMMARY without persisting it", async () => {
+    const h = harness()
+    await start(h)
+    completeTurn(h, "one", "answer one")
+    completeTurn(h, "two", "answer two")
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+
+    const stopping = h.controller.stop(true)
+    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    h.sockets[0].message({
+      serverContent: {
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
+        outputTranscription: {text: "NO_SUMMARY"},
+        turnComplete: true,
+      },
+    })
+    await stopping
+
+    const events = h.requests
+      .filter((request) => request.url.endsWith("/transcripts/append"))
+      .flatMap((request) => request.body.events)
+    expect(events.some((event: any) => event.event_kind === "sitting_summary")).toBe(false)
+    expect(h.audio.at(-1)).toBe("AAAAAA==")
   })
 
   test("resumes once with the latest private handle", async () => {

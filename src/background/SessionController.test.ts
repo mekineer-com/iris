@@ -22,8 +22,11 @@ function silentPcm(): string {
 class FakeLive {
   starts = 0
   stops = 0
+  stopArgs: boolean[] = []
   sent: string[] = []
   startGate: Promise<void> | null = null
+  stopGate: Promise<void> | null = null
+  audioOnStop = false
 
   constructor(readonly callbacks: GeminiCallbacks) {}
 
@@ -36,8 +39,11 @@ class FakeLive {
     this.sent.push(data)
   }
 
-  async stop(): Promise<void> {
+  async stop(graceful = false): Promise<void> {
     this.stops += 1
+    this.stopArgs.push(graceful)
+    if (graceful && this.audioOnStop) this.callbacks.onAudio(silentPcm())
+    if (this.stopGate) await this.stopGate
   }
 
   audio(data = silentPcm()): void {
@@ -50,6 +56,10 @@ class FakeLive {
 
   interrupted(): void {
     this.callbacks.onInterrupted()
+  }
+
+  persistence(message: string | null): void {
+    this.callbacks.onPersistenceError(message)
   }
 
   fail(message: string): void {
@@ -73,6 +83,7 @@ class FakeSession {
   snapshots: Snapshot[] = []
   createGate: Promise<void> | null = null
   closeGate: Promise<void> | null = null
+  createErrorOnce = false
 
   ui = {
     send: (channel: string, payload: Snapshot) => {
@@ -108,6 +119,10 @@ class FakeSession {
       this.speakerStops += 1
     },
     createStream: async (opts: {sampleRate: number; stopOtherAudio?: boolean}) => {
+      if (this.createErrorOnce) {
+        this.createErrorOnce = false
+        throw new Error("speaker open failed")
+      }
       if (this.createGate) {
         const gate = this.createGate
         this.createGate = null
@@ -172,6 +187,7 @@ describe("SessionController", () => {
     expect(harness.session.streams[0]?.closed).toBe(true)
     await harness.session.handlers["openalma:stop"]({})
     expect(harness.live.stops).toBe(1)
+    expect(harness.live.stopArgs).toEqual([true])
     expect(harness.session.micHandler).toBeNull()
     expect(lastSnapshot(harness.session)?.connection).toBe("idle")
   })
@@ -326,5 +342,60 @@ describe("SessionController", () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(lastSnapshot(harness.session)?.connection).toBe("error")
     expect(lastSnapshot(harness.session)?.lastError).toBe("provider failed")
+  })
+
+  test("temporary transcript failure is visible without stopping voice", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    harness.live.persistence("Transcript sync failed; retrying")
+    expect(lastSnapshot(harness.session)).toMatchObject({
+      connection: "listening",
+      lastError: "Transcript sync failed; retrying",
+    })
+    harness.live.persistence(null)
+    expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", lastError: null})
+    await harness.session.handlers["openalma:stop"]({})
+  })
+
+  test("Stop during fatal teardown awaits the same owner", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    let release!: () => void
+    harness.live.stopGate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    harness.live.fail("provider failed")
+    await Promise.resolve()
+    let stopped = false
+    const stop = Promise.resolve(harness.session.handlers["openalma:stop"]({})).then(() => {
+      stopped = true
+    })
+    await Promise.resolve()
+    expect(stopped).toBe(false)
+    expect(harness.live.stops).toBe(1)
+    release()
+    await stop
+    expect(harness.live.stops).toBe(1)
+    expect(lastSnapshot(harness.session)).toMatchObject({connection: "idle", lastError: null})
+  })
+
+  test("graceful teardown closes reflection audio without turnComplete", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    harness.live.audioOnStop = true
+    await harness.session.handlers["openalma:stop"]({})
+    expect(harness.session.streams[1]?.writes).toEqual([silentPcm()])
+    expect(harness.session.streams[1]?.closed).toBe(true)
+    expect(lastSnapshot(harness.session)?.connection).toBe("idle")
+  })
+
+  test("reflection speaker-open failure cannot strand teardown", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    harness.session.createErrorOnce = true
+    harness.live.audioOnStop = true
+    await harness.session.handlers["openalma:stop"]({})
+    expect(harness.live.stops).toBe(1)
+    expect(lastSnapshot(harness.session)).toMatchObject({connection: "idle", lastError: null})
   })
 })

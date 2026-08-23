@@ -40,11 +40,12 @@ export class SessionController {
   private speakerWriter: SpeakerWriter | null = null
   private speakerOpenPromise: Promise<SpeakerWriter | null> | null = null
   private readonly pendingSpeechWrites = new Set<Promise<void>>()
+  private speechFinishTail: Promise<void> = Promise.resolve()
   private micUnsub: UnsubscribeFn | null = null
   private firstPcmTimeout: ReturnType<typeof setTimeout> | null = null
   private sawMicFrame = false
-  private disconnectedPlayed = false
   private teardownKind: "stop" | "fail" | null = null
+  private teardownPromise: Promise<void> | null = null
   private readonly watchdogMs: number
   private readonly config?: OpenAlmaConfig
   private readonly createLiveController: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
@@ -161,7 +162,6 @@ export class SessionController {
     const generation = ++this.startGeneration
     this.mode = mode
     this.lastError = null
-    this.disconnectedPlayed = false
     this.sawMicFrame = false
     this.connection = "starting"
     this.pushSnapshot()
@@ -170,8 +170,14 @@ export class SessionController {
       if (!this.liveController) {
         this.liveController = this.createLiveController(this.config ?? readOpenAlmaConfig(), {
           onAudio: (pcm) => this.onGeminiAudio(pcm),
-          onTurnComplete: () => void this.finishSpeech(),
+          onTurnComplete: () => this.queueFinishSpeech(),
           onInterrupted: () => void this.interrupt(),
+          onPersistenceError: (message) => {
+            if (message || this.lastError === "Transcript sync failed; retrying") {
+              this.lastError = message
+              this.pushSnapshot()
+            }
+          },
           onError: (error) => void this.fail(error),
         })
       }
@@ -231,58 +237,58 @@ export class SessionController {
 
   private async stopSession(_reason: "user" | "error"): Promise<void> {
     if (this.connection === "idle") return
-    if (this.connection === "stopping") {
-      if (this.teardownKind !== "fail") return
-      this.startGeneration += 1
-      this.speakerEpoch += 1
-      this.teardownKind = "stop"
-      this.lastError = null
-      this.connection = "idle"
-      this.pushSnapshot()
-      void this.abortCurrentWriter()
+    if (this.teardownPromise) {
+      if (_reason === "user" && this.teardownKind === "fail") {
+        this.teardownKind = "stop"
+        this.lastError = null
+      }
+      await this.teardownPromise
       return
     }
-    const userStop = _reason === "user"
-    const generation = this.beginTeardown("stop")
-    if (userStop) this.lastError = null
+    this.teardownKind = "stop"
+    this.teardownPromise = this.runTeardown().finally(() => {
+      this.teardownPromise = null
+    })
+    await this.teardownPromise
+  }
+
+  private async fail(error: unknown): Promise<void> {
+    if (this.connection === "idle" || this.connection === "error" || this.teardownPromise) return
+    this.lastError = error instanceof Error ? error.message : String(error)
+    this.teardownKind = "fail"
+    this.teardownPromise = this.runTeardown().finally(() => {
+      this.teardownPromise = null
+    })
+    await this.teardownPromise
+  }
+
+  private async runTeardown(): Promise<void> {
+    const generation = this.beginTeardown(this.teardownKind ?? "fail")
     this.pushSnapshot()
     await this.abortCurrentWriter()
-    await this.stopLiveController()
+    await this.stopLiveController(this.teardownKind === "stop")
+    await this.speechFinishTail
+    await this.finishSpeech()
     if (generation !== this.startGeneration) return
-    if (userStop) {
+
+    if (this.teardownKind === "stop") {
+      this.lastError = null
       try {
         await this.playEarcon("listen-stop")
       } catch {
         /* ignore */
       }
-    }
-    if (generation !== this.startGeneration) return
-    this.teardownKind = null
-    this.connection = "idle"
-    this.pushSnapshot()
-  }
-
-  private async fail(error: unknown): Promise<void> {
-    if (this.connection === "idle" || this.connection === "stopping" || this.connection === "error") {
-      return
-    }
-    this.lastError = error instanceof Error ? error.message : String(error)
-    const generation = this.beginTeardown("fail")
-    this.pushSnapshot()
-    await this.abortCurrentWriter()
-    await this.stopLiveController()
-    if (generation !== this.startGeneration) return
-    if (!this.disconnectedPlayed) {
-      this.disconnectedPlayed = true
+      this.connection = "idle"
+    } else {
       try {
         await this.playEarcon("disconnected")
       } catch {
         /* ignore */
       }
+      this.connection = "error"
     }
     if (generation !== this.startGeneration) return
     this.teardownKind = null
-    this.connection = "error"
     this.pushSnapshot()
   }
 
@@ -342,8 +348,9 @@ export class SessionController {
   }
 
   private onGeminiAudio(base64Pcm: string): void {
-    if (this.connection !== "listening" && this.connection !== "speaking") return
-    if (this.connection !== "speaking") {
+    const reflection = this.connection === "stopping" && this.teardownKind === "stop"
+    if (!reflection && this.connection !== "listening" && this.connection !== "speaking") return
+    if (!reflection && this.connection !== "speaking") {
       this.connection = "speaking"
       this.pushSnapshot()
     }
@@ -387,9 +394,11 @@ export class SessionController {
       return writer
     })()
     this.speakerOpenPromise = opening
-    const writer = await opening
-    if (this.speakerOpenPromise === opening) this.speakerOpenPromise = null
-    return writer
+    try {
+      return await opening
+    } finally {
+      if (this.speakerOpenPromise === opening) this.speakerOpenPromise = null
+    }
   }
 
   private async finishSpeech(): Promise<void> {
@@ -416,9 +425,13 @@ export class SessionController {
     }
   }
 
-  private async stopLiveController(): Promise<void> {
+  private queueFinishSpeech(): void {
+    this.speechFinishTail = this.speechFinishTail.then(() => this.finishSpeech())
+  }
+
+  private async stopLiveController(graceful = false): Promise<void> {
     const controller = this.liveController
     this.liveController = null
-    if (controller) await controller.stop()
+    if (controller) await controller.stop(graceful)
   }
 }
