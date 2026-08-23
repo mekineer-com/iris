@@ -181,7 +181,7 @@ describe("GeminiLiveController", () => {
   test("resumes once with the latest private handle", async () => {
     const h = harness()
     await start(h)
-    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, handle: "private-handle"}})
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
     h.sockets[0].error()
     await waitFor(() => h.sockets.length === 2)
     expect(() => h.controller.sendAudio("AAAA")).not.toThrow()

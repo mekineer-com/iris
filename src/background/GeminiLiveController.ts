@@ -209,8 +209,8 @@ export class GeminiLiveController {
 
   private handleMessage(message: Record<string, any>): void {
     const update = message.sessionResumptionUpdate
-    if (update?.resumable === true && typeof update.handle === "string" && update.handle.trim()) {
-      this.resumptionHandle = update.handle
+    if (update?.resumable === true && typeof update.newHandle === "string" && update.newHandle.trim()) {
+      this.resumptionHandle = update.newHandle
     }
 
     const content = message.serverContent
