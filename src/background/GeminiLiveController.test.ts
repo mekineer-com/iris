@@ -56,6 +56,7 @@ function harness(
     startGate?: Promise<void>
     startStatus?: number
     startBody?: unknown
+    leaseSeconds?: number
   } = {},
 ) {
   const sockets: FakeSocket[] = []
@@ -79,6 +80,7 @@ function harness(
             input_audio_rate_hz: 16000,
             output_audio_rate_hz: 24000,
           },
+          lease_seconds: options.leaseSeconds ?? 90,
         },
         {status: options.startStatus ?? 200},
       )
@@ -252,7 +254,7 @@ describe("GeminiLiveController", () => {
   })
 
   test("heartbeat failure becomes observable", async () => {
-    const h = harness({heartbeatMs: 10, heartbeatStatus: 404})
+    const h = harness({leaseSeconds: 0.03, heartbeatStatus: 404})
     await start(h)
     await waitFor(() => h.errors.length === 1)
     expect(h.errors).toEqual(["OpenAlma heartbeat failed (404)"])

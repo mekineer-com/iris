@@ -10,6 +10,7 @@ type StartResponse = {
     input_audio_rate_hz: number
     output_audio_rate_hz: number
   }
+  lease_seconds: number
 }
 
 export type GeminiCallbacks = {
@@ -40,7 +41,7 @@ export class GeminiLiveController {
   private readonly fetchFn: typeof fetch
   private readonly openSocket: (url: string) => SocketLike
   private readonly setupTimeoutMs: number
-  private readonly heartbeatMs: number
+  private readonly heartbeatMs?: number
   private socket: SocketLike | null = null
   private token = ""
   private sessionId = ""
@@ -63,7 +64,7 @@ export class GeminiLiveController {
     this.fetchFn = options.fetchFn ?? fetch
     this.openSocket = options.openSocket ?? ((url) => new WebSocket(url) as unknown as SocketLike)
     this.setupTimeoutMs = options.setupTimeoutMs ?? REQUEST_TIMEOUT_MS
-    this.heartbeatMs = options.heartbeatMs ?? 30_000
+    this.heartbeatMs = options.heartbeatMs
   }
 
   async start(): Promise<void> {
@@ -80,7 +81,10 @@ export class GeminiLiveController {
       if (generation !== this.generation) throw new Error("Gemini start cancelled")
       await this.connectSocket("")
       if (generation !== this.generation) throw new Error("Gemini start cancelled")
-      this.heartbeatTimer = setInterval(() => void this.heartbeat(), this.heartbeatMs)
+      this.heartbeatTimer = setInterval(
+        () => void this.heartbeat(),
+        this.heartbeatMs ?? Math.floor((response.lease_seconds * 1000) / 3),
+      )
     } catch (error) {
       await this.stop()
       throw error
@@ -132,7 +136,10 @@ export class GeminiLiveController {
       ws.api_version !== "v1alpha" ||
       ws.method !== "BidiGenerateContentConstrained" ||
       ws.input_audio_rate_hz !== 16000 ||
-      ws.output_audio_rate_hz !== 24000
+      ws.output_audio_rate_hz !== 24000 ||
+      typeof body.lease_seconds !== "number" ||
+      !Number.isFinite(body.lease_seconds) ||
+      body.lease_seconds <= 0
     ) {
       throw new Error("OpenAlma Start returned an invalid session contract")
     }
