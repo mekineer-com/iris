@@ -52,7 +52,9 @@ export default function SessionPage() {
           onChange={(event) => void onMode(event.target.value as SessionMode)}
         >
           <option value="continuous">Continuous</option>
-          <option value="manual">Manual</option>
+          <option value="manual" disabled>
+            Manual (Slice 7)
+          </option>
         </select>
       </label>
       <p>

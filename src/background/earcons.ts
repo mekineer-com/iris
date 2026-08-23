@@ -19,6 +19,3 @@ export const EARCONS: Record<EarconName, Uint8Array> = {
   "listen-stop": tone(440, 80),
   disconnected: tone(220, 120),
 }
-
-/** Short 24 kHz PCM16 burst used as the inlined mock speech reply. */
-export const LOOPBACK_PCM = tone(520, 60, 2500)

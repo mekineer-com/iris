@@ -1,6 +1,6 @@
 import {describe, expect, test} from "bun:test"
 
-import {approxBase64ByteLength, parsePcmSampleRate, resamplePcm16Le} from "./audioHelpers"
+import {approxBase64ByteLength, normalizePcm16Audio, parsePcmSampleRate, resamplePcm16Le} from "./audioHelpers"
 
 describe("audioHelpers", () => {
   test("approxBase64ByteLength accounts for padding", () => {
@@ -24,5 +24,20 @@ describe("audioHelpers", () => {
     const out = resamplePcm16Le(input, 16000, 32000)
     expect(out.byteLength).toBe(8)
     expect(resamplePcm16Le(input, 16000, 16000)).toBe(input)
+  })
+
+  test("normalizes supported PCM and rejects bad boundaries", () => {
+    const pcm = Buffer.from([0, 0, 1, 0]).toString("base64")
+    expect(normalizePcm16Audio({data: pcm, format: "pcm_s16le", sampleRate: 16000})).toBe(pcm)
+    expect(Buffer.from(normalizePcm16Audio({data: pcm, format: "pcm_8000"}), "base64").length).toBe(8)
+    expect(() => normalizePcm16Audio({data: pcm, format: "lc3", sampleRate: 16000})).toThrow(
+      "unsupported microphone audio format",
+    )
+    expect(() => normalizePcm16Audio({data: pcm, format: "pcm_8000", sampleRate: 16000})).toThrow(
+      "conflicting microphone sample rates",
+    )
+    expect(() => normalizePcm16Audio({data: "AA==", format: "pcm_s16le", sampleRate: 16000})).toThrow(
+      "complete 16-bit samples",
+    )
   })
 })

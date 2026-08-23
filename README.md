@@ -12,7 +12,9 @@ in `mentra-os/.git/info/exclude`.
 
 MentraOS `package.json` lists `miniapps/*` as workspaces. Keep OpenAlma out of that glob with a local parent line `!miniapps/openalma` (do not push that MentraOS edit upstream). Otherwise `bun install` here rewrites MentraOS `bun.lock` and links the in-tree SDK instead of npm `0.3.0-dev.1`.
 
-Slice 2 is a Start/Stop shell with mock loopback audio. No Gemini or mcp yet.
+Slice 4 connects the existing Start/Stop shell to OpenAlma's authenticated Mentra bootstrap and Gemini Live native audio. Manual mode remains disabled until Slice 7.
+
+Create `.env.local` from `.env.example`. The dedicated bearer is bundled into the private MiniApp and only grants access over the private WireGuard route; the permanent Gemini key stays on the OpenAlma server.
 
 ```
 bun install

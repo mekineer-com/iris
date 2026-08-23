@@ -1,21 +1,27 @@
-import type {MiniappSession, UnsubscribeFn} from "@mentra/miniapp/background"
+import type {AudioChunkData, MiniappSession, UnsubscribeFn} from "@mentra/miniapp/background"
 
 import type {Channels} from "../shared/channels"
 import type {ConnectionState, EarconName, SessionMode, SessionSnapshot} from "../shared/types"
-import {approxBase64ByteLength} from "./audioHelpers"
-import {EARCON_SAMPLE_RATE, EARCONS, LOOPBACK_PCM} from "./earcons"
+import {normalizePcm16Audio} from "./audioHelpers"
+import {EARCON_SAMPLE_RATE, EARCONS} from "./earcons"
+import {GeminiLiveController} from "./GeminiLiveController"
+import type {GeminiCallbacks} from "./GeminiLiveController"
+import type {OpenAlmaConfig} from "./openAlmaConfig"
+import {readOpenAlmaConfig} from "./openAlmaConfig"
 
 type Send = <C extends keyof Channels & string>(channel: C, payload: Channels[C]) => void
 
 type SpeakerWriter = {
   write(chunk: Uint8Array | ArrayBuffer): Promise<{bufferedMs: number}>
+  writeBase64(chunk: string): Promise<{bufferedMs: number}>
   close(): Promise<{durationMs?: number}>
   abort(): Promise<void>
 }
 
 export type SessionControllerOptions = {
   watchdogMs?: number
-  loopbackAfterFrames?: number
+  config?: OpenAlmaConfig
+  createLiveController?: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
 }
 
 const ACTIVE: ReadonlySet<ConnectionState> = new Set(["starting", "listening", "speaking"])
@@ -33,21 +39,26 @@ export class SessionController {
   private speakerEpoch = 0
   private speakerWriter: SpeakerWriter | null = null
   private speakerOpenPromise: Promise<SpeakerWriter | null> | null = null
+  private readonly pendingSpeechWrites = new Set<Promise<void>>()
   private micUnsub: UnsubscribeFn | null = null
   private firstPcmTimeout: ReturnType<typeof setTimeout> | null = null
-  private micFrames = 0
-  private loopbackStarted = false
+  private sawMicFrame = false
   private disconnectedPlayed = false
   private teardownKind: "stop" | "fail" | null = null
   private readonly watchdogMs: number
-  private readonly loopbackAfterFrames: number
+  private readonly config?: OpenAlmaConfig
+  private readonly createLiveController: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
+  private liveController: GeminiLiveController | null
 
   constructor(
     private readonly session: MiniappSession,
     options: SessionControllerOptions = {},
   ) {
     this.watchdogMs = options.watchdogMs ?? 3000
-    this.loopbackAfterFrames = options.loopbackAfterFrames ?? 3
+    this.config = options.config
+    this.createLiveController =
+      options.createLiveController ?? ((config, callbacks) => new GeminiLiveController(config, callbacks))
+    this.liveController = null
   }
 
   start(): void {
@@ -84,7 +95,8 @@ export class SessionController {
     this.unsubs.push(
       ui.handle("openalma:set-mode", (payload) => {
         const mode = (payload as {mode?: SessionMode} | null)?.mode
-        if (mode === "continuous" || mode === "manual") this.mode = mode
+        if (mode === "manual") throw new Error("Manual mode is available in Slice 7")
+        if (mode === "continuous") this.mode = mode
         this.pushSnapshot()
         return {ok: true as const}
       }),
@@ -93,9 +105,6 @@ export class SessionController {
 
   async interrupt(): Promise<void> {
     this.speakerEpoch += 1
-    this.cancelLoopback()
-    this.loopbackStarted = false
-    this.micFrames = 0
     await this.abortCurrentWriter()
     if (this.connection === "speaking") {
       this.connection = "listening"
@@ -146,23 +155,40 @@ export class SessionController {
     if (this.startInFlight || ACTIVE.has(this.connection) || this.connection === "stopping") {
       return
     }
+    if (mode !== "continuous") throw new Error("Manual mode is available in Slice 7")
 
     this.startInFlight = true
     const generation = ++this.startGeneration
     this.mode = mode
     this.lastError = null
     this.disconnectedPlayed = false
-    this.micFrames = 0
-    this.loopbackStarted = false
+    this.sawMicFrame = false
     this.connection = "starting"
     this.pushSnapshot()
 
     try {
+      if (!this.liveController) {
+        this.liveController = this.createLiveController(this.config ?? readOpenAlmaConfig(), {
+          onAudio: (pcm) => this.onGeminiAudio(pcm),
+          onTurnComplete: () => void this.finishSpeech(),
+          onInterrupted: () => void this.interrupt(),
+          onError: (error) => void this.fail(error),
+        })
+      }
+      await this.liveController.start()
+      if (generation !== this.startGeneration) {
+        await this.stopLiveController()
+        return
+      }
       await this.playEarcon("listen-start")
-      if (generation !== this.startGeneration) return
+      if (generation !== this.startGeneration) {
+        await this.stopLiveController()
+        return
+      }
       this.subscribeMic()
       if (generation !== this.startGeneration) {
         this.stopMic()
+        await this.stopLiveController()
         return
       }
       this.connection = "listening"
@@ -181,7 +207,6 @@ export class SessionController {
     this.startGeneration += 1
     this.startInFlight = false
     this.clearFirstPcmTimeout()
-    this.cancelLoopback()
     this.stopMic()
     this.speakerEpoch += 1
     return this.startGeneration
@@ -192,6 +217,11 @@ export class SessionController {
     this.speakerWriter = null
     this.speakerOpenPromise = null
     if (!writer) return
+    try {
+      this.session.speaker.stop()
+    } catch {
+      /* host may reject a stale stop */
+    }
     try {
       await writer.abort()
     } catch {
@@ -217,6 +247,7 @@ export class SessionController {
     if (userStop) this.lastError = null
     this.pushSnapshot()
     await this.abortCurrentWriter()
+    await this.stopLiveController()
     if (generation !== this.startGeneration) return
     if (userStop) {
       try {
@@ -239,6 +270,7 @@ export class SessionController {
     const generation = this.beginTeardown("fail")
     this.pushSnapshot()
     await this.abortCurrentWriter()
+    await this.stopLiveController()
     if (generation !== this.startGeneration) return
     if (!this.disconnectedPlayed) {
       this.disconnectedPlayed = true
@@ -257,7 +289,7 @@ export class SessionController {
   private subscribeMic(): void {
     this.stopMic()
     this.micUnsub = this.session.mic.onAudioChunk((chunk) => {
-      this.handlePcmFrame(chunk.data)
+      this.handlePcmFrame(chunk)
     })
     this.startFirstPcmWatchdog()
   }
@@ -295,31 +327,52 @@ export class SessionController {
     }, this.watchdogMs)
   }
 
-  private handlePcmFrame(base64Pcm: string): void {
+  private handlePcmFrame(chunk: AudioChunkData): void {
     if (!ACTIVE.has(this.connection) && this.connection !== "starting") return
-    if (approxBase64ByteLength(base64Pcm) < 1) return
-    this.micFrames += 1
-    if (this.micFrames === 1) this.clearFirstPcmTimeout()
-    if (!this.loopbackStarted && this.micFrames >= this.loopbackAfterFrames) {
-      this.loopbackStarted = true
-      void this.playLoopback()
+    try {
+      const normalized = normalizePcm16Audio(chunk)
+      if (!this.sawMicFrame) {
+        this.sawMicFrame = true
+        this.clearFirstPcmTimeout()
+      }
+      this.liveController?.sendAudio(normalized)
+    } catch (error) {
+      void this.fail(error)
     }
   }
 
-  private cancelLoopback(): void {
-    this.loopbackStarted = true
+  private onGeminiAudio(base64Pcm: string): void {
+    if (this.connection !== "listening" && this.connection !== "speaking") return
+    if (this.connection !== "speaking") {
+      this.connection = "speaking"
+      this.pushSnapshot()
+    }
+    const write = this.writeSpeech(base64Pcm)
+    this.pendingSpeechWrites.add(write)
+    void write.finally(() => this.pendingSpeechWrites.delete(write))
   }
 
-  private async playLoopback(): Promise<void> {
+  private async writeSpeech(base64Pcm: string): Promise<void> {
     const epoch = this.speakerEpoch
+    try {
+      const writer = await this.ensureSpeechWriter(epoch)
+      if (!writer || epoch !== this.speakerEpoch) return
+      await writer.writeBase64(base64Pcm)
+    } catch {
+      if (epoch === this.speakerEpoch) await this.fail(new Error("speaker write failed"))
+    }
+  }
+
+  private async ensureSpeechWriter(epoch: number): Promise<SpeakerWriter | null> {
+    if (this.speakerWriter && epoch === this.speakerEpoch) return this.speakerWriter
     if (this.speakerOpenPromise) {
       const existing = await this.speakerOpenPromise
-      if (epoch !== this.speakerEpoch) return
-      if (existing) return
+      if (epoch !== this.speakerEpoch) return null
+      return existing
     }
-    this.speakerOpenPromise = (async () => {
+    const opening = (async () => {
       const writer = (await this.session.speaker.createStream({
-        sampleRate: EARCON_SAMPLE_RATE,
+        sampleRate: 24000,
         stopOtherAudio: true,
       })) as SpeakerWriter
       if (epoch !== this.speakerEpoch) {
@@ -333,19 +386,39 @@ export class SessionController {
       this.speakerWriter = writer
       return writer
     })()
-    const writer = await this.speakerOpenPromise
-    this.speakerOpenPromise = null
-    if (!writer || epoch !== this.speakerEpoch) return
-    this.connection = "speaking"
-    this.pushSnapshot()
-    try {
-      if (epoch !== this.speakerEpoch) return
-      await writer.write(LOOPBACK_PCM)
-      if (epoch !== this.speakerEpoch) return
-      this.connection = "listening"
-      this.pushSnapshot()
-    } catch {
-      if (epoch === this.speakerEpoch) await this.fail(new Error("speaker write failed"))
+    this.speakerOpenPromise = opening
+    const writer = await opening
+    if (this.speakerOpenPromise === opening) this.speakerOpenPromise = null
+    return writer
+  }
+
+  private async finishSpeech(): Promise<void> {
+    const epoch = this.speakerEpoch
+    await Promise.all(this.pendingSpeechWrites)
+    if (epoch !== this.speakerEpoch) return
+    const writer = this.speakerWriter ?? (await this.speakerOpenPromise)
+    if (!writer || epoch !== this.speakerEpoch) {
+      if (this.connection === "speaking") {
+        this.connection = "listening"
+        this.pushSnapshot()
+      }
+      return
     }
+    try {
+      await writer.close()
+      if (this.speakerWriter === writer) this.speakerWriter = null
+      if (epoch === this.speakerEpoch && this.connection === "speaking") {
+        this.connection = "listening"
+        this.pushSnapshot()
+      }
+    } catch {
+      if (epoch === this.speakerEpoch) await this.fail(new Error("speaker close failed"))
+    }
+  }
+
+  private async stopLiveController(): Promise<void> {
+    const controller = this.liveController
+    this.liveController = null
+    if (controller) await controller.stop()
   }
 }

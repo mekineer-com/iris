@@ -42,6 +42,15 @@ for (const [k, v] of Object.entries(process.env)) {
     define[`process.env.${k}`] = JSON.stringify(v)
   }
 }
+for (const key of [
+  "MENTRA_PUBLIC_OPENALMA_BASE_URL",
+  "MENTRA_PUBLIC_OPENALMA_BEARER",
+  "MENTRA_PUBLIC_OPENALMA_USER_ID",
+  "MENTRA_PUBLIC_OPENALMA_SOUL_ID",
+  "MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID",
+]) {
+  define[`process.env.${key}`] ??= JSON.stringify("")
+}
 
 const backgroundResult = await Bun.build({
   entrypoints: ["./src/background/index.ts"],
