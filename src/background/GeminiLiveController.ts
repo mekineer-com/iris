@@ -196,7 +196,7 @@ export class GeminiLiveController {
       const errorBody = response.status === 409 ? await response.clone().json().catch(() => null) : null
       if (
         attempt === 0 &&
-        errorBody?.detail === "Mentra history changed during Start; retry"
+        errorBody?.detail?.code === "mentra_history_changed"
       ) {
         continue
       }
@@ -343,7 +343,7 @@ export class GeminiLiveController {
     }
     this.outputTranscript += output
     if (interrupted) {
-      this.finalizeInterruptedTurn()
+      this.finalizeInterruptedTurn(true)
       this.callbacks.onInterrupted()
     }
     if (content.turnComplete === true) {
@@ -376,12 +376,13 @@ export class GeminiLiveController {
     this.scheduleAppend()
   }
 
-  private finalizeInterruptedTurn(): void {
+  private finalizeInterruptedTurn(userComplete = false): void {
     const input = this.inputTranscript.trim()
     const output = this.outputTranscript.trim()
     this.clearTurn()
-    if (input) this.enqueueEvent("transcript", "user", input, "interrupted")
+    if (input) this.enqueueEvent("transcript", "user", input, userComplete ? "complete" : "interrupted")
     if (output) this.enqueueEvent("transcript", "assistant", output, "interrupted")
+    if (input && userComplete) this.completeUserTurns += 1
     this.interruptionFinalized = true
     if (input || output) this.scheduleAppend()
   }
@@ -481,6 +482,10 @@ export class GeminiLiveController {
   private async handleUnexpectedClose(): Promise<void> {
     this.socket = null
     this.ready = false
+    if (this.reflecting) {
+      this.finishReflection(null)
+      return
+    }
     if (this.inputTranscript.trim() || this.outputTranscript.trim()) {
       this.finalizeInterruptedTurn()
     } else {

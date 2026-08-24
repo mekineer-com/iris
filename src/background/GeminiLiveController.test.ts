@@ -173,7 +173,7 @@ describe("GeminiLiveController", () => {
   test("retries one stale-bootstrap conflict", async () => {
     const h = harness({
       startResults: [
-        {status: 409, body: {detail: "Mentra history changed during Start; retry"}},
+        {status: 409, body: {detail: {code: "mentra_history_changed"}}},
         {
           status: 200,
           body: {
@@ -267,13 +267,29 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
     const appends = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
     expect(appends[0].body.events.map((event: any) => [event.content, event.status])).toEqual([
-      ["first question", "interrupted"],
+      ["first question", "complete"],
       ["partial answer", "interrupted"],
       ["second question", "complete"],
       ["second answer", "complete"],
     ])
     expect(h.events).toEqual(["interrupted", "turnComplete", "turnComplete"])
     await h.controller.stop()
+  })
+
+  test("completed barge-in input counts toward the reflection gate", async () => {
+    const h = harness()
+    await start(h)
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "first question"}}})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
+    h.sockets[0].message({serverContent: {interrupted: true}})
+    h.sockets[0].message({serverContent: {turnComplete: true}})
+    completeTurn(h, "second question", "second answer")
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+
+    const stopping = h.controller.stop(true)
+    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "NO_SUMMARY"}, turnComplete: true}})
+    await stopping
   })
 
   test("fails loud when a completed turn lacks either transcript side", async () => {
@@ -438,6 +454,26 @@ describe("GeminiLiveController", () => {
 
     expect(h.errors).toContain("Gemini returned input transcription during reflection")
     expect(h.requests.filter((request) => request.url.endsWith("/end"))).toHaveLength(1)
+  })
+
+  test("socket close during reflection discards partial private reflection", async () => {
+    const h = harness()
+    await start(h)
+    completeTurn(h, "one", "answer one")
+    completeTurn(h, "two", "answer two")
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+
+    const stopping = h.controller.stop(true)
+    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "private partial"}}})
+    h.sockets[0].close()
+    await stopping
+
+    const events = h.requests
+      .filter((request) => request.url.endsWith("/transcripts/append"))
+      .flatMap((request) => request.body.events)
+    expect(events.some((event: any) => event.content === "private partial")).toBe(false)
+    expect(h.sockets).toHaveLength(1)
   })
 
   test("resumes once with the latest private handle", async () => {
