@@ -254,6 +254,7 @@ export class GeminiLiveController {
           this.handleMessage(message)
         } catch (error) {
           const normalized = error instanceof Error ? error : new Error(String(error))
+          if (this.reflecting) this.finishReflection(null)
           if (ready) this.reportError(normalized)
           else finish(normalized)
         }

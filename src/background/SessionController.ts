@@ -263,10 +263,11 @@ export class SessionController {
   }
 
   private async runTeardown(): Promise<void> {
+    const graceful = this.teardownKind === "stop"
     const generation = this.beginTeardown(this.teardownKind ?? "fail")
     this.pushSnapshot()
     await this.abortCurrentWriter()
-    await this.stopLiveController(this.teardownKind === "stop")
+    await this.stopLiveController(graceful)
     await this.speechFinishTail
     await this.finishSpeech()
     if (generation !== this.startGeneration) return

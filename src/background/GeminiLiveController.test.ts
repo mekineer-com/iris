@@ -392,6 +392,22 @@ describe("GeminiLiveController", () => {
     expect(h.audio.at(-1)).toBe("AAAAAA==")
   })
 
+  test("unexpected input during reflection ends reflection immediately", async () => {
+    const h = harness()
+    await start(h)
+    completeTurn(h, "one", "answer one")
+    completeTurn(h, "two", "answer two")
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+
+    const stopping = h.controller.stop(true)
+    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "unexpected"}}})
+    await stopping
+
+    expect(h.errors).toContain("Gemini returned input transcription during reflection")
+    expect(h.requests.filter((request) => request.url.endsWith("/end"))).toHaveLength(1)
+  })
+
   test("resumes once with the latest private handle", async () => {
     const h = harness()
     await start(h)

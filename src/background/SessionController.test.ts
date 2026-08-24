@@ -85,6 +85,7 @@ class FakeSession {
   snapshots: Snapshot[] = []
   createGate: Promise<void> | null = null
   closeGate: Promise<void> | null = null
+  abortGate: Promise<void> | null = null
   createErrorOnce = false
 
   ui = {
@@ -148,6 +149,7 @@ class FakeSession {
         },
         abort: async () => {
           rec.aborted = true
+          if (this.abortGate) await this.abortGate
         },
       }
     },
@@ -379,6 +381,30 @@ describe("SessionController", () => {
     await stop
     expect(harness.live.stops).toBe(1)
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "idle", lastError: null})
+  })
+
+  test("Stop during a blocked fatal teardown cannot request reflection", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    harness.live.audio()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    let release!: () => void
+    harness.session.abortGate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    harness.live.persistenceOnStop = "Transcript sync failed; last turns were not saved"
+
+    harness.live.fail("provider failed")
+    await Promise.resolve()
+    const stop = harness.session.handlers["openalma:stop"]({})
+    release()
+    await stop
+
+    expect(harness.live.stopArgs).toEqual([false])
+    expect(lastSnapshot(harness.session)).toMatchObject({
+      connection: "idle",
+      lastError: "Transcript sync failed; last turns were not saved",
+    })
   })
 
   test("graceful teardown closes reflection audio without turnComplete", async () => {
