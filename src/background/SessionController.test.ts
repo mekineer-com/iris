@@ -196,6 +196,26 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)?.connection).toBe("idle")
   })
 
+  test("keeps Gemini speech that arrives during the start earcon", async () => {
+    const harness = setup()
+    let release!: () => void
+    harness.session.closeGate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const start = harness.session.handlers["openalma:start"]({mode: "continuous"})
+    while (harness.session.streams.length === 0) await new Promise((resolve) => setTimeout(resolve, 0))
+
+    harness.live.audio()
+    harness.live.turnComplete()
+    release()
+    await start
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(harness.session.streams[1]?.writes).toEqual([silentPcm()])
+    expect(harness.session.streams[1]?.closed).toBe(true)
+    expect(lastSnapshot(harness.session)?.connection).toBe("listening")
+  })
+
   test("normalizes mic PCM and drains Gemini speech", async () => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "continuous"})

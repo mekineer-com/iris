@@ -40,6 +40,8 @@ export class SessionController {
   private speakerWriter: SpeakerWriter | null = null
   private speakerOpenPromise: Promise<SpeakerWriter | null> | null = null
   private readonly pendingSpeechWrites = new Set<Promise<void>>()
+  private startupAudio: string[] = []
+  private startupTurnComplete = false
   private speechFinishTail: Promise<void> = Promise.resolve()
   private micUnsub: UnsubscribeFn | null = null
   private firstPcmTimeout: ReturnType<typeof setTimeout> | null = null
@@ -170,7 +172,10 @@ export class SessionController {
       if (!this.liveController) {
         this.liveController = this.createLiveController(this.config ?? readOpenAlmaConfig(), {
           onAudio: (pcm) => this.onGeminiAudio(pcm),
-          onTurnComplete: () => this.queueFinishSpeech(),
+          onTurnComplete: () => {
+            if (this.connection === "starting") this.startupTurnComplete = true
+            else this.queueFinishSpeech()
+          },
           onInterrupted: () => void this.interrupt(),
           onPersistenceError: (message) => {
             if (message || this.lastError === "Transcript sync failed; retrying") {
@@ -199,6 +204,11 @@ export class SessionController {
       }
       this.connection = "listening"
       this.pushSnapshot()
+      for (const pcm of this.startupAudio.splice(0)) this.onGeminiAudio(pcm)
+      if (this.startupTurnComplete) {
+        this.startupTurnComplete = false
+        this.queueFinishSpeech()
+      }
     } catch (error) {
       if (generation !== this.startGeneration) return
       await this.fail(error)
@@ -214,6 +224,8 @@ export class SessionController {
     this.startInFlight = false
     this.clearFirstPcmTimeout()
     this.stopMic()
+    this.startupAudio = []
+    this.startupTurnComplete = false
     this.speakerEpoch += 1
     return this.startGeneration
   }
@@ -349,6 +361,10 @@ export class SessionController {
 
   private onGeminiAudio(base64Pcm: string): void {
     const reflection = this.connection === "stopping" && this.teardownKind === "stop"
+    if (this.connection === "starting") {
+      this.startupAudio.push(base64Pcm)
+      return
+    }
     if (!reflection && this.connection !== "listening" && this.connection !== "speaking") return
     if (!reflection && this.connection !== "speaking") {
       this.connection = "speaking"
