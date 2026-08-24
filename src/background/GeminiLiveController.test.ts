@@ -371,6 +371,30 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("answers batched recalls by provider call ID", async () => {
+    const h = harness()
+    await start(h)
+    h.sockets[0].message({
+      toolCall: {
+        functionCalls: [
+          {id: "batch-1", name: "recall_memory", args: {query: "first"}},
+          {id: "batch-2", name: "recall_memory", args: {query: "second"}},
+        ],
+      },
+    })
+
+    await waitFor(
+      () => h.sockets[0].sent.filter((value) => JSON.parse(value).toolResponse).length === 2,
+    )
+    const ids = h.sockets[0].sent
+      .map((value) => JSON.parse(value).toolResponse?.functionResponses?.[0]?.id)
+      .filter(Boolean)
+    expect(ids).toEqual(["batch-1", "batch-2"])
+    expect(h.requests.filter((request) => request.url.endsWith("/recall")).map((request) => request.body.query))
+      .toEqual(["first", "second"])
+    await h.controller.stop()
+  })
+
   test("pending recall follows a same-sitting socket replacement", async () => {
     let release!: () => void
     const gate = new Promise<void>((resolve) => {

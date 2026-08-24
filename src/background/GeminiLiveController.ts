@@ -409,33 +409,41 @@ export class GeminiLiveController {
     if (this.stopping || this.reflecting) throw new Error("Gemini requested memory during teardown")
     if (!value || typeof value !== "object") throw new Error("Gemini returned malformed tool call")
     const calls = (value as {functionCalls?: unknown}).functionCalls
-    if (!Array.isArray(calls) || calls.length !== 1) {
+    if (!Array.isArray(calls) || !calls.length) {
       throw new Error("Gemini returned malformed tool call")
     }
-    const call = calls[0]
-    const id = typeof call?.id === "string" ? call.id.trim() : ""
-    const name = typeof call?.name === "string" ? call.name : ""
-    const args = call?.args
-    const query = args && typeof args === "object" && !Array.isArray(args)
-      ? (args as {query?: unknown}).query
-      : undefined
-    if (
-      !id ||
-      name !== "recall_memory" ||
-      typeof query !== "string" ||
-      !query.trim() ||
-      Object.keys(args as object).some((key) => key !== "query") ||
-      this.pendingToolCalls.has(id)
-    ) {
-      throw new Error("Gemini returned malformed recall_memory call")
+    const parsed: Array<{id: string; query: string}> = []
+    const ids = new Set<string>()
+    for (const call of calls) {
+      const id = typeof call?.id === "string" ? call.id.trim() : ""
+      const name = typeof call?.name === "string" ? call.name : ""
+      const args = call?.args
+      const query = args && typeof args === "object" && !Array.isArray(args)
+        ? (args as {query?: unknown}).query
+        : undefined
+      if (
+        !id ||
+        name !== "recall_memory" ||
+        typeof query !== "string" ||
+        !query.trim() ||
+        Object.keys(args as object).some((key) => key !== "query") ||
+        ids.has(id) ||
+        this.pendingToolCalls.has(id)
+      ) {
+        throw new Error("Gemini returned malformed recall_memory call")
+      }
+      ids.add(id)
+      parsed.push({id, query: query.trim()})
     }
-    const pending: PendingToolCall = {
-      generation: this.generation,
-      sessionId: this.sessionId,
+    for (const {id, query} of parsed) {
+      const pending: PendingToolCall = {
+        generation: this.generation,
+        sessionId: this.sessionId,
+      }
+      this.pendingToolCalls.set(id, pending)
+      void this.runRecall(id, query, pending)
     }
-    this.pendingToolCalls.set(id, pending)
     this.toolContextPending = true
-    void this.runRecall(id, query.trim(), pending)
   }
 
   private handleToolCancellation(value: unknown): void {
