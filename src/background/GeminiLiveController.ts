@@ -31,6 +31,12 @@ type TranscriptEvent = {
   status?: "complete" | "interrupted"
 }
 
+type PendingToolCall = {
+  generation: number
+  sessionId: string
+  response?: string
+}
+
 type SocketLike = {
   readyState: number
   send(data: string): void
@@ -47,6 +53,7 @@ export type GeminiLiveControllerOptions = {
 
 const WS_OPEN = 1
 const REQUEST_TIMEOUT_MS = 10_000
+const RECALL_TIMEOUT_MS = 30_000
 const REFLECTION_TIMEOUT_MS = 8_000
 export const SITTING_REFLECTION_PROMPT =
   "Reflect briefly in first person on the emotional tone, subtext, or meaningful shift in this sitting that the literal transcript may not preserve. Do not recap the conversation. Respond with one or two natural sentences, or exactly NO_SUMMARY if nothing worthwhile would be added."
@@ -79,6 +86,8 @@ export class GeminiLiveController {
   private stopPromise: Promise<void> | null = null
   private generation = 0
   private ready = false
+  private pendingToolCalls = new Map<string, PendingToolCall>()
+  private toolContextPending = false
 
   constructor(
     private readonly config: OpenAlmaConfig,
@@ -110,6 +119,8 @@ export class GeminiLiveController {
     this.reflecting = false
     this.reflectionResolve = null
     this.stopPromise = null
+    this.pendingToolCalls.clear()
+    this.toolContextPending = false
     try {
       const response = await this.requestStart()
       this.token = response.ephemeral_token
@@ -179,6 +190,8 @@ export class GeminiLiveController {
       const socket = this.socket
       this.socket = null
       socket?.close()
+      this.pendingToolCalls.clear()
+      this.toolContextPending = false
       await this.endLease()
     }
   }
@@ -260,6 +273,7 @@ export class GeminiLiveController {
           if (message.setupComplete !== undefined) {
             ready = true
             this.ready = true
+            this.flushToolResponses()
             finish()
           }
           this.handleMessage(message)
@@ -298,8 +312,17 @@ export class GeminiLiveController {
       this.resumptionHandle = update.newHandle
     }
 
-    const content = message.serverContent
-    if (content === undefined) return
+    const hasToolCall = message.toolCall !== undefined
+    if (message.serverContent !== undefined) {
+      this.handleServerContent(message.serverContent, hasToolCall)
+    }
+    if (hasToolCall) this.handleToolCall(message.toolCall)
+    if (message.toolCallCancellation !== undefined) {
+      this.handleToolCancellation(message.toolCallCancellation)
+    }
+  }
+
+  private handleServerContent(content: any, hasToolCall: boolean): void {
     if (!content || typeof content !== "object") throw new Error("Gemini returned malformed server content")
     const interrupted = content.interrupted === true
     const parts = content.modelTurn?.parts
@@ -350,8 +373,9 @@ export class GeminiLiveController {
       if (this.interruptionFinalized) {
         this.interruptionFinalized = false
       } else {
-        this.finalizeCompleteTurn()
+        this.finalizeCompleteTurn(hasToolCall || this.toolContextPending)
       }
+      if (this.toolContextPending && !hasToolCall) this.toolContextPending = false
       this.turnActive = false
       this.callbacks.onTurnComplete()
     }
@@ -365,15 +389,136 @@ export class GeminiLiveController {
     return (value as {text: string}).text
   }
 
-  private finalizeCompleteTurn(): void {
+  private finalizeCompleteTurn(allowOneSided = false): void {
     const input = this.inputTranscript.trim()
     const output = this.outputTranscript.trim()
     this.clearTurn()
-    if (!input || !output) throw new Error("Gemini completed a turn without both transcriptions")
-    this.enqueueEvent("transcript", "user", input, "complete")
-    this.enqueueEvent("transcript", "assistant", output, "complete")
-    this.completeUserTurns += 1
+    if (!input && !output) throw new Error("Gemini completed a turn without transcription")
+    if (!allowOneSided && (!input || !output)) {
+      throw new Error("Gemini completed a turn without both transcriptions")
+    }
+    if (input) {
+      this.enqueueEvent("transcript", "user", input, "complete")
+      this.completeUserTurns += 1
+    }
+    if (output) this.enqueueEvent("transcript", "assistant", output, "complete")
     this.scheduleAppend()
+  }
+
+  private handleToolCall(value: unknown): void {
+    if (this.stopping || this.reflecting) throw new Error("Gemini requested memory during teardown")
+    if (!value || typeof value !== "object") throw new Error("Gemini returned malformed tool call")
+    const calls = (value as {functionCalls?: unknown}).functionCalls
+    if (!Array.isArray(calls) || calls.length !== 1) {
+      throw new Error("Gemini returned malformed tool call")
+    }
+    const call = calls[0]
+    const id = typeof call?.id === "string" ? call.id.trim() : ""
+    const name = typeof call?.name === "string" ? call.name : ""
+    const args = call?.args
+    const query = args && typeof args === "object" && !Array.isArray(args)
+      ? (args as {query?: unknown}).query
+      : undefined
+    if (
+      !id ||
+      name !== "recall_memory" ||
+      typeof query !== "string" ||
+      !query.trim() ||
+      Object.keys(args as object).some((key) => key !== "query") ||
+      this.pendingToolCalls.has(id)
+    ) {
+      throw new Error("Gemini returned malformed recall_memory call")
+    }
+    const pending: PendingToolCall = {
+      generation: this.generation,
+      sessionId: this.sessionId,
+    }
+    this.pendingToolCalls.set(id, pending)
+    this.toolContextPending = true
+    void this.runRecall(id, query.trim(), pending)
+  }
+
+  private handleToolCancellation(value: unknown): void {
+    if (!value || typeof value !== "object") throw new Error("Gemini returned malformed tool cancellation")
+    const ids = (value as {ids?: unknown}).ids
+    if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string" || !id.trim())) {
+      throw new Error("Gemini returned malformed tool cancellation")
+    }
+    for (const id of ids) this.pendingToolCalls.delete(id)
+    if (!this.pendingToolCalls.size) this.toolContextPending = false
+  }
+
+  private async runRecall(id: string, query: string, pending: PendingToolCall): Promise<void> {
+    let response: Response
+    try {
+      response = await this.request(
+        `/integration/mentra/session/${this.sessionId}/recall`,
+        {user_id: this.config.userId, soul_id: this.config.soulId, query},
+        RECALL_TIMEOUT_MS,
+      )
+    } catch {
+      this.completeRecall(id, pending, "Memory recall is temporarily unavailable.", true)
+      return
+    }
+    if ([400, 401, 403, 404, 409, 422].includes(response.status)) {
+      this.failRecall(id, pending, `OpenAlma memory recall failed (${response.status})`)
+      return
+    }
+    if (!response.ok) {
+      this.completeRecall(id, pending, "Memory recall is temporarily unavailable.", true)
+      return
+    }
+    const body = await response.json().catch(() => null) as {context?: unknown; retrieve_ms?: unknown} | null
+    if (
+      !body ||
+      typeof body.context !== "string" ||
+      !body.context.trim() ||
+      (body.retrieve_ms !== null && body.retrieve_ms !== undefined &&
+        (typeof body.retrieve_ms !== "number" || !Number.isFinite(body.retrieve_ms)))
+    ) {
+      this.failRecall(id, pending, "OpenAlma memory recall returned an invalid response")
+      return
+    }
+    this.completeRecall(id, pending, body.context.trim(), false)
+  }
+
+  private completeRecall(id: string, pending: PendingToolCall, result: string, failed: boolean): void {
+    if (this.pendingToolCalls.get(id) !== pending) return
+    pending.response = result
+    if (failed) this.callbacks.onPersistenceError("Memory recall unavailable; voice is continuing")
+    this.flushToolResponses()
+  }
+
+  private failRecall(id: string, pending: PendingToolCall, message: string): void {
+    if (this.pendingToolCalls.get(id) !== pending) return
+    this.pendingToolCalls.delete(id)
+    this.reportError(new Error(message))
+  }
+
+  private flushToolResponses(): void {
+    for (const [id, pending] of this.pendingToolCalls) {
+      if (!pending.response) continue
+      if (
+        pending.generation !== this.generation ||
+        pending.sessionId !== this.sessionId ||
+        this.stopping ||
+        this.reflecting
+      ) {
+        this.pendingToolCalls.delete(id)
+        continue
+      }
+      if (!this.ready || !this.socket || this.socket.readyState !== WS_OPEN) continue
+      this.socket.send(JSON.stringify({
+        toolResponse: {
+          functionResponses: [{
+            id,
+            name: "recall_memory",
+            response: {result: pending.response, scheduling: "SILENT"},
+          }],
+        },
+      }))
+      this.pendingToolCalls.delete(id)
+    }
   }
 
   private finalizeInterruptedTurn(userComplete = false): void {
@@ -531,9 +676,9 @@ export class GeminiLiveController {
     }
   }
 
-  private request(path: string, body: unknown): Promise<Response> {
+  private request(path: string, body: unknown, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Response> {
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+    const timeout = setTimeout(() => controller.abort(), timeoutMs)
     return this.fetchFn(`${this.config.baseUrl}${path}`, {
       method: "POST",
       headers: {
@@ -553,6 +698,8 @@ export class GeminiLiveController {
   private reportError(error: Error): void {
     if (this.stopping || this.errorReported) return
     this.errorReported = true
+    this.pendingToolCalls.clear()
+    this.toolContextPending = false
     this.clearHeartbeat()
     this.callbacks.onError(error)
   }

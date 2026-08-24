@@ -59,6 +59,9 @@ function harness(
     startResults?: Array<{status: number; body: unknown}>
     leaseSeconds?: number
     appendStatuses?: number[]
+    recallGate?: Promise<void>
+    recallStatus?: number
+    recallBody?: unknown
   } = {},
 ) {
   const sockets: FakeSocket[] = []
@@ -93,6 +96,13 @@ function harness(
       )
     }
     if (url.endsWith("/heartbeat")) return Response.json({ok: true}, {status: options.heartbeatStatus ?? 200})
+    if (url.endsWith("/recall")) {
+      if (options.recallGate) await options.recallGate
+      return Response.json(
+        options.recallBody ?? {ok: true, context: "A compact fictional memory.", retrieve_ms: 123},
+        {status: options.recallStatus ?? 200},
+      )
+    }
     if (url.endsWith("/transcripts/append")) {
       return Response.json(
         {ok: true, ack_sequence: body.events.at(-1)?.sequence ?? 0},
@@ -239,6 +249,210 @@ describe("GeminiLiveController", () => {
       ],
     })
     await h.controller.stop()
+  })
+
+  test("processes audio while recall is pending and preserves tool-boundary speech", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const h = harness({recallGate: gate})
+    await start(h)
+
+    h.sockets[0].message({
+      serverContent: {
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
+        inputTranscription: {text: "remember the beacon"},
+        turnComplete: true,
+      },
+      toolCall: {
+        functionCalls: [{id: "call-1", name: "recall_memory", args: {query: "beacon"}}],
+      },
+    })
+    expect(h.audio).toEqual(["AAAAAA=="])
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/recall")))
+    const recall = h.requests.find((request) => request.url.endsWith("/recall"))!
+    expect(recall.body).toEqual({user_id: "Test User", soul_id: "Test Soul", query: "beacon"})
+    expect(recall.authorization).toBe("Bearer fictional-bearer")
+
+    h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
+    expect(h.audio).toEqual(["AAAAAA==", "AAAAAA=="])
+    expect(h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse)).toBe(false)
+
+    release()
+    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse))
+    expect(JSON.parse(h.sockets[0].sent.find((value) => JSON.parse(value).toolResponse)!)).toEqual({
+      toolResponse: {
+        functionResponses: [{
+          id: "call-1",
+          name: "recall_memory",
+          response: {result: "A compact fictional memory.", scheduling: "SILENT"},
+        }],
+      },
+    })
+
+    h.sockets[0].message({
+      serverContent: {outputTranscription: {text: "I remembered it."}, turnComplete: true},
+    })
+    await waitFor(
+      () => h.requests
+        .filter((request) => request.url.endsWith("/transcripts/append"))
+        .flatMap((request) => request.body.events).length === 2,
+    )
+    const events = h.requests
+      .filter((request) => request.url.endsWith("/transcripts/append"))
+      .flatMap((request) => request.body.events)
+    expect(events.map((event: any) => [event.role, event.content, event.status])).toEqual([
+      ["user", "remember the beacon", "complete"],
+      ["assistant", "I remembered it.", "complete"],
+    ])
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("temporary recall failure is SILENT and nonfatal", async () => {
+    const h = harness({recallStatus: 502, recallBody: {detail: "private upstream detail"}})
+    await start(h)
+    h.sockets[0].message({
+      toolCall: {
+        functionCalls: [{id: "call-2", name: "recall_memory", args: {query: "private query"}}],
+      },
+    })
+
+    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse))
+    const response = JSON.parse(h.sockets[0].sent.find((value) => JSON.parse(value).toolResponse)!)
+    expect(response.toolResponse.functionResponses[0].response).toEqual({
+      result: "Memory recall is temporarily unavailable.",
+      scheduling: "SILENT",
+    })
+    expect(h.persistenceErrors).toContain("Memory recall unavailable; voice is continuing")
+    expect(JSON.stringify({response, errors: h.errors, persistenceErrors: h.persistenceErrors})).not.toContain(
+      "private",
+    )
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("recall scope failure is fatal without exposing the query", async () => {
+    const h = harness({recallStatus: 404, recallBody: {detail: "private scope detail"}})
+    await start(h)
+    h.sockets[0].message({
+      toolCall: {
+        functionCalls: [{id: "call-fatal", name: "recall_memory", args: {query: "private query"}}],
+      },
+    })
+
+    await waitFor(() => h.errors.length === 1)
+    expect(h.errors).toEqual(["OpenAlma memory recall failed (404)"])
+    expect(h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse)).toBe(false)
+    expect(JSON.stringify(h.errors)).not.toContain("private")
+    await h.controller.stop()
+  })
+
+  test("cancelled recall never sends a late tool response", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const h = harness({recallGate: gate})
+    await start(h)
+    h.sockets[0].message({
+      toolCall: {
+        functionCalls: [{id: "call-3", name: "recall_memory", args: {query: "cancel me"}}],
+      },
+    })
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/recall")))
+    h.sockets[0].message({toolCallCancellation: {ids: ["call-3"]}})
+    release()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse)).toBe(false)
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("pending recall follows a same-sitting socket replacement", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const h = harness({recallGate: gate})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].message({
+      toolCall: {
+        functionCalls: [{id: "call-4", name: "recall_memory", args: {query: "resume"}}],
+      },
+    })
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/recall")))
+    h.sockets[0].error()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    h.sockets[1].message({setupComplete: {}})
+    release()
+    await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).toolResponse))
+
+    expect(h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse)).toBe(false)
+    expect(JSON.parse(h.sockets[1].sent.find((value) => JSON.parse(value).toolResponse)!))
+      .toEqual({
+        toolResponse: {
+          functionResponses: [{
+            id: "call-4",
+            name: "recall_memory",
+            response: {result: "A compact fictional memory.", scheduling: "SILENT"},
+          }],
+        },
+      })
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("graceful reflection discards a late recall result", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const h = harness({recallGate: gate})
+    await start(h)
+    completeTurn(h, "one", "answer one")
+    completeTurn(h, "two", "answer two")
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+    h.sockets[0].message({
+      toolCall: {
+        functionCalls: [{id: "call-stop", name: "recall_memory", args: {query: "late"}}],
+      },
+    })
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/recall")))
+
+    const stopping = h.controller.stop(true)
+    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    release()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    h.sockets[0].message({
+      serverContent: {outputTranscription: {text: "NO_SUMMARY"}, turnComplete: true},
+    })
+    await stopping
+
+    expect(h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse)).toBe(false)
+    expect(h.errors).toEqual([])
+  })
+
+  test("malformed and ordinary one-sided turns still fail loud", async () => {
+    const unknown = harness()
+    await start(unknown)
+    unknown.sockets[0].message({
+      toolCall: {functionCalls: [{id: "call-x", name: "other_tool", args: {query: "x"}}]},
+    })
+    expect(unknown.errors).toEqual(["Gemini returned malformed recall_memory call"])
+    await unknown.controller.stop()
+
+    const oneSided = harness()
+    await start(oneSided)
+    oneSided.sockets[0].message({
+      serverContent: {inputTranscription: {text: "ordinary input"}, turnComplete: true},
+    })
+    expect(oneSided.errors).toEqual(["Gemini completed a turn without both transcriptions"])
+    await oneSided.controller.stop()
   })
 
   test("interruption drops residual audio from the same server payload", async () => {
