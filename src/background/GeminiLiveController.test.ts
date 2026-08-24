@@ -291,19 +291,22 @@ describe("GeminiLiveController", () => {
       },
     })
 
+    completeTurn(h, "ordinary follow-up", "ordinary answer")
     h.sockets[0].message({
       serverContent: {outputTranscription: {text: "I remembered it."}, turnComplete: true},
     })
     await waitFor(
       () => h.requests
         .filter((request) => request.url.endsWith("/transcripts/append"))
-        .flatMap((request) => request.body.events).length === 2,
+        .flatMap((request) => request.body.events).length === 4,
     )
     const events = h.requests
       .filter((request) => request.url.endsWith("/transcripts/append"))
       .flatMap((request) => request.body.events)
     expect(events.map((event: any) => [event.role, event.content, event.status])).toEqual([
       ["user", "remember the beacon", "complete"],
+      ["user", "ordinary follow-up", "complete"],
+      ["assistant", "ordinary answer", "complete"],
       ["assistant", "I remembered it.", "complete"],
     ])
     expect(h.errors).toEqual([])
@@ -333,20 +336,22 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
-  test("recall scope failure is fatal without exposing the query", async () => {
-    const h = harness({recallStatus: 404, recallBody: {detail: "private scope detail"}})
-    await start(h)
-    h.sockets[0].message({
-      toolCall: {
-        functionCalls: [{id: "call-fatal", name: "recall_memory", args: {query: "private query"}}],
-      },
-    })
+  test("recall scope, internal, and config failures are fatal without exposing the query", async () => {
+    for (const status of [404, 500, 503]) {
+      const h = harness({recallStatus: status, recallBody: {detail: "private scope detail"}})
+      await start(h)
+      h.sockets[0].message({
+        toolCall: {
+          functionCalls: [{id: `call-${status}`, name: "recall_memory", args: {query: "private query"}}],
+        },
+      })
 
-    await waitFor(() => h.errors.length === 1)
-    expect(h.errors).toEqual(["OpenAlma memory recall failed (404)"])
-    expect(h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse)).toBe(false)
-    expect(JSON.stringify(h.errors)).not.toContain("private")
-    await h.controller.stop()
+      await waitFor(() => h.errors.length === 1)
+      expect(h.errors).toEqual([`OpenAlma memory recall failed (${status})`])
+      expect(h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse)).toBe(false)
+      expect(JSON.stringify(h.errors)).not.toContain("private")
+      await h.controller.stop()
+    }
   })
 
   test("cancelled recall never sends a late tool response", async () => {
@@ -477,6 +482,25 @@ describe("GeminiLiveController", () => {
     })
     expect(oneSided.errors).toEqual(["Gemini completed a turn without both transcriptions"])
     await oneSided.controller.stop()
+
+    let release!: () => void
+    const pendingGate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const pending = harness({recallGate: pendingGate})
+    await start(pending)
+    pending.sockets[0].message({
+      toolCall: {
+        functionCalls: [{id: "pending", name: "recall_memory", args: {query: "pending"}}],
+      },
+    })
+    await waitFor(() => pending.requests.some((request) => request.url.endsWith("/recall")))
+    pending.sockets[0].message({
+      serverContent: {inputTranscription: {text: "ordinary while pending"}, turnComplete: true},
+    })
+    expect(pending.errors).toEqual(["Gemini completed a turn without both transcriptions"])
+    release()
+    await pending.controller.stop()
   })
 
   test("interruption drops residual audio from the same server payload", async () => {

@@ -87,7 +87,7 @@ export class GeminiLiveController {
   private generation = 0
   private ready = false
   private pendingToolCalls = new Map<string, PendingToolCall>()
-  private toolContextPending = false
+  private deliveredToolResultIds = new Set<string>()
 
   constructor(
     private readonly config: OpenAlmaConfig,
@@ -120,7 +120,7 @@ export class GeminiLiveController {
     this.reflectionResolve = null
     this.stopPromise = null
     this.pendingToolCalls.clear()
-    this.toolContextPending = false
+    this.deliveredToolResultIds.clear()
     try {
       const response = await this.requestStart()
       this.token = response.ephemeral_token
@@ -191,7 +191,7 @@ export class GeminiLiveController {
       this.socket = null
       socket?.close()
       this.pendingToolCalls.clear()
-      this.toolContextPending = false
+      this.deliveredToolResultIds.clear()
       await this.endLease()
     }
   }
@@ -373,9 +373,8 @@ export class GeminiLiveController {
       if (this.interruptionFinalized) {
         this.interruptionFinalized = false
       } else {
-        this.finalizeCompleteTurn(hasToolCall || this.toolContextPending)
+        this.finalizeCompleteTurn(hasToolCall)
       }
-      if (this.toolContextPending && !hasToolCall) this.toolContextPending = false
       this.turnActive = false
       this.callbacks.onTurnComplete()
     }
@@ -389,12 +388,15 @@ export class GeminiLiveController {
     return (value as {text: string}).text
   }
 
-  private finalizeCompleteTurn(allowOneSided = false): void {
+  private finalizeCompleteTurn(toolCallBoundary = false): void {
     const input = this.inputTranscript.trim()
     const output = this.outputTranscript.trim()
     this.clearTurn()
     if (!input && !output) throw new Error("Gemini completed a turn without transcription")
-    if (!allowOneSided && (!input || !output)) {
+    const deliveredResultId = !input && output
+      ? this.deliveredToolResultIds.values().next().value as string | undefined
+      : undefined
+    if ((!input || !output) && !(input && toolCallBoundary) && !deliveredResultId) {
       throw new Error("Gemini completed a turn without both transcriptions")
     }
     if (input) {
@@ -402,6 +404,7 @@ export class GeminiLiveController {
       this.completeUserTurns += 1
     }
     if (output) this.enqueueEvent("transcript", "assistant", output, "complete")
+    if (deliveredResultId) this.deliveredToolResultIds.delete(deliveredResultId)
     this.scheduleAppend()
   }
 
@@ -443,7 +446,6 @@ export class GeminiLiveController {
       this.pendingToolCalls.set(id, pending)
       void this.runRecall(id, query, pending)
     }
-    this.toolContextPending = true
   }
 
   private handleToolCancellation(value: unknown): void {
@@ -453,7 +455,6 @@ export class GeminiLiveController {
       throw new Error("Gemini returned malformed tool cancellation")
     }
     for (const id of ids) this.pendingToolCalls.delete(id)
-    if (!this.pendingToolCalls.size) this.toolContextPending = false
   }
 
   private async runRecall(id: string, query: string, pending: PendingToolCall): Promise<void> {
@@ -468,7 +469,7 @@ export class GeminiLiveController {
       this.completeRecall(id, pending, "Memory recall is temporarily unavailable.", true)
       return
     }
-    if ([400, 401, 403, 404, 409, 422].includes(response.status)) {
+    if ([400, 401, 403, 404, 409, 422, 500, 503].includes(response.status)) {
       this.failRecall(id, pending, `OpenAlma memory recall failed (${response.status})`)
       return
     }
@@ -525,6 +526,7 @@ export class GeminiLiveController {
           }],
         },
       }))
+      this.deliveredToolResultIds.add(id)
       this.pendingToolCalls.delete(id)
     }
   }
@@ -707,7 +709,7 @@ export class GeminiLiveController {
     if (this.stopping || this.errorReported) return
     this.errorReported = true
     this.pendingToolCalls.clear()
-    this.toolContextPending = false
+    this.deliveredToolResultIds.clear()
     this.clearHeartbeat()
     this.callbacks.onError(error)
   }
