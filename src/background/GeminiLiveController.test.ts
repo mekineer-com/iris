@@ -288,6 +288,17 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.errors.length === 1)
     expect(h.errors).toEqual(["OpenAlma transcript append failed (409)"])
     await h.controller.stop()
+    expect(h.persistenceErrors.includes(null)).toBe(false)
+  })
+
+  test("final Stop failure preserves an honest unsaved-transcript warning", async () => {
+    const h = harness({appendStatuses: [503, 503]})
+    await start(h)
+    completeTurn(h)
+    await waitFor(() => h.persistenceErrors.length === 1)
+    await h.controller.stop()
+    expect(h.persistenceErrors.at(-1)).toBe("Transcript sync failed; last turns were not saved")
+    expect(h.requests.filter((request) => request.url.endsWith("/sitting-1/end"))).toHaveLength(1)
   })
 
   test("Stop persists proven partial text as interrupted before End", async () => {
@@ -384,6 +395,8 @@ describe("GeminiLiveController", () => {
   test("resumes once with the latest private handle", async () => {
     const h = harness()
     await start(h)
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "before drop"}}})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
     h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
     h.sockets[0].error()
     await waitFor(() => h.sockets.length === 2)
@@ -393,6 +406,22 @@ describe("GeminiLiveController", () => {
       setup: {sessionResumption: {handle: "private-handle"}},
     })
     h.sockets[1].message({setupComplete: {}})
+    completeTurn(h, "after resume", "fresh answer")
+    await waitFor(
+      () =>
+        h.requests
+          .filter((request) => request.url.endsWith("/transcripts/append"))
+          .flatMap((request) => request.body.events).length === 4,
+    )
+    const events = h.requests
+      .filter((request) => request.url.endsWith("/transcripts/append"))
+      .flatMap((request) => request.body.events)
+    expect(events.map((event: any) => [event.content, event.status])).toEqual([
+      ["before drop", "interrupted"],
+      ["partial answer", "interrupted"],
+      ["after resume", "complete"],
+      ["fresh answer", "complete"],
+    ])
     h.sockets[0].error()
     expect(h.errors).toEqual([])
     h.controller.sendAudio("AAAA")

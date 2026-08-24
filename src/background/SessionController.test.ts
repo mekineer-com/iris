@@ -27,6 +27,7 @@ class FakeLive {
   startGate: Promise<void> | null = null
   stopGate: Promise<void> | null = null
   audioOnStop = false
+  persistenceOnStop: string | null = null
 
   constructor(readonly callbacks: GeminiCallbacks) {}
 
@@ -43,6 +44,7 @@ class FakeLive {
     this.stops += 1
     this.stopArgs.push(graceful)
     if (graceful && this.audioOnStop) this.callbacks.onAudio(silentPcm())
+    if (this.persistenceOnStop) this.callbacks.onPersistenceError(this.persistenceOnStop)
     if (this.stopGate) await this.stopGate
   }
 
@@ -397,5 +399,16 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:stop"]({})
     expect(harness.live.stops).toBe(1)
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "idle", lastError: null})
+  })
+
+  test("graceful Stop preserves a final unsaved-transcript warning", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    harness.live.persistenceOnStop = "Transcript sync failed; last turns were not saved"
+    await harness.session.handlers["openalma:stop"]({})
+    expect(lastSnapshot(harness.session)).toMatchObject({
+      connection: "idle",
+      lastError: "Transcript sync failed; last turns were not saved",
+    })
   })
 })

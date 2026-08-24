@@ -164,8 +164,12 @@ export class GeminiLiveController {
       this.ready = false
       await this.appendTail
       if (!this.persistenceFatal) await this.flushPendingEvents()
+      if (this.pendingEvents.length) {
+        this.callbacks.onPersistenceError("Transcript sync failed; last turns were not saved")
+      }
     } catch (error) {
       this.persistenceFatal = true
+      this.callbacks.onPersistenceError("Transcript sync failed; last turns were not saved")
       this.reportError(error instanceof Error ? error : new Error(String(error)))
     } finally {
       this.generation += 1
@@ -425,7 +429,7 @@ export class GeminiLiveController {
       }
       this.pendingEvents = this.pendingEvents.filter((event) => event.sequence > Number(ack))
     }
-    this.callbacks.onPersistenceError(null)
+    if (!this.pendingEvents.length) this.callbacks.onPersistenceError(null)
   }
 
   private requestReflection(): Promise<string | null> {
@@ -465,6 +469,13 @@ export class GeminiLiveController {
   private async handleUnexpectedClose(): Promise<void> {
     this.socket = null
     this.ready = false
+    if (this.inputTranscript.trim() || this.outputTranscript.trim()) {
+      this.finalizeInterruptedTurn()
+    } else {
+      this.clearTurn()
+    }
+    this.interruptionFinalized = false
+    this.turnActive = false
     if (this.resumptionHandle && !this.reconnectAttempted) {
       this.reconnectAttempted = true
       try {

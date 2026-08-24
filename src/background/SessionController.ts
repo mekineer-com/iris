@@ -272,7 +272,6 @@ export class SessionController {
     if (generation !== this.startGeneration) return
 
     if (this.teardownKind === "stop") {
-      this.lastError = null
       try {
         await this.playEarcon("listen-stop")
       } catch {
