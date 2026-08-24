@@ -184,13 +184,24 @@ export class GeminiLiveController {
   }
 
   private async requestStart(): Promise<StartResponse> {
-    const response = await this.request("/integration/mentra/session/start", {
-      user_id: this.config.userId,
-      soul_id: this.config.soulId,
-      device_session_id: this.config.deviceSessionId,
-      mode: "continuous",
-    })
-    if (!response.ok) throw new Error(`OpenAlma Start failed (${response.status})`)
+    let response: Response
+    for (let attempt = 0; ; attempt += 1) {
+      response = await this.request("/integration/mentra/session/start", {
+        user_id: this.config.userId,
+        soul_id: this.config.soulId,
+        device_session_id: this.config.deviceSessionId,
+        mode: "continuous",
+      })
+      if (response.ok) break
+      const errorBody = response.status === 409 ? await response.clone().json().catch(() => null) : null
+      if (
+        attempt === 0 &&
+        errorBody?.detail === "Mentra history changed during Start; retry"
+      ) {
+        continue
+      }
+      throw new Error(`OpenAlma Start failed (${response.status})`)
+    }
     const body = (await response.json()) as Partial<StartResponse>
     if (typeof body.session_id === "string" && body.session_id.trim()) {
       this.sessionId = body.session_id

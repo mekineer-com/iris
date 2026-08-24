@@ -56,6 +56,7 @@ function harness(
     startGate?: Promise<void>
     startStatus?: number
     startBody?: unknown
+    startResults?: Array<{status: number; body: unknown}>
     leaseSeconds?: number
     appendStatuses?: number[]
   } = {},
@@ -67,14 +68,16 @@ function harness(
   const errors: string[] = []
   const persistenceErrors: Array<string | null> = []
   const appendStatuses = [...(options.appendStatuses ?? [])]
+  const startResults = [...(options.startResults ?? [])]
   const fetchFn = async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input)
     const body = JSON.parse(String(init?.body ?? "{}"))
     requests.push({url, body, authorization: new Headers(init?.headers).get("Authorization")})
     if (url.endsWith("/session/start")) {
       if (options.startGate) await options.startGate
+      const result = startResults.shift()
       return Response.json(
-        options.startBody ?? {
+        result?.body ?? options.startBody ?? {
           session_id: "sitting-1",
           next_transcript_sequence: 41,
           ephemeral_token: "ephemeral/test",
@@ -86,7 +89,7 @@ function harness(
           },
           lease_seconds: options.leaseSeconds ?? 90,
         },
-        {status: options.startStatus ?? 200},
+        {status: result?.status ?? options.startStatus ?? 200},
       )
     }
     if (url.endsWith("/heartbeat")) return Response.json({ok: true}, {status: options.heartbeatStatus ?? 200})
@@ -165,6 +168,35 @@ describe("GeminiLiveController", () => {
     })
     await h.controller.stop()
     expect(h.requests.filter((request) => request.url.endsWith("/sitting-1/end"))).toHaveLength(1)
+  })
+
+  test("retries one stale-bootstrap conflict", async () => {
+    const h = harness({
+      startResults: [
+        {status: 409, body: {detail: "Mentra history changed during Start; retry"}},
+        {
+          status: 200,
+          body: {
+            session_id: "sitting-2",
+            next_transcript_sequence: 42,
+            ephemeral_token: "ephemeral/retry",
+            websocket: {
+              api_version: "v1alpha",
+              method: "BidiGenerateContentConstrained",
+              input_audio_rate_hz: 16000,
+              output_audio_rate_hz: 24000,
+            },
+            lease_seconds: 90,
+          },
+        },
+      ],
+    })
+
+    await start(h)
+
+    expect(h.requests.filter((request) => request.url.endsWith("/session/start"))).toHaveLength(2)
+    await h.controller.stop()
+    expect(h.requests.some((request) => request.url.endsWith("/sitting-2/end"))).toBe(true)
   })
 
   test("iterates audio, transcript, interruption, and turn completion independently", async () => {
