@@ -1,6 +1,6 @@
 # OpenAlma Mentra MiniApp
 
-Nested at `mentra-os/miniapps/openalma/` for MentraOS development convenience. This is its own git repository, not part of MentraOS history.
+Nested at `mentra-os/miniapps/openalma/` for MentraOS development convenience. This is its own git repository (`mekineer-com/iris`), not part of MentraOS history.
 
 After cloning MentraOS, add this path to the **parent** checkout’s local exclude (it does not survive a fresh MentraOS clone):
 
