@@ -14,11 +14,11 @@ function required(name: string, value: string | undefined): string {
 
 export function readOpenAlmaConfig(): OpenAlmaConfig {
   const rawBaseUrl = required("MENTRA_PUBLIC_OPENALMA_BASE_URL", process.env.MENTRA_PUBLIC_OPENALMA_BASE_URL)
-  const url = new URL(rawBaseUrl)
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
+  if (!/^https?:\/\//.test(rawBaseUrl)) {
     throw new Error("MENTRA_PUBLIC_OPENALMA_BASE_URL must use http or https")
   }
-  if (url.username || url.password || url.search || url.hash) {
+  const authority = rawBaseUrl.slice(rawBaseUrl.indexOf("://") + 3).split("/", 1)[0]
+  if (!authority || /[\s@?#]/.test(rawBaseUrl)) {
     throw new Error("MENTRA_PUBLIC_OPENALMA_BASE_URL must not contain credentials, query, or fragment")
   }
 

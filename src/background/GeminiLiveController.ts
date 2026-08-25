@@ -298,6 +298,7 @@ export class GeminiLiveController {
   }
 
   private parseMessage(data: unknown): Record<string, any> {
+    if (data instanceof ArrayBuffer) data = new TextDecoder().decode(new Uint8Array(data))
     if (typeof data !== "string") throw new Error("Gemini returned a non-text message")
     const parsed = JSON.parse(data)
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -360,10 +361,7 @@ export class GeminiLiveController {
       return
     }
 
-    if (input) {
-      if (this.inputTranscript) throw new Error("Gemini returned multiple input transcription fields")
-      this.inputTranscript = input
-    }
+    this.inputTranscript += input
     this.outputTranscript += output
     if (interrupted) {
       this.finalizeInterruptedTurn(true)
@@ -522,7 +520,8 @@ export class GeminiLiveController {
           functionResponses: [{
             id,
             name: "recall_memory",
-            response: {result: pending.response, scheduling: "SILENT"},
+            response: {result: pending.response},
+            scheduling: "SILENT",
           }],
         },
       }))

@@ -35,6 +35,21 @@ describe("readOpenAlmaConfig", () => {
     })
   })
 
+  test("does not require the URL global missing from the Mentra runtime", () => {
+    process.env.MENTRA_PUBLIC_OPENALMA_BASE_URL = "http://10.77.0.1:8081"
+    process.env.MENTRA_PUBLIC_OPENALMA_BEARER = "fictional"
+    process.env.MENTRA_PUBLIC_OPENALMA_USER_ID = "Test User"
+    process.env.MENTRA_PUBLIC_OPENALMA_SOUL_ID = "Test Soul"
+    process.env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID = "test-phone"
+    const urlConstructor = globalThis.URL
+    Reflect.deleteProperty(globalThis, "URL")
+    try {
+      expect(readOpenAlmaConfig().baseUrl).toBe("http://10.77.0.1:8081")
+    } finally {
+      globalThis.URL = urlConstructor
+    }
+  })
+
   test("fails before transport work when required configuration is missing", () => {
     for (const key of KEYS) delete process.env[key]
     expect(() => readOpenAlmaConfig()).toThrow("MENTRA_PUBLIC_OPENALMA_BASE_URL is not configured")

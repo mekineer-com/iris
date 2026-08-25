@@ -30,7 +30,9 @@ class FakeSocket {
   }
 
   message(value: unknown): void {
-    this.emit("message", {data: typeof value === "string" ? value : JSON.stringify(value)})
+    this.emit("message", {
+      data: typeof value === "string" || value instanceof ArrayBuffer ? value : JSON.stringify(value),
+    })
   }
 
   error(): void {
@@ -144,7 +146,7 @@ async function start(h: ReturnType<typeof harness>): Promise<void> {
   await waitFor(() => h.sockets.length === 1)
   h.sockets[0].open()
   expect(JSON.parse(h.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
-  h.sockets[0].message({setupComplete: {}})
+  h.sockets[0].message(new TextEncoder().encode(JSON.stringify({setupComplete: {}})).buffer)
   await starting
 }
 
@@ -212,12 +214,13 @@ describe("GeminiLiveController", () => {
   test("iterates audio, transcript, interruption, and turn completion independently", async () => {
     const h = harness()
     await start(h)
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "hel"}}})
     h.sockets[0].message({
       serverContent: {
         modelTurn: {
           parts: [{inlineData: {data: "AAAAAA=="}}, {text: "ignored"}, {inlineData: {data: "AAAAAA=="}}],
         },
-        inputTranscription: {text: "hello"},
+        inputTranscription: {text: "lo"},
         outputTranscription: {text: "hi"},
         turnComplete: true,
       },
@@ -286,7 +289,8 @@ describe("GeminiLiveController", () => {
         functionResponses: [{
           id: "call-1",
           name: "recall_memory",
-          response: {result: "A compact fictional memory.", scheduling: "SILENT"},
+          response: {result: "A compact fictional memory."},
+          scheduling: "SILENT",
         }],
       },
     })
@@ -324,8 +328,8 @@ describe("GeminiLiveController", () => {
 
     await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse))
     const response = JSON.parse(h.sockets[0].sent.find((value) => JSON.parse(value).toolResponse)!)
-    expect(response.toolResponse.functionResponses[0].response).toEqual({
-      result: "Memory recall is temporarily unavailable.",
+    expect(response.toolResponse.functionResponses[0]).toMatchObject({
+      response: {result: "Memory recall is temporarily unavailable."},
       scheduling: "SILENT",
     })
     expect(h.persistenceErrors).toContain("Memory recall unavailable; voice is continuing")
@@ -428,7 +432,8 @@ describe("GeminiLiveController", () => {
           functionResponses: [{
             id: "call-4",
             name: "recall_memory",
-            response: {result: "A compact fictional memory.", scheduling: "SILENT"},
+            response: {result: "A compact fictional memory."},
+            scheduling: "SILENT",
           }],
         },
       })
