@@ -516,6 +516,23 @@ describe("SessionController", () => {
     expect(harness.live.activities).toEqual([[testPcm(1)]])
   })
 
+  test("Stop discards an unsent Manual draft", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+
+    await harness.session.handlers["openalma:stop"]({})
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    expect(lastSnapshot(harness.session)?.manualPhase).toBe("idle")
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    expect(() => harness.session.handlers["openalma:manual-action"]({action: "done"})).toThrow(
+      "No audio was recorded",
+    )
+    expect(harness.live.activities).toEqual([])
+  })
+
   test("Manual response timeout fails the sitting", async () => {
     const harness = setup({responseWatchdogMs: 10})
     await harness.session.handlers["openalma:start"]({mode: "manual"})
