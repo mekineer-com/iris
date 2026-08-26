@@ -293,9 +293,17 @@ export class SessionController {
 
   private async abortCurrentWriter(): Promise<void> {
     const writer = this.speakerWriter
+    const opening = this.speakerOpenPromise
     this.speakerWriter = null
     this.speakerOpenPromise = null
-    if (!writer) return
+    if (!writer) {
+      try {
+        await opening
+      } catch {
+        /* stale opening failed on its own */
+      }
+      return
+    }
     try {
       this.session.speaker.stop()
     } catch {
@@ -321,6 +329,8 @@ export class SessionController {
     if (_reason === "user" && this.manualPhase === "submitted" && this.manualResponsePromise) {
       this.connection = "stopping"
       this.teardownKind = "stop"
+      this.clearFirstPcmTimeout()
+      this.stopMic()
       this.pushSnapshot()
       await this.manualResponsePromise
       if (this.teardownPromise) {
@@ -354,8 +364,10 @@ export class SessionController {
     trace("session.speaker.aborted")
     await this.stopLiveController(graceful)
     trace("session.provider.stopped")
-    await this.speechFinishTail
-    await this.finishSpeech()
+    if (graceful) {
+      await this.speechFinishTail
+      await this.finishSpeech()
+    }
     if (generation !== this.startGeneration) return
 
     if (this.teardownKind === "stop") {

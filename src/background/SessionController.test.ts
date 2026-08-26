@@ -321,8 +321,7 @@ describe("SessionController", () => {
     harness.live.interrupted()
     await Promise.resolve()
     release()
-    await Promise.resolve()
-    await Promise.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 0))
     expect(harness.session.streams.at(-1)?.aborted).toBe(true)
     expect(lastSnapshot(harness.session)?.connection).toBe("listening")
   })
@@ -549,6 +548,7 @@ describe("SessionController", () => {
     expect(stopped).toBe(false)
     expect(harness.live.stops).toBe(0)
     expect(lastSnapshot(harness.session)?.connection).toBe("stopping")
+    expect(harness.session.micHandler).toBeNull()
 
     harness.live.turnComplete()
     await stop
@@ -583,6 +583,30 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)?.manualPhase).toBe("idle")
   })
 
+  test("Manual interruption waits for a pending native stream to abort", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+    harness.session.handlers["openalma:manual-action"]({action: "send"})
+
+    let release!: () => void
+    harness.session.createGate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    harness.live.audio()
+    await Promise.resolve()
+    harness.live.interrupted()
+    await Promise.resolve()
+    expect(lastSnapshot(harness.session)?.manualPhase).toBe("submitted")
+
+    release()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(harness.session.streams.at(-1)?.aborted).toBe(true)
+    expect(lastSnapshot(harness.session)?.manualPhase).toBe("idle")
+  })
+
   test("rejects unknown Manual actions without sending", async () => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "manual"})
@@ -609,6 +633,29 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)).toMatchObject({
       connection: "error",
       manualPhase: "idle",
+      lastError: "Gemini did not answer the Manual recording",
+    })
+  })
+
+  test("Manual timeout cannot deadlock on a hung speaker close", async () => {
+    const harness = setup({responseWatchdogMs: 10})
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+    harness.session.handlers["openalma:manual-action"]({action: "send"})
+    harness.live.audio()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    harness.session.closeGate = new Promise<void>(() => {})
+    harness.live.turnComplete()
+
+    const stop = harness.session.handlers["openalma:stop"]({})
+    await Promise.race([
+      stop,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Stop deadlocked")), 100)),
+    ])
+    expect(lastSnapshot(harness.session)).toMatchObject({
+      connection: "error",
       lastError: "Gemini did not answer the Manual recording",
     })
   })
