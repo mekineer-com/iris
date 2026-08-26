@@ -188,7 +188,7 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     expect(harness.live.starts).toBe(1)
     expect(harness.session.micSubs).toBe(1)
-    expect(harness.session.streams[0]?.closed).toBe(true)
+    expect(harness.session.streams[0]?.aborted).toBe(true)
     await harness.session.handlers["openalma:stop"]({})
     expect(harness.live.stops).toBe(1)
     expect(harness.live.stopArgs).toEqual([true])
@@ -199,7 +199,7 @@ describe("SessionController", () => {
   test("keeps Gemini speech that arrives during the start earcon", async () => {
     const harness = setup()
     let release!: () => void
-    harness.session.closeGate = new Promise<void>((resolve) => {
+    harness.session.abortGate = new Promise<void>((resolve) => {
       release = resolve
     })
     const start = harness.session.handlers["openalma:start"]({mode: "continuous"})

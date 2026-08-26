@@ -137,9 +137,12 @@ export class SessionController {
     }
     this.speakerWriter = writer
     try {
-      await writer.write(pcm)
+      const {bufferedMs} = await writer.write(pcm)
       if (epoch !== this.speakerEpoch) return
-      await writer.close()
+      if (bufferedMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(bufferedMs, 500)))
+      }
+      await writer.abort()
     } catch {
       try {
         await writer.abort()

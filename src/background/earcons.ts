@@ -15,7 +15,7 @@ function tone(hz: number, ms: number, amplitude = 4000): Uint8Array {
 }
 
 export const EARCONS: Record<EarconName, Uint8Array> = {
-  "listen-start": tone(660, 80),
+  "listen-start": tone(660, 220, 8000),
   "listen-stop": tone(440, 80),
   disconnected: tone(220, 120),
 }
