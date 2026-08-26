@@ -101,7 +101,7 @@ export default function SessionPage() {
         : visibleConnection === "error"
           ? "Retry"
           : "Start"
-  const sittingDisabled = stopping || stopPending || (!active && startPending)
+  const sittingDisabled = stopping || stopPending || modePending || (!active && startPending)
   const showSpinner = starting || stopping
   const manualDisabled = manualPending || visibleConnection === "speaking"
   const voiceReady = visibleConnection === "listening" || visibleConnection === "speaking"
@@ -147,7 +147,7 @@ export default function SessionPage() {
               <button
                 type="button"
                 className="recording-button"
-                disabled={manualPending}
+                disabled={manualDisabled}
                 onClick={() => void onManual("done")}
               >
                 Done
@@ -155,10 +155,10 @@ export default function SessionPage() {
             ) : null}
             {manualPhase === "review" ? (
               <>
-                <button type="button" disabled={manualPending} onClick={() => void onManual("send")}>
+                <button type="button" disabled={manualDisabled} onClick={() => void onManual("send")}>
                   Send
                 </button>
-                <button type="button" disabled={manualPending} onClick={() => void onManual("redo")}>
+                <button type="button" disabled={manualDisabled} onClick={() => void onManual("redo")}>
                   Redo
                 </button>
               </>

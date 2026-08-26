@@ -52,6 +52,9 @@ export class SessionController {
   private manualAudio: string[] = []
   private manualAudioBytes = 0
   private manualResponseTimeout: ReturnType<typeof setTimeout> | null = null
+  private manualResponsePromise: Promise<void> | null = null
+  private manualResponseResolve: (() => void) | null = null
+  private interruptPromise: Promise<void> | null = null
   private lastError: string | null = null
   private startInFlight = false
   private startGeneration = 0
@@ -135,7 +138,9 @@ export class SessionController {
     this.unsubs.push(
       ui.handle("openalma:manual-action", (payload) => {
         const action = (payload as {action?: ManualAction} | null)?.action
-        if (!action) throw new Error("Manual action is required")
+        if (!action || !["talk", "done", "redo", "send"].includes(action)) {
+          throw new Error("Unknown Manual action")
+        }
         this.handleManualAction(action)
         return {ok: true as const}
       }),
@@ -216,11 +221,16 @@ export class SessionController {
       if (!this.liveController) {
         this.liveController = this.createLiveController(this.config ?? readOpenAlmaConfig(), {
           onAudio: (pcm) => this.onGeminiAudio(pcm),
-          onTurnComplete: () => {
+          onTurnComplete: (finalResponse) => {
             if (this.connection === "starting") this.startupTurnComplete = true
-            else this.queueFinishSpeech()
+            else this.queueFinishSpeech(finalResponse)
           },
-          onInterrupted: () => void this.interrupt(),
+          onInterrupted: () => {
+            const interrupting = this.interrupt().finally(() => {
+              if (this.interruptPromise === interrupting) this.interruptPromise = null
+            })
+            this.interruptPromise = interrupting
+          },
           onPersistenceError: (message) => {
             if (message || this.lastError === "Transcript sync failed; retrying") {
               this.lastError = message
@@ -307,6 +317,16 @@ export class SessionController {
       }
       await this.teardownPromise
       return
+    }
+    if (_reason === "user" && this.manualPhase === "submitted" && this.manualResponsePromise) {
+      this.connection = "stopping"
+      this.teardownKind = "stop"
+      this.pushSnapshot()
+      await this.manualResponsePromise
+      if (this.teardownPromise) {
+        await this.teardownPromise
+        return
+      }
     }
     this.teardownKind = "stop"
     this.teardownPromise = this.runTeardown().finally(() => {
@@ -489,13 +509,14 @@ export class SessionController {
     }
   }
 
-  private async finishSpeech(): Promise<void> {
+  private async finishSpeech(finalResponse = true): Promise<void> {
     const epoch = this.speakerEpoch
     await Promise.all(this.pendingSpeechWrites)
+    if (this.interruptPromise) await this.interruptPromise
     if (epoch !== this.speakerEpoch) return
     const writer = this.speakerWriter ?? (await this.speakerOpenPromise)
     if (!writer || epoch !== this.speakerEpoch) {
-      const manualFinished = this.completeManualResponse()
+      const manualFinished = finalResponse && this.completeManualResponse()
       if (this.connection === "speaking") {
         this.connection = "listening"
         this.pushSnapshot()
@@ -508,7 +529,7 @@ export class SessionController {
       await writer.close()
       if (this.speakerWriter === writer) this.speakerWriter = null
       if (epoch === this.speakerEpoch) {
-        const manualFinished = this.completeManualResponse()
+        const manualFinished = finalResponse && this.completeManualResponse()
         if (this.connection === "speaking") {
           this.connection = "listening"
           trace("session.listening")
@@ -522,8 +543,8 @@ export class SessionController {
     }
   }
 
-  private queueFinishSpeech(): void {
-    this.speechFinishTail = this.speechFinishTail.then(() => this.finishSpeech())
+  private queueFinishSpeech(finalResponse = true): void {
+    this.speechFinishTail = this.speechFinishTail.then(() => this.finishSpeech(finalResponse))
   }
 
   private handleManualAction(action: ManualAction): void {
@@ -549,7 +570,7 @@ export class SessionController {
       this.liveController.sendActivity(this.manualAudio)
       this.clearManualAudio()
       this.manualPhase = "submitted"
-      this.startManualResponseWatchdog()
+      this.beginManualResponse()
     }
     this.pushSnapshot()
   }
@@ -563,17 +584,22 @@ export class SessionController {
     this.clearManualAudio()
     this.manualPhase = "idle"
     this.clearManualResponseWatchdog()
+    this.resolveManualResponse()
   }
 
   private completeManualResponse(): boolean {
     if (this.manualPhase !== "submitted") return false
     this.manualPhase = "idle"
     this.clearManualResponseWatchdog()
+    this.resolveManualResponse()
     return true
   }
 
-  private startManualResponseWatchdog(): void {
+  private beginManualResponse(): void {
     this.clearManualResponseWatchdog()
+    this.manualResponsePromise = new Promise<void>((resolve) => {
+      this.manualResponseResolve = resolve
+    })
     this.manualResponseTimeout = setTimeout(() => {
       if (this.manualPhase === "submitted") {
         void this.fail(new Error("Gemini did not answer the Manual recording"))
@@ -585,6 +611,12 @@ export class SessionController {
     if (!this.manualResponseTimeout) return
     clearTimeout(this.manualResponseTimeout)
     this.manualResponseTimeout = null
+  }
+
+  private resolveManualResponse(): void {
+    this.manualResponseResolve?.()
+    this.manualResponseResolve = null
+    this.manualResponsePromise = null
   }
 
   private async stopLiveController(

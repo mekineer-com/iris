@@ -119,7 +119,7 @@ function harness(
     CONFIG,
     {
       onAudio: (data) => audio.push(data),
-      onTurnComplete: () => events.push("turnComplete"),
+      onTurnComplete: (finalResponse) => events.push(finalResponse ? "turnComplete" : "toolBoundary"),
       onInterrupted: () => events.push("interrupted"),
       onPersistenceError: (message) => persistenceErrors.push(message),
       onError: (error) => errors.push(error.message),
@@ -306,6 +306,7 @@ describe("GeminiLiveController", () => {
         functionCalls: [{id: "call-1", name: "recall_memory", args: {query: "beacon"}}],
       },
     })
+    expect(h.events).toEqual(["toolBoundary"])
     expect(h.audio).toEqual(["AAAAAA=="])
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/recall")))
     const recall = h.requests.find((request) => request.url.endsWith("/recall"))!

@@ -17,7 +17,7 @@ type StartResponse = {
 
 export type GeminiCallbacks = {
   onAudio: (base64Pcm: string) => void
-  onTurnComplete: () => void
+  onTurnComplete: (finalResponse: boolean) => void
   onInterrupted: () => void
   onPersistenceError: (message: string | null) => void
   onError: (error: Error) => void
@@ -176,6 +176,7 @@ export class GeminiLiveController {
     try {
       socket.send(JSON.stringify({realtimeInput: {activityStart: {}}}))
       started = true
+      this.turnActive = true
       for (const chunk of audioChunks) this.sendAudioToSocket(socket, chunk)
       socket.send(JSON.stringify({realtimeInput: {activityEnd: {}}}))
       ended = true
@@ -415,7 +416,7 @@ export class GeminiLiveController {
         this.callbacks.onInterrupted()
         this.finishReflection(null)
       } else if (content.turnComplete === true) {
-        this.callbacks.onTurnComplete()
+        this.callbacks.onTurnComplete(true)
         this.finishReflection(this.outputTranscript.trim() || null)
       }
       return
@@ -449,7 +450,7 @@ export class GeminiLiveController {
         this.finalizeCompleteTurn(hasToolCall)
       }
       this.turnActive = false
-      this.callbacks.onTurnComplete()
+      this.callbacks.onTurnComplete(!hasToolCall)
     }
   }
 

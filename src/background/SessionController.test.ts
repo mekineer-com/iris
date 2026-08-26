@@ -65,8 +65,8 @@ class FakeLive {
     this.callbacks.onAudio(data)
   }
 
-  turnComplete(): void {
-    this.callbacks.onTurnComplete()
+  turnComplete(finalResponse = true): void {
+    this.callbacks.onTurnComplete(finalResponse)
   }
 
   interrupted(): void {
@@ -531,6 +531,70 @@ describe("SessionController", () => {
       "No audio was recorded",
     )
     expect(harness.live.activities).toEqual([])
+  })
+
+  test("Stop after Manual Send waits for the submitted response", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+    harness.session.handlers["openalma:manual-action"]({action: "send"})
+
+    let stopped = false
+    const stop = Promise.resolve(harness.session.handlers["openalma:stop"]({})).then(() => {
+      stopped = true
+    })
+    await Promise.resolve()
+    expect(stopped).toBe(false)
+    expect(harness.live.stops).toBe(0)
+    expect(lastSnapshot(harness.session)?.connection).toBe("stopping")
+
+    harness.live.turnComplete()
+    await stop
+    expect(harness.live.stops).toBe(1)
+    expect(lastSnapshot(harness.session)?.connection).toBe("idle")
+  })
+
+  test("tool boundary and interrupted abort cannot release Manual early", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+    harness.session.handlers["openalma:manual-action"]({action: "send"})
+
+    harness.live.turnComplete(false)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(lastSnapshot(harness.session)?.manualPhase).toBe("submitted")
+
+    harness.live.audio()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    let release!: () => void
+    harness.session.abortGate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    harness.live.interrupted()
+    harness.live.turnComplete()
+    await Promise.resolve()
+    expect(lastSnapshot(harness.session)?.manualPhase).toBe("submitted")
+    release()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(lastSnapshot(harness.session)?.manualPhase).toBe("idle")
+  })
+
+  test("rejects unknown Manual actions without sending", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+
+    expect(() => harness.session.handlers["openalma:manual-action"]({action: "invalid"})).toThrow(
+      "Unknown Manual action",
+    )
+    expect(harness.live.activities).toEqual([])
+    expect(lastSnapshot(harness.session)?.manualPhase).toBe("review")
   })
 
   test("Manual response timeout fails the sitting", async () => {
