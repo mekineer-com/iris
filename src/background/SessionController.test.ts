@@ -162,11 +162,12 @@ class FakeSession {
   }
 }
 
-function setup(options: {watchdogMs?: number; startGate?: Promise<void>} = {}) {
+function setup(options: {watchdogMs?: number; earconTimeoutMs?: number; startGate?: Promise<void>} = {}) {
   const session = new FakeSession()
   let live!: FakeLive
   const controller = new SessionController(session as never, {
     watchdogMs: options.watchdogMs ?? 5000,
+    earconTimeoutMs: options.earconTimeoutMs,
     config: CONFIG,
     createLiveController: (_config, callbacks) => {
       live = new FakeLive(callbacks)
@@ -222,6 +223,35 @@ describe("SessionController", () => {
 
     expect(harness.session.streams[0]?.writes).toEqual([silentPcm()])
     expect(harness.session.streams[0]?.closed).toBe(true)
+    expect(lastSnapshot(harness.session)?.connection).toBe("listening")
+  })
+
+  test("a hung start earcon is stopped and does not block listening", async () => {
+    const harness = setup({earconTimeoutMs: 5})
+    harness.session.playGate = new Promise<void>(() => {})
+
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+
+    expect(harness.session.speakerStops).toBe(1)
+    expect(lastSnapshot(harness.session)?.connection).toBe("listening")
+  })
+
+  test("a stale start earcon cannot stop its replacement sitting", async () => {
+    const harness = setup({earconTimeoutMs: 5})
+    harness.session.playGate = new Promise<void>(() => {})
+    const staleStart = harness.session.handlers["openalma:start"]({mode: "continuous"})
+    while (harness.session.plays.length === 0) await new Promise((resolve) => setTimeout(resolve, 0))
+    const staleLive = harness.live
+    harness.session.playGate = null
+
+    await harness.session.handlers["openalma:stop"]({})
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    const replacement = harness.live
+    await staleStart
+
+    expect(staleLive.stops).toBe(1)
+    expect(replacement.stops).toBe(0)
+    expect(harness.session.speakerStops).toBe(0)
     expect(lastSnapshot(harness.session)?.connection).toBe("listening")
   })
 
@@ -333,19 +363,25 @@ describe("SessionController", () => {
     release()
   })
 
-  test("stop during Gemini setup never subscribes mic", async () => {
+  test("stale Gemini setup cannot stop its replacement sitting", async () => {
     let release!: () => void
     const gate = new Promise<void>((resolve) => {
       release = resolve
     })
-    const harness = setup({startGate: gate})
-    const start = harness.session.handlers["openalma:start"]({mode: "continuous"})
+    const options: {startGate?: Promise<void>} = {startGate: gate}
+    const harness = setup(options)
+    const staleStart = harness.session.handlers["openalma:start"]({mode: "continuous"})
     await Promise.resolve()
     await harness.session.handlers["openalma:stop"]({})
+    const staleLive = harness.live
+    options.startGate = undefined
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    const replacement = harness.live
     release()
-    await start
-    expect(harness.session.micSubs).toBe(0)
-    expect(lastSnapshot(harness.session)?.connection).toBe("idle")
+    await staleStart
+    expect(staleLive.stops).toBe(1)
+    expect(replacement.stops).toBe(0)
+    expect(lastSnapshot(harness.session)?.connection).toBe("listening")
   })
 
   test("watchdog failure plays disconnected once and stops Gemini", async () => {

@@ -19,6 +19,7 @@ type SpeakerWriter = {
 
 export type SessionControllerOptions = {
   watchdogMs?: number
+  earconTimeoutMs?: number
   config?: OpenAlmaConfig
   createLiveController?: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
 }
@@ -53,6 +54,7 @@ export class SessionController {
   private teardownKind: "stop" | "fail" | null = null
   private teardownPromise: Promise<void> | null = null
   private readonly watchdogMs: number
+  private readonly earconTimeoutMs: number
   private readonly config?: OpenAlmaConfig
   private readonly createLiveController: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
   private liveController: GeminiLiveController | null
@@ -62,6 +64,7 @@ export class SessionController {
     options: SessionControllerOptions = {},
   ) {
     this.watchdogMs = options.watchdogMs ?? 3000
+    this.earconTimeoutMs = options.earconTimeoutMs ?? 2000
     this.config = options.config
     this.createLiveController =
       options.createLiveController ?? ((config, callbacks) => new GeminiLiveController(config, callbacks))
@@ -120,14 +123,26 @@ export class SessionController {
   }
 
   async playEarcon(name: EarconName): Promise<void> {
+    const epoch = this.speakerEpoch
+    let timeout: ReturnType<typeof setTimeout> | null = null
     try {
       const config = this.config ?? readOpenAlmaConfig()
-      await this.session.speaker.play({
-        audioUrl: `${config.baseUrl}/integration/mentra/earcons/${name}.wav`,
-        stopOtherAudio: true,
-      })
+      await Promise.race([
+        this.session.speaker.play({
+          audioUrl: `${config.baseUrl}/integration/mentra/earcons/${name}.wav`,
+          stopOtherAudio: true,
+        }),
+        new Promise<void>((resolve) => {
+          timeout = setTimeout(() => {
+            if (epoch === this.speakerEpoch) this.session.speaker.stop()
+            resolve()
+          }, this.earconTimeoutMs)
+        }),
+      ])
     } catch {
       /* a missing cue must not block voice */
+    } finally {
+      if (timeout) clearTimeout(timeout)
     }
   }
 
@@ -172,24 +187,25 @@ export class SessionController {
           onError: (error) => void this.fail(error),
         })
       }
-      await this.liveController.start()
+      const controller = this.liveController
+      await controller.start()
       trace("session.provider.ready")
       if (generation !== this.startGeneration) {
-        await this.stopLiveController()
+        await this.stopLiveController(false, controller)
         return
       }
       trace("session.start_earcon.begin")
       await this.playEarcon("listen-start")
       trace("session.start_earcon.end")
       if (generation !== this.startGeneration) {
-        await this.stopLiveController()
+        await this.stopLiveController(false, controller)
         return
       }
       this.subscribeMic()
       trace("session.microphone.subscribed")
       if (generation !== this.startGeneration) {
         this.stopMic()
-        await this.stopLiveController()
+        await this.stopLiveController(false, controller)
         return
       }
       this.connection = "listening"
@@ -445,7 +461,11 @@ export class SessionController {
     this.speechFinishTail = this.speechFinishTail.then(() => this.finishSpeech())
   }
 
-  private async stopLiveController(graceful = false): Promise<void> {
+  private async stopLiveController(
+    graceful = false,
+    expected?: GeminiLiveController,
+  ): Promise<void> {
+    if (expected && this.liveController !== expected) return
     const controller = this.liveController
     this.liveController = null
     if (controller) await controller.stop(graceful)
