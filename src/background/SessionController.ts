@@ -367,6 +367,9 @@ export class SessionController {
     if (graceful) {
       await this.speechFinishTail
       await this.finishSpeech()
+    } else {
+      this.speechFinishTail = Promise.resolve()
+      this.pendingSpeechWrites.clear()
     }
     if (generation !== this.startGeneration) return
 

@@ -658,6 +658,15 @@ describe("SessionController", () => {
       connection: "error",
       lastError: "Gemini did not answer the Manual recording",
     })
+
+    harness.session.closeGate = null
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    harness.live.audio()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    harness.live.turnComplete()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(harness.session.streams.at(-1)?.closed).toBe(true)
+    expect(lastSnapshot(harness.session)?.connection).toBe("listening")
   })
 
   test("Stop during fatal teardown awaits the same owner", async () => {
