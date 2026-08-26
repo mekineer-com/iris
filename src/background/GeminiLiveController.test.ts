@@ -1,4 +1,4 @@
-import {describe, expect, test} from "bun:test"
+import {describe, expect, spyOn, test} from "bun:test"
 
 import {GeminiLiveController} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
@@ -528,24 +528,41 @@ describe("GeminiLiveController", () => {
   })
 
   test("finalizes interrupted text once and does not leak it into the next turn", async () => {
+    const nodeEnv = process.env.NODE_ENV
+    process.env.NODE_ENV = "development"
+    const consoleInfo = spyOn(console, "info").mockImplementation(() => {})
     const h = harness()
-    await start(h)
-    h.sockets[0].message({serverContent: {inputTranscription: {text: "first question"}}})
-    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
-    h.sockets[0].message({serverContent: {interrupted: true}})
-    h.sockets[0].message({serverContent: {turnComplete: true}})
-    completeTurn(h, "second question", "second answer")
+    try {
+      await start(h)
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "first question"}}})
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
+      h.sockets[0].message({serverContent: {interrupted: true}})
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      completeTurn(h, "second question", "second answer")
 
-    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
-    const appends = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
-    expect(appends[0].body.events.map((event: any) => [event.content, event.status])).toEqual([
-      ["first question", "complete"],
-      ["partial answer", "interrupted"],
-      ["second question", "complete"],
-      ["second answer", "complete"],
-    ])
-    expect(h.events).toEqual(["interrupted", "turnComplete", "turnComplete"])
-    await h.controller.stop()
+      await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+      const appends = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
+      expect(appends[0].body.events.map((event: any) => [event.content, event.status])).toEqual([
+        ["first question", "complete"],
+        ["partial answer", "interrupted"],
+        ["second question", "complete"],
+        ["second answer", "complete"],
+      ])
+      expect(h.events).toEqual(["interrupted", "turnComplete", "turnComplete"])
+      expect(consoleInfo).toHaveBeenCalledWith(
+        expect.stringContaining("provider.interrupted"),
+        {audioChunks: 0, inputChars: 14, outputChars: 14},
+      )
+      expect(consoleInfo).toHaveBeenCalledWith(
+        expect.stringContaining("provider.turn_complete"),
+        {hasToolCall: false, interrupted: true},
+      )
+      await h.controller.stop()
+    } finally {
+      consoleInfo.mockRestore()
+      if (nodeEnv === undefined) delete process.env.NODE_ENV
+      else process.env.NODE_ENV = nodeEnv
+    }
   })
 
   test("completed barge-in input counts toward the reflection gate", async () => {

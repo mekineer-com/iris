@@ -375,6 +375,7 @@ export class GeminiLiveController {
       if (input) throw new Error("Gemini returned input transcription during reflection")
       this.outputTranscript += output
       if (interrupted) {
+        trace("provider.reflection.interrupted")
         this.callbacks.onInterrupted()
         this.finishReflection(null)
       } else if (content.turnComplete === true) {
