@@ -371,7 +371,6 @@ export class GeminiLiveController {
     const output = this.transcriptText(content.outputTranscription, "output")
     if (input) trace("provider.input_transcription", {text: input})
     if (output) trace("provider.output_transcription", {text: output})
-    if (interrupted) trace("provider.interrupted")
     if (this.reflecting) {
       if (input) throw new Error("Gemini returned input transcription during reflection")
       this.outputTranscript += output
@@ -388,15 +387,23 @@ export class GeminiLiveController {
     this.inputTranscript += input
     this.outputTranscript += output
     if (interrupted) {
+      trace("provider.interrupted", {
+        audioChunks: this.providerAudioChunks,
+        inputChars: this.inputTranscript.length,
+        outputChars: this.outputTranscript.length,
+      })
       this.finalizeInterruptedTurn(true)
       this.callbacks.onInterrupted()
     }
     if (content.turnComplete === true) {
       trace("provider.turn_complete", {
         hasToolCall,
-        audioChunks: this.providerAudioChunks,
-        inputChars: this.inputTranscript.length,
-        outputChars: this.outputTranscript.length,
+        interrupted: this.interruptionFinalized,
+        ...(this.interruptionFinalized ? {} : {
+          audioChunks: this.providerAudioChunks,
+          inputChars: this.inputTranscript.length,
+          outputChars: this.outputTranscript.length,
+        }),
       })
       this.providerAudioChunks = 0
       if (this.interruptionFinalized) {
