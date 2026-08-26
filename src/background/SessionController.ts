@@ -64,6 +64,7 @@ export class SessionController {
     options: SessionControllerOptions = {},
   ) {
     this.watchdogMs = options.watchdogMs ?? 3000
+    // ponytail: one bound covers tiny local cues; split only if remote/long clips are introduced.
     this.earconTimeoutMs = options.earconTimeoutMs ?? 2000
     this.config = options.config
     this.createLiveController =
@@ -134,7 +135,14 @@ export class SessionController {
         }),
         new Promise<void>((resolve) => {
           timeout = setTimeout(() => {
-            if (epoch === this.speakerEpoch) this.session.speaker.stop()
+            trace("session.earcon.timeout", {name})
+            if (epoch === this.speakerEpoch) {
+              try {
+                this.session.speaker.stop()
+              } catch {
+                /* host may reject a stale stop */
+              }
+            }
             resolve()
           }, this.earconTimeoutMs)
         }),

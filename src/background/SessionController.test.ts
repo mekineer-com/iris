@@ -384,6 +384,23 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)?.connection).toBe("listening")
   })
 
+  test("stop during Gemini setup never subscribes mic", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const harness = setup({startGate: gate})
+    const start = harness.session.handlers["openalma:start"]({mode: "continuous"})
+    await Promise.resolve()
+
+    await harness.session.handlers["openalma:stop"]({})
+    release()
+    await start
+
+    expect(harness.session.micSubs).toBe(0)
+    expect(lastSnapshot(harness.session)?.connection).toBe("idle")
+  })
+
   test("watchdog failure plays disconnected once and stops Gemini", async () => {
     const harness = setup({watchdogMs: 15})
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
