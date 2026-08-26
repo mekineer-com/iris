@@ -37,6 +37,11 @@ type PendingToolCall = {
   response?: string
 }
 
+function trace(event: string, detail: Record<string, unknown> = {}): void {
+  if (process.env.NODE_ENV === "test") return
+  console.info(`[OpenAlma] ${new Date().toISOString()} ${event}`, detail)
+}
+
 type SocketLike = {
   readyState: number
   send(data: string): void
@@ -88,6 +93,8 @@ export class GeminiLiveController {
   private ready = false
   private pendingToolCalls = new Map<string, PendingToolCall>()
   private deliveredToolResultIds = new Set<string>()
+  private audioFramesSent = 0
+  private providerAudioChunks = 0
 
   constructor(
     private readonly config: OpenAlmaConfig,
@@ -101,6 +108,7 @@ export class GeminiLiveController {
   }
 
   async start(): Promise<void> {
+    trace("provider.start.begin")
     const generation = ++this.generation
     this.stopping = false
     this.ready = false
@@ -121,14 +129,18 @@ export class GeminiLiveController {
     this.stopPromise = null
     this.pendingToolCalls.clear()
     this.deliveredToolResultIds.clear()
+    this.audioFramesSent = 0
+    this.providerAudioChunks = 0
     try {
       const response = await this.requestStart()
+      trace("provider.bootstrap.ready")
       this.token = response.ephemeral_token
       if (generation !== this.generation) {
         await this.endLease()
         throw new Error("Gemini start cancelled")
       }
       await this.connectSocket("")
+      trace("provider.socket.ready")
       if (generation !== this.generation) throw new Error("Gemini start cancelled")
       this.heartbeatTimer = setInterval(
         () => void this.heartbeat(),
@@ -151,6 +163,7 @@ export class GeminiLiveController {
         realtimeInput: {audio: {data: base64Pcm, mimeType: "audio/pcm;rate=16000"}},
       }),
     )
+    this.audioFramesSent += 1
   }
 
   stop(graceful = false): Promise<void> {
@@ -159,6 +172,7 @@ export class GeminiLiveController {
   }
 
   private async performStop(graceful: boolean): Promise<void> {
+    trace("provider.stop.begin", {graceful, turnActive: this.turnActive})
     try {
       const stoppedMidTurn = this.turnActive
       if (this.inputTranscript.trim() || this.outputTranscript.trim()) {
@@ -166,7 +180,9 @@ export class GeminiLiveController {
         this.interruptionFinalized = false
       }
       if (graceful && !stoppedMidTurn && this.ready && this.completeUserTurns >= 2) {
+        trace("provider.reflection.begin")
         const reflection = await this.requestReflection()
+        trace("provider.reflection.end", {persisted: Boolean(reflection && reflection !== "NO_SUMMARY")})
         if (reflection && reflection !== "NO_SUMMARY") {
           this.enqueueEvent("sitting_summary", "assistant", reflection)
         }
@@ -174,6 +190,7 @@ export class GeminiLiveController {
       this.stopping = true
       this.ready = false
       await this.appendTail
+      trace("provider.transcript_queue.drained")
       if (!this.persistenceFatal) await this.flushPendingEvents()
       if (this.pendingEvents.length) {
         this.callbacks.onPersistenceError("Transcript sync failed; last turns were not saved")
@@ -193,6 +210,7 @@ export class GeminiLiveController {
       this.pendingToolCalls.clear()
       this.deliveredToolResultIds.clear()
       await this.endLease()
+      trace("provider.stop.end")
     }
   }
 
@@ -274,6 +292,7 @@ export class GeminiLiveController {
             ready = true
             this.ready = true
             this.flushToolResponses()
+            trace("provider.setup_complete", {resumed: Boolean(handle)})
             finish()
           }
           this.handleMessage(message)
@@ -314,6 +333,7 @@ export class GeminiLiveController {
     }
 
     const hasToolCall = message.toolCall !== undefined
+    if (hasToolCall) trace("provider.tool_call")
     if (message.serverContent !== undefined) {
       this.handleServerContent(message.serverContent, hasToolCall)
     }
@@ -344,10 +364,14 @@ export class GeminiLiveController {
         throw new Error("Gemini returned malformed audio")
       }
       this.callbacks.onAudio(inline.data)
+      this.providerAudioChunks += 1
     }
 
     const input = this.transcriptText(content.inputTranscription, "input")
     const output = this.transcriptText(content.outputTranscription, "output")
+    if (input) trace("provider.input_transcription", {text: input})
+    if (output) trace("provider.output_transcription", {text: output})
+    if (interrupted) trace("provider.interrupted")
     if (this.reflecting) {
       if (input) throw new Error("Gemini returned input transcription during reflection")
       this.outputTranscript += output
@@ -368,6 +392,13 @@ export class GeminiLiveController {
       this.callbacks.onInterrupted()
     }
     if (content.turnComplete === true) {
+      trace("provider.turn_complete", {
+        hasToolCall,
+        audioChunks: this.providerAudioChunks,
+        inputChars: this.inputTranscript.length,
+        outputChars: this.outputTranscript.length,
+      })
+      this.providerAudioChunks = 0
       if (this.interruptionFinalized) {
         this.interruptionFinalized = false
       } else {
@@ -454,6 +485,8 @@ export class GeminiLiveController {
   }
 
   private async runRecall(id: string, query: string, pending: PendingToolCall): Promise<void> {
+    const startedAt = Date.now()
+    trace("recall.begin", {id, query})
     let response: Response
     try {
       response = await this.request(
@@ -462,14 +495,17 @@ export class GeminiLiveController {
         RECALL_TIMEOUT_MS,
       )
     } catch {
+      trace("recall.network_failure", {id, elapsedMs: Date.now() - startedAt})
       this.completeRecall(id, pending, "Memory recall is temporarily unavailable.", true)
       return
     }
     if ([400, 401, 403, 404, 409, 422, 503].includes(response.status)) {
+      trace("recall.fatal", {id, status: response.status, elapsedMs: Date.now() - startedAt})
       this.failRecall(id, pending, `OpenAlma memory recall failed (${response.status})`)
       return
     }
     if (!response.ok) {
+      trace("recall.temporary_failure", {id, status: response.status, elapsedMs: Date.now() - startedAt})
       this.completeRecall(id, pending, "Memory recall is temporarily unavailable.", true)
       return
     }
@@ -485,6 +521,7 @@ export class GeminiLiveController {
       return
     }
     this.completeRecall(id, pending, body.context.trim(), false)
+    trace("recall.end", {id, elapsedMs: Date.now() - startedAt, context: body.context.trim()})
   }
 
   private completeRecall(id: string, pending: PendingToolCall, result: string, failed: boolean): void {
@@ -632,6 +669,7 @@ export class GeminiLiveController {
   }
 
   private async handleUnexpectedClose(): Promise<void> {
+    trace("provider.socket.closed", {resumable: Boolean(this.resumptionHandle)})
     this.socket = null
     this.ready = false
     if (this.reflecting) {
@@ -659,6 +697,7 @@ export class GeminiLiveController {
   }
 
   private async heartbeat(): Promise<void> {
+    trace("provider.heartbeat", {audioFramesSent: this.audioFramesSent})
     try {
       const response = await this.request(`/integration/mentra/session/${this.sessionId}/heartbeat`, {
         user_id: this.config.userId,

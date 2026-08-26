@@ -26,6 +26,11 @@ export type SessionControllerOptions = {
 
 const ACTIVE: ReadonlySet<ConnectionState> = new Set(["starting", "listening", "speaking"])
 
+function trace(event: string, detail: Record<string, unknown> = {}): void {
+  if (process.env.NODE_ENV === "test") return
+  console.info(`[OpenAlma] ${new Date().toISOString()} ${event}`, detail)
+}
+
 export class SessionController {
   private started = false
   private readonly unsubs: Array<() => void> = []
@@ -166,6 +171,7 @@ export class SessionController {
     this.lastError = null
     this.sawMicFrame = false
     this.connection = "starting"
+    trace("session.start.requested", {mode})
     this.pushSnapshot()
 
     try {
@@ -187,22 +193,27 @@ export class SessionController {
         })
       }
       await this.liveController.start()
+      trace("session.provider.ready")
       if (generation !== this.startGeneration) {
         await this.stopLiveController()
         return
       }
+      trace("session.start_earcon.begin")
       await this.playEarcon("listen-start")
+      trace("session.start_earcon.end")
       if (generation !== this.startGeneration) {
         await this.stopLiveController()
         return
       }
       this.subscribeMic()
+      trace("session.microphone.subscribed")
       if (generation !== this.startGeneration) {
         this.stopMic()
         await this.stopLiveController()
         return
       }
       this.connection = "listening"
+      trace("session.listening")
       this.pushSnapshot()
       for (const pcm of this.startupAudio.splice(0)) this.onGeminiAudio(pcm)
       if (this.startupTurnComplete) {
@@ -277,9 +288,12 @@ export class SessionController {
   private async runTeardown(): Promise<void> {
     const graceful = this.teardownKind === "stop"
     const generation = this.beginTeardown(this.teardownKind ?? "fail")
+    trace("session.stop.begin", {kind: this.teardownKind, graceful})
     this.pushSnapshot()
     await this.abortCurrentWriter()
+    trace("session.speaker.aborted")
     await this.stopLiveController(graceful)
+    trace("session.provider.stopped")
     await this.speechFinishTail
     await this.finishSpeech()
     if (generation !== this.startGeneration) return
@@ -291,6 +305,7 @@ export class SessionController {
         /* ignore */
       }
       this.connection = "idle"
+      trace("session.idle")
     } else {
       try {
         await this.playEarcon("disconnected")
@@ -298,6 +313,7 @@ export class SessionController {
         /* ignore */
       }
       this.connection = "error"
+      trace("session.error", {error: this.lastError})
     }
     if (generation !== this.startGeneration) return
     this.teardownKind = null
@@ -351,6 +367,7 @@ export class SessionController {
       const normalized = normalizePcm16Audio(chunk)
       if (!this.sawMicFrame) {
         this.sawMicFrame = true
+        trace("session.microphone.first_frame")
         this.clearFirstPcmTimeout()
       }
       this.liveController?.sendAudio(normalized)
@@ -368,6 +385,7 @@ export class SessionController {
     if (!reflection && this.connection !== "listening" && this.connection !== "speaking") return
     if (!reflection && this.connection !== "speaking") {
       this.connection = "speaking"
+      trace("session.speaking")
       this.pushSnapshot()
     }
     const write = this.writeSpeech(base64Pcm)
@@ -434,6 +452,7 @@ export class SessionController {
       if (this.speakerWriter === writer) this.speakerWriter = null
       if (epoch === this.speakerEpoch && this.connection === "speaking") {
         this.connection = "listening"
+        trace("session.listening")
         this.pushSnapshot()
       }
     } catch {
