@@ -3,7 +3,6 @@ import type {AudioChunkData, MiniappSession, UnsubscribeFn} from "@mentra/miniap
 import type {Channels} from "../shared/channels"
 import type {ConnectionState, EarconName, SessionMode, SessionSnapshot} from "../shared/types"
 import {normalizePcm16Audio} from "./audioHelpers"
-import {EARCON_SAMPLE_RATE, EARCONS} from "./earcons"
 import {GeminiLiveController} from "./GeminiLiveController"
 import type {GeminiCallbacks} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
@@ -121,36 +120,14 @@ export class SessionController {
   }
 
   async playEarcon(name: EarconName): Promise<void> {
-    const pcm = EARCONS[name]
-    const epoch = this.speakerEpoch
-    const writer = (await this.session.speaker.createStream({
-      sampleRate: EARCON_SAMPLE_RATE,
-      stopOtherAudio: true,
-    })) as SpeakerWriter
-    if (epoch !== this.speakerEpoch) {
-      try {
-        await writer.abort()
-      } catch {
-        /* abandoned */
-      }
-      return
-    }
-    this.speakerWriter = writer
     try {
-      const {bufferedMs} = await writer.write(pcm)
-      if (epoch !== this.speakerEpoch) return
-      if (bufferedMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, Math.min(bufferedMs, 500)))
-      }
-      await writer.abort()
+      const config = this.config ?? readOpenAlmaConfig()
+      await this.session.speaker.play({
+        audioUrl: `${config.baseUrl}/integration/mentra/earcons/${name}.wav`,
+        stopOtherAudio: true,
+      })
     } catch {
-      try {
-        await writer.abort()
-      } catch {
-        /* ignore */
-      }
-    } finally {
-      if (this.speakerWriter === writer) this.speakerWriter = null
+      /* a missing cue must not block voice */
     }
   }
 

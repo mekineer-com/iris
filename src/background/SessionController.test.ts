@@ -74,6 +74,7 @@ class FakeSession {
   micSubs = 0
   micStops = 0
   speakerStops = 0
+  plays: Array<{audioUrl: string; stopOtherAudio?: boolean}> = []
   streams: Array<{
     opts: {sampleRate: number; stopOtherAudio?: boolean}
     writes: unknown[]
@@ -86,6 +87,7 @@ class FakeSession {
   createGate: Promise<void> | null = null
   closeGate: Promise<void> | null = null
   abortGate: Promise<void> | null = null
+  playGate: Promise<void> | null = null
   createErrorOnce = false
 
   ui = {
@@ -120,6 +122,10 @@ class FakeSession {
   speaker = {
     stop: () => {
       this.speakerStops += 1
+    },
+    play: async (options: {audioUrl: string; stopOtherAudio?: boolean}) => {
+      this.plays.push(options)
+      if (this.playGate) await this.playGate
     },
     createStream: async (opts: {sampleRate: number; stopOtherAudio?: boolean}) => {
       if (this.createErrorOnce) {
@@ -188,7 +194,10 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     expect(harness.live.starts).toBe(1)
     expect(harness.session.micSubs).toBe(1)
-    expect(harness.session.streams[0]?.aborted).toBe(true)
+    expect(harness.session.plays[0]).toEqual({
+      audioUrl: "http://127.0.0.1:9999/integration/mentra/earcons/listen-start.wav",
+      stopOtherAudio: true,
+    })
     await harness.session.handlers["openalma:stop"]({})
     expect(harness.live.stops).toBe(1)
     expect(harness.live.stopArgs).toEqual([true])
@@ -199,11 +208,11 @@ describe("SessionController", () => {
   test("keeps Gemini speech that arrives during the start earcon", async () => {
     const harness = setup()
     let release!: () => void
-    harness.session.abortGate = new Promise<void>((resolve) => {
+    harness.session.playGate = new Promise<void>((resolve) => {
       release = resolve
     })
     const start = harness.session.handlers["openalma:start"]({mode: "continuous"})
-    while (harness.session.streams.length === 0) await new Promise((resolve) => setTimeout(resolve, 0))
+    while (harness.session.plays.length === 0) await new Promise((resolve) => setTimeout(resolve, 0))
 
     harness.live.audio()
     harness.live.turnComplete()
@@ -211,8 +220,8 @@ describe("SessionController", () => {
     await start
     await new Promise((resolve) => setTimeout(resolve, 0))
 
-    expect(harness.session.streams[1]?.writes).toEqual([silentPcm()])
-    expect(harness.session.streams[1]?.closed).toBe(true)
+    expect(harness.session.streams[0]?.writes).toEqual([silentPcm()])
+    expect(harness.session.streams[0]?.closed).toBe(true)
     expect(lastSnapshot(harness.session)?.connection).toBe("listening")
   })
 
@@ -225,13 +234,13 @@ describe("SessionController", () => {
     harness.live.audio()
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(lastSnapshot(harness.session)?.connection).toBe("speaking")
-    expect(harness.session.streams[1]?.opts.sampleRate).toBe(24000)
-    expect(harness.session.streams[1]?.writes).toEqual([silentPcm()])
+    expect(harness.session.streams[0]?.opts.sampleRate).toBe(24000)
+    expect(harness.session.streams[0]?.writes).toEqual([silentPcm()])
     harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})
     expect(harness.live.sent).toEqual([silentPcm()])
     harness.live.turnComplete()
     await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(harness.session.streams[1]?.closed).toBe(true)
+    expect(harness.session.streams[0]?.closed).toBe(true)
     expect(lastSnapshot(harness.session)?.connection).toBe("listening")
     harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})
     expect(harness.live.sent).toEqual([silentPcm(), silentPcm()])
@@ -245,8 +254,8 @@ describe("SessionController", () => {
     harness.live.audio()
     harness.live.turnComplete()
     await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(harness.session.streams[1]?.writes).toEqual([silentPcm(), silentPcm()])
-    expect(harness.session.streams[1]?.closed).toBe(true)
+    expect(harness.session.streams[0]?.writes).toEqual([silentPcm(), silentPcm()])
+    expect(harness.session.streams[0]?.closed).toBe(true)
   })
 
   test("interruption aborts stale speaker creation", async () => {
@@ -289,10 +298,10 @@ describe("SessionController", () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     harness.live.audio()
     await Promise.resolve()
-    expect(harness.session.streams).toHaveLength(2)
+    expect(harness.session.streams).toHaveLength(1)
     releaseNew()
     await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(harness.session.streams).toHaveLength(3)
+    expect(harness.session.streams).toHaveLength(2)
   })
 
   test("interruption stops and aborts an active speaker stream", async () => {
@@ -302,7 +311,7 @@ describe("SessionController", () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     harness.live.interrupted()
     await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(harness.session.streams[1]?.aborted).toBe(true)
+    expect(harness.session.streams[0]?.aborted).toBe(true)
     expect(harness.session.speakerStops).toBe(1)
     expect(lastSnapshot(harness.session)?.connection).toBe("listening")
   })
@@ -345,7 +354,7 @@ describe("SessionController", () => {
     await new Promise((resolve) => setTimeout(resolve, 40))
     expect(lastSnapshot(harness.session)?.connection).toBe("error")
     expect(harness.live.stops).toBe(1)
-    expect(harness.session.streams.length).toBe(2)
+    expect(harness.session.plays).toHaveLength(2)
   })
 
   test("duplicate Start is a no-op and Manual fails visibly", async () => {
@@ -436,8 +445,8 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     harness.live.audioOnStop = true
     await harness.session.handlers["openalma:stop"]({})
-    expect(harness.session.streams[1]?.writes).toEqual([silentPcm()])
-    expect(harness.session.streams[1]?.closed).toBe(true)
+    expect(harness.session.streams[0]?.writes).toEqual([silentPcm()])
+    expect(harness.session.streams[0]?.closed).toBe(true)
     expect(lastSnapshot(harness.session)?.connection).toBe("idle")
   })
 
