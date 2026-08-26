@@ -295,9 +295,12 @@ describe("GeminiLiveController", () => {
       },
     })
 
-    completeTurn(h, "ordinary follow-up", "ordinary answer")
     h.sockets[0].message({
       serverContent: {outputTranscription: {text: "I remembered it."}, turnComplete: true},
+    })
+    completeTurn(h, "ordinary follow-up", "ordinary answer")
+    h.sockets[0].message({
+      serverContent: {outputTranscription: {text: "stale license"}, turnComplete: true},
     })
     await waitFor(
       () => h.requests
@@ -309,39 +312,41 @@ describe("GeminiLiveController", () => {
       .flatMap((request) => request.body.events)
     expect(events.map((event: any) => [event.role, event.content, event.status])).toEqual([
       ["user", "remember the beacon", "complete"],
+      ["assistant", "I remembered it.", "complete"],
       ["user", "ordinary follow-up", "complete"],
       ["assistant", "ordinary answer", "complete"],
-      ["assistant", "I remembered it.", "complete"],
     ])
-    expect(h.errors).toEqual([])
+    expect(h.errors).toEqual(["Gemini completed a turn without both transcriptions"])
     await h.controller.stop()
   })
 
   test("temporary recall failure is SILENT and nonfatal", async () => {
-    const h = harness({recallStatus: 502, recallBody: {detail: "private upstream detail"}})
-    await start(h)
-    h.sockets[0].message({
-      toolCall: {
-        functionCalls: [{id: "call-2", name: "recall_memory", args: {query: "private query"}}],
-      },
-    })
+    for (const status of [429, 500, 502]) {
+      const h = harness({recallStatus: status, recallBody: {detail: "private upstream detail"}})
+      await start(h)
+      h.sockets[0].message({
+        toolCall: {
+          functionCalls: [{id: `call-${status}`, name: "recall_memory", args: {query: "private query"}}],
+        },
+      })
 
-    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse))
-    const response = JSON.parse(h.sockets[0].sent.find((value) => JSON.parse(value).toolResponse)!)
-    expect(response.toolResponse.functionResponses[0]).toMatchObject({
-      response: {result: "Memory recall is temporarily unavailable."},
-      scheduling: "SILENT",
-    })
-    expect(h.persistenceErrors).toContain("Memory recall unavailable; voice is continuing")
-    expect(JSON.stringify({response, errors: h.errors, persistenceErrors: h.persistenceErrors})).not.toContain(
-      "private",
-    )
-    expect(h.errors).toEqual([])
-    await h.controller.stop()
+      await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse))
+      const response = JSON.parse(h.sockets[0].sent.find((value) => JSON.parse(value).toolResponse)!)
+      expect(response.toolResponse.functionResponses[0]).toMatchObject({
+        response: {result: "Memory recall is temporarily unavailable."},
+        scheduling: "SILENT",
+      })
+      expect(h.persistenceErrors).toContain("Memory recall unavailable; voice is continuing")
+      expect(JSON.stringify({response, errors: h.errors, persistenceErrors: h.persistenceErrors})).not.toContain(
+        "private",
+      )
+      expect(h.errors).toEqual([])
+      await h.controller.stop()
+    }
   })
 
   test("recall scope, internal, and config failures are fatal without exposing the query", async () => {
-    for (const status of [404, 500, 503]) {
+    for (const status of [404, 503]) {
       const h = harness({recallStatus: status, recallBody: {detail: "private scope detail"}})
       await start(h)
       h.sockets[0].message({

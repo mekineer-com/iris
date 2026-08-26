@@ -391,10 +391,8 @@ export class GeminiLiveController {
     const output = this.outputTranscript.trim()
     this.clearTurn()
     if (!input && !output) throw new Error("Gemini completed a turn without transcription")
-    const deliveredResultId = !input && output
-      ? this.deliveredToolResultIds.values().next().value as string | undefined
-      : undefined
-    if ((!input || !output) && !(input && toolCallBoundary) && !deliveredResultId) {
+    const followsToolResult = !input && output && this.deliveredToolResultIds.size > 0
+    if ((!input || !output) && !(input && toolCallBoundary) && !followsToolResult) {
       throw new Error("Gemini completed a turn without both transcriptions")
     }
     if (input) {
@@ -402,7 +400,7 @@ export class GeminiLiveController {
       this.completeUserTurns += 1
     }
     if (output) this.enqueueEvent("transcript", "assistant", output, "complete")
-    if (deliveredResultId) this.deliveredToolResultIds.delete(deliveredResultId)
+    this.deliveredToolResultIds.clear()
     this.scheduleAppend()
   }
 
@@ -467,7 +465,7 @@ export class GeminiLiveController {
       this.completeRecall(id, pending, "Memory recall is temporarily unavailable.", true)
       return
     }
-    if ([400, 401, 403, 404, 409, 422, 500, 503].includes(response.status)) {
+    if ([400, 401, 403, 404, 409, 422, 503].includes(response.status)) {
       this.failRecall(id, pending, `OpenAlma memory recall failed (${response.status})`)
       return
     }
