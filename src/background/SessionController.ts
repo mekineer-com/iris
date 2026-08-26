@@ -363,6 +363,7 @@ export class SessionController {
 
   private handlePcmFrame(chunk: AudioChunkData): void {
     if (!ACTIVE.has(this.connection) && this.connection !== "starting") return
+    if (this.connection === "speaking") return
     try {
       const normalized = normalizePcm16Audio(chunk)
       if (!this.sawMicFrame) {

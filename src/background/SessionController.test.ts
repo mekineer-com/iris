@@ -227,10 +227,14 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)?.connection).toBe("speaking")
     expect(harness.session.streams[1]?.opts.sampleRate).toBe(24000)
     expect(harness.session.streams[1]?.writes).toEqual([silentPcm()])
+    harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})
+    expect(harness.live.sent).toEqual([silentPcm()])
     harness.live.turnComplete()
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(harness.session.streams[1]?.closed).toBe(true)
     expect(lastSnapshot(harness.session)?.connection).toBe("listening")
+    harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})
+    expect(harness.live.sent).toEqual([silentPcm(), silentPcm()])
   })
 
   test("turn completion waits for audio dispatched in the same tick", async () => {
