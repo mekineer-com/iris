@@ -5,7 +5,7 @@ import {GeminiLiveController} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {SessionController} from "./SessionController"
 
-type Snapshot = {mode: string; connection: string; lastError: string | null}
+type Snapshot = {mode: string; connection: string; manualPhase: string; lastError: string | null}
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://127.0.0.1:9999",
@@ -19,11 +19,18 @@ function silentPcm(): string {
   return Buffer.alloc(8).toString("base64")
 }
 
+function testPcm(value: number): string {
+  return Buffer.alloc(8, value).toString("base64")
+}
+
 class FakeLive {
   starts = 0
   stops = 0
   stopArgs: boolean[] = []
   sent: string[] = []
+  startModes: string[] = []
+  activities: string[][] = []
+  activityError: Error | null = null
   startGate: Promise<void> | null = null
   stopGate: Promise<void> | null = null
   audioOnStop = false
@@ -31,13 +38,19 @@ class FakeLive {
 
   constructor(readonly callbacks: GeminiCallbacks) {}
 
-  async start(): Promise<void> {
+  async start(mode = "continuous"): Promise<void> {
     this.starts += 1
+    this.startModes.push(mode)
     if (this.startGate) await this.startGate
   }
 
   sendAudio(data: string): void {
     this.sent.push(data)
+  }
+
+  sendActivity(chunks: readonly string[]): void {
+    if (this.activityError) throw this.activityError
+    this.activities.push([...chunks])
   }
 
   async stop(graceful = false): Promise<void> {
@@ -162,12 +175,20 @@ class FakeSession {
   }
 }
 
-function setup(options: {watchdogMs?: number; earconTimeoutMs?: number; startGate?: Promise<void>} = {}) {
+function setup(
+  options: {
+    watchdogMs?: number
+    earconTimeoutMs?: number
+    responseWatchdogMs?: number
+    startGate?: Promise<void>
+  } = {},
+) {
   const session = new FakeSession()
   let live!: FakeLive
   const controller = new SessionController(session as never, {
     watchdogMs: options.watchdogMs ?? 5000,
     earconTimeoutMs: options.earconTimeoutMs,
+    responseWatchdogMs: options.responseWatchdogMs,
     config: CONFIG,
     createLiveController: (_config, callbacks) => {
       live = new FakeLive(callbacks)
@@ -410,23 +431,27 @@ describe("SessionController", () => {
     expect(harness.session.plays).toHaveLength(2)
   })
 
-  test("duplicate Start is a no-op and Manual fails visibly", async () => {
+  test("selects Manual while idle and rejects active mode changes", async () => {
     const harness = setup()
-    expect(() => harness.session.handlers["openalma:set-mode"]({mode: "manual"})).toThrow(
-      "Manual mode is available in Slice 7",
-    )
-    await expect(harness.session.handlers["openalma:start"]({mode: "manual"})).rejects.toThrow(
-      "Manual mode is available in Slice 7",
-    )
-    await harness.session.handlers["openalma:start"]({mode: "continuous"})
-    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(harness.session.handlers["openalma:set-mode"]({mode: "manual"})).toEqual({ok: true})
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
     expect(harness.live.starts).toBe(1)
+    expect(harness.live.startModes).toEqual(["manual"])
+    expect(() => harness.session.handlers["openalma:set-mode"]({mode: "continuous"})).toThrow(
+      "Stop before changing speech mode",
+    )
   })
 
   test("UI registration and provider failure remain observable", async () => {
     const harness = setup()
     harness.session.onOpenCb?.()
-    expect(harness.session.snapshots[0]).toEqual({mode: "continuous", connection: "idle", lastError: null})
+    expect(harness.session.snapshots[0]).toEqual({
+      mode: "continuous",
+      connection: "idle",
+      manualPhase: "idle",
+      lastError: null,
+    })
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     harness.live.fail("provider failed")
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -445,6 +470,66 @@ describe("SessionController", () => {
     harness.live.persistence(null)
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", lastError: null})
     await harness.session.handlers["openalma:stop"]({})
+  })
+
+  test("Manual records, reviews, redoes, and sends only the replacement", async () => {
+    const harness = setup({watchdogMs: 15})
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", manualPhase: "idle"})
+
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    expect(() => harness.session.handlers["openalma:manual-action"]({action: "done"})).toThrow(
+      "No audio was recorded",
+    )
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+    expect(harness.live.activities).toEqual([])
+
+    harness.session.handlers["openalma:manual-action"]({action: "redo"})
+    harness.session.micHandler?.({data: testPcm(2), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+    harness.session.handlers["openalma:manual-action"]({action: "send"})
+    expect(harness.live.activities).toEqual([[testPcm(2)]])
+    expect(lastSnapshot(harness.session)?.manualPhase).toBe("submitted")
+
+    harness.live.turnComplete()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", manualPhase: "idle"})
+  })
+
+  test("Manual keeps a Review draft when the provider is not ready", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+    harness.live.activityError = new Error("Gemini socket is not ready")
+
+    expect(() => harness.session.handlers["openalma:manual-action"]({action: "send"})).toThrow(
+      "Gemini socket is not ready",
+    )
+    expect(lastSnapshot(harness.session)?.manualPhase).toBe("review")
+    harness.live.activityError = null
+    harness.session.handlers["openalma:manual-action"]({action: "send"})
+    expect(harness.live.activities).toEqual([[testPcm(1)]])
+  })
+
+  test("Manual response timeout fails the sitting", async () => {
+    const harness = setup({responseWatchdogMs: 10})
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+    harness.session.handlers["openalma:manual-action"]({action: "send"})
+
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(lastSnapshot(harness.session)).toMatchObject({
+      connection: "error",
+      manualPhase: "idle",
+      lastError: "Gemini did not answer the Manual recording",
+    })
   })
 
   test("Stop during fatal teardown awaits the same owner", async () => {

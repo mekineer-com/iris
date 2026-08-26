@@ -14,6 +14,7 @@ const CONFIG: OpenAlmaConfig = {
 class FakeSocket {
   readyState = 0
   sent: string[] = []
+  failAtSendCount: number | null = null
   private listeners: Record<string, Array<(event: any) => void>> = {}
 
   addEventListener(type: string, listener: (event: any) => void): void {
@@ -21,6 +22,7 @@ class FakeSocket {
   }
 
   send(data: string): void {
+    if (this.failAtSendCount === this.sent.length) throw new Error("socket send failed")
     this.sent.push(data)
   }
 
@@ -141,8 +143,8 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   expect(predicate()).toBe(true)
 }
 
-async function start(h: ReturnType<typeof harness>): Promise<void> {
-  const starting = h.controller.start()
+async function start(h: ReturnType<typeof harness>, mode: "continuous" | "manual" = "continuous"): Promise<void> {
+  const starting = h.controller.start(mode)
   await waitFor(() => h.sockets.length === 1)
   h.sockets[0].open()
   expect(JSON.parse(h.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
@@ -180,6 +182,38 @@ describe("GeminiLiveController", () => {
     })
     await h.controller.stop()
     expect(h.requests.filter((request) => request.url.endsWith("/sitting-1/end"))).toHaveLength(1)
+  })
+
+  test("sends one buffered Manual activity in order", async () => {
+    const h = harness()
+    await start(h, "manual")
+
+    h.controller.sendActivity(["AAAA", "BBBB"])
+
+    expect(h.requests[0].body.mode).toBe("manual")
+    expect(h.sockets[0].sent.slice(1).map((value) => JSON.parse(value))).toEqual([
+      {realtimeInput: {activityStart: {}}},
+      {realtimeInput: {audio: {data: "AAAA", mimeType: "audio/pcm;rate=16000"}}},
+      {realtimeInput: {audio: {data: "BBBB", mimeType: "audio/pcm;rate=16000"}}},
+      {realtimeInput: {activityEnd: {}}},
+    ])
+    await h.controller.stop()
+  })
+
+  test("preserves a pre-send Manual take but reports partial transmission", async () => {
+    const h = harness()
+    await start(h, "manual")
+    h.sockets[0].readyState = 0
+    expect(() => h.controller.sendActivity(["AAAA"])).toThrow("Gemini socket is not ready")
+    expect(h.errors).toEqual([])
+
+    h.sockets[0].readyState = 1
+    h.sockets[0].failAtSendCount = 3
+    expect(() => h.controller.sendActivity(["AAAA", "BBBB"])).toThrow(
+      "Gemini manual activity send failed",
+    )
+    expect(h.errors).toEqual(["Gemini manual activity send failed"])
+    await h.controller.stop()
   })
 
   test("retries one stale-bootstrap conflict", async () => {

@@ -1,8 +1,15 @@
 import type {AudioChunkData, MiniappSession, UnsubscribeFn} from "@mentra/miniapp/background"
 
 import type {Channels} from "../shared/channels"
-import type {ConnectionState, EarconName, SessionMode, SessionSnapshot} from "../shared/types"
-import {normalizePcm16Audio} from "./audioHelpers"
+import type {
+  ConnectionState,
+  EarconName,
+  ManualAction,
+  ManualPhase,
+  SessionMode,
+  SessionSnapshot,
+} from "../shared/types"
+import {approxBase64ByteLength, normalizePcm16Audio} from "./audioHelpers"
 import {GeminiLiveController} from "./GeminiLiveController"
 import type {GeminiCallbacks} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
@@ -20,11 +27,14 @@ type SpeakerWriter = {
 export type SessionControllerOptions = {
   watchdogMs?: number
   earconTimeoutMs?: number
+  responseWatchdogMs?: number
   config?: OpenAlmaConfig
   createLiveController?: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
 }
 
 const ACTIVE: ReadonlySet<ConnectionState> = new Set(["starting", "listening", "speaking"])
+const MAX_MANUAL_AUDIO_BYTES = 16000 * 2 * 120
+const MANUAL_LIMIT_MESSAGE = "Manual recording reached 120-second limit"
 
 function trace(event: string, detail: Record<string, unknown> = {}): void {
   if (process.env.NODE_ENV === "test") return
@@ -38,6 +48,10 @@ export class SessionController {
 
   private mode: SessionMode = "continuous"
   private connection: ConnectionState = "idle"
+  private manualPhase: ManualPhase = "idle"
+  private manualAudio: string[] = []
+  private manualAudioBytes = 0
+  private manualResponseTimeout: ReturnType<typeof setTimeout> | null = null
   private lastError: string | null = null
   private startInFlight = false
   private startGeneration = 0
@@ -55,6 +69,7 @@ export class SessionController {
   private teardownPromise: Promise<void> | null = null
   private readonly watchdogMs: number
   private readonly earconTimeoutMs: number
+  private readonly responseWatchdogMs: number
   private readonly config?: OpenAlmaConfig
   private readonly createLiveController: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
   private liveController: GeminiLiveController | null
@@ -66,6 +81,7 @@ export class SessionController {
     this.watchdogMs = options.watchdogMs ?? 3000
     // ponytail: one bound covers tiny local cues; split only if remote/long clips are introduced.
     this.earconTimeoutMs = options.earconTimeoutMs ?? 2000
+    this.responseWatchdogMs = options.responseWatchdogMs ?? 60_000
     this.config = options.config
     this.createLiveController =
       options.createLiveController ?? ((config, callbacks) => new GeminiLiveController(config, callbacks))
@@ -106,9 +122,21 @@ export class SessionController {
     this.unsubs.push(
       ui.handle("openalma:set-mode", (payload) => {
         const mode = (payload as {mode?: SessionMode} | null)?.mode
-        if (mode === "manual") throw new Error("Manual mode is available in Slice 7")
-        if (mode === "continuous") this.mode = mode
+        if (mode !== "continuous" && mode !== "manual") throw new Error("Unknown speech mode")
+        if (this.connection !== "idle" && this.connection !== "error") {
+          throw new Error("Stop before changing speech mode")
+        }
+        this.mode = mode
+        this.resetManualState()
         this.pushSnapshot()
+        return {ok: true as const}
+      }),
+    )
+    this.unsubs.push(
+      ui.handle("openalma:manual-action", (payload) => {
+        const action = (payload as {action?: ManualAction} | null)?.action
+        if (!action) throw new Error("Manual action is required")
+        this.handleManualAction(action)
         return {ok: true as const}
       }),
     )
@@ -117,8 +145,11 @@ export class SessionController {
   async interrupt(): Promise<void> {
     this.speakerEpoch += 1
     await this.abortCurrentWriter()
+    const manualFinished = this.completeManualResponse()
     if (this.connection === "speaking") {
       this.connection = "listening"
+      this.pushSnapshot()
+    } else if (manualFinished) {
       this.pushSnapshot()
     }
   }
@@ -155,7 +186,12 @@ export class SessionController {
   }
 
   private snapshot(): SessionSnapshot {
-    return {mode: this.mode, connection: this.connection, lastError: this.lastError}
+    return {
+      mode: this.mode,
+      connection: this.connection,
+      manualPhase: this.manualPhase,
+      lastError: this.lastError,
+    }
   }
 
   private pushSnapshot(): void {
@@ -166,12 +202,11 @@ export class SessionController {
     if (this.startInFlight || ACTIVE.has(this.connection) || this.connection === "stopping") {
       return
     }
-    if (mode !== "continuous") throw new Error("Manual mode is available in Slice 7")
-
     this.startInFlight = true
     const generation = ++this.startGeneration
     this.mode = mode
     this.lastError = null
+    this.resetManualState()
     this.sawMicFrame = false
     this.connection = "starting"
     trace("session.start.requested", {mode})
@@ -196,7 +231,7 @@ export class SessionController {
         })
       }
       const controller = this.liveController
-      await controller.start()
+      await controller.start(mode)
       trace("session.provider.ready")
       if (generation !== this.startGeneration) {
         await this.stopLiveController(false, controller)
@@ -241,6 +276,7 @@ export class SessionController {
     this.stopMic()
     this.startupAudio = []
     this.startupTurnComplete = false
+    this.resetManualState()
     this.speakerEpoch += 1
     return this.startGeneration
   }
@@ -375,7 +411,20 @@ export class SessionController {
         trace("session.microphone.first_frame")
         this.clearFirstPcmTimeout()
       }
-      this.liveController?.sendAudio(normalized)
+      if (this.mode === "continuous") {
+        this.liveController?.sendAudio(normalized)
+        return
+      }
+      if (this.manualPhase !== "recording") return
+      const bytes = approxBase64ByteLength(normalized)
+      if (this.manualAudioBytes + bytes > MAX_MANUAL_AUDIO_BYTES) {
+        this.manualPhase = "review"
+        this.lastError = MANUAL_LIMIT_MESSAGE
+        this.pushSnapshot()
+        return
+      }
+      this.manualAudio.push(normalized)
+      this.manualAudioBytes += bytes
     } catch (error) {
       void this.fail(error)
     }
@@ -446,8 +495,11 @@ export class SessionController {
     if (epoch !== this.speakerEpoch) return
     const writer = this.speakerWriter ?? (await this.speakerOpenPromise)
     if (!writer || epoch !== this.speakerEpoch) {
+      const manualFinished = this.completeManualResponse()
       if (this.connection === "speaking") {
         this.connection = "listening"
+        this.pushSnapshot()
+      } else if (manualFinished) {
         this.pushSnapshot()
       }
       return
@@ -455,10 +507,15 @@ export class SessionController {
     try {
       await writer.close()
       if (this.speakerWriter === writer) this.speakerWriter = null
-      if (epoch === this.speakerEpoch && this.connection === "speaking") {
-        this.connection = "listening"
-        trace("session.listening")
-        this.pushSnapshot()
+      if (epoch === this.speakerEpoch) {
+        const manualFinished = this.completeManualResponse()
+        if (this.connection === "speaking") {
+          this.connection = "listening"
+          trace("session.listening")
+          this.pushSnapshot()
+        } else if (manualFinished) {
+          this.pushSnapshot()
+        }
       }
     } catch {
       if (epoch === this.speakerEpoch) await this.fail(new Error("speaker close failed"))
@@ -467,6 +524,67 @@ export class SessionController {
 
   private queueFinishSpeech(): void {
     this.speechFinishTail = this.speechFinishTail.then(() => this.finishSpeech())
+  }
+
+  private handleManualAction(action: ManualAction): void {
+    if (this.mode !== "manual") throw new Error("Manual controls require Manual mode")
+    if (this.connection !== "listening") throw new Error("Manual controls require a ready session")
+    if (action === "talk") {
+      if (this.manualPhase !== "idle") throw new Error("Manual recording is already active")
+      this.clearManualAudio()
+      this.lastError = null
+      this.manualPhase = "recording"
+    } else if (action === "done") {
+      if (this.manualPhase !== "recording") throw new Error("No Manual recording is active")
+      if (this.manualAudio.length === 0) throw new Error("No audio was recorded")
+      this.manualPhase = "review"
+    } else if (action === "redo") {
+      if (this.manualPhase !== "review") throw new Error("Redo requires a recording in Review")
+      this.clearManualAudio()
+      this.lastError = null
+      this.manualPhase = "recording"
+    } else {
+      if (this.manualPhase !== "review") throw new Error("Send requires a recording in Review")
+      if (!this.liveController) throw new Error("Gemini controller is not available")
+      this.liveController.sendActivity(this.manualAudio)
+      this.clearManualAudio()
+      this.manualPhase = "submitted"
+      this.startManualResponseWatchdog()
+    }
+    this.pushSnapshot()
+  }
+
+  private clearManualAudio(): void {
+    this.manualAudio = []
+    this.manualAudioBytes = 0
+  }
+
+  private resetManualState(): void {
+    this.clearManualAudio()
+    this.manualPhase = "idle"
+    this.clearManualResponseWatchdog()
+  }
+
+  private completeManualResponse(): boolean {
+    if (this.manualPhase !== "submitted") return false
+    this.manualPhase = "idle"
+    this.clearManualResponseWatchdog()
+    return true
+  }
+
+  private startManualResponseWatchdog(): void {
+    this.clearManualResponseWatchdog()
+    this.manualResponseTimeout = setTimeout(() => {
+      if (this.manualPhase === "submitted") {
+        void this.fail(new Error("Gemini did not answer the Manual recording"))
+      }
+    }, this.responseWatchdogMs)
+  }
+
+  private clearManualResponseWatchdog(): void {
+    if (!this.manualResponseTimeout) return
+    clearTimeout(this.manualResponseTimeout)
+    this.manualResponseTimeout = null
   }
 
   private async stopLiveController(

@@ -1,5 +1,6 @@
 import {approxBase64ByteLength} from "./audioHelpers"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
+import type {SessionMode} from "../shared/types"
 
 type StartResponse = {
   session_id: string
@@ -95,6 +96,7 @@ export class GeminiLiveController {
   private deliveredToolResultIds = new Set<string>()
   private audioFramesSent = 0
   private providerAudioChunks = 0
+  private mode: SessionMode = "continuous"
 
   constructor(
     private readonly config: OpenAlmaConfig,
@@ -107,7 +109,7 @@ export class GeminiLiveController {
     this.heartbeatMs = options.heartbeatMs
   }
 
-  async start(): Promise<void> {
+  async start(mode: SessionMode = "continuous"): Promise<void> {
     trace("provider.start.begin")
     const generation = ++this.generation
     this.stopping = false
@@ -131,8 +133,9 @@ export class GeminiLiveController {
     this.deliveredToolResultIds.clear()
     this.audioFramesSent = 0
     this.providerAudioChunks = 0
+    this.mode = mode
     try {
-      const response = await this.requestStart()
+      const response = await this.requestStart(mode)
       trace("provider.bootstrap.ready")
       this.token = response.ephemeral_token
       if (generation !== this.generation) {
@@ -158,7 +161,40 @@ export class GeminiLiveController {
       return
     }
     if (!this.socket || this.socket.readyState !== WS_OPEN) throw new Error("Gemini socket is not ready")
-    this.socket.send(
+    this.sendAudioToSocket(this.socket, base64Pcm)
+  }
+
+  sendActivity(audioChunks: readonly string[]): void {
+    const socket = this.socket
+    if (this.mode !== "manual") throw new Error("Manual activity requires Manual mode")
+    if (audioChunks.length === 0) throw new Error("Manual recording is empty")
+    if (!this.ready || this.stopping || !socket || socket.readyState !== WS_OPEN) {
+      throw new Error("Gemini socket is not ready")
+    }
+    let started = false
+    let ended = false
+    try {
+      socket.send(JSON.stringify({realtimeInput: {activityStart: {}}}))
+      started = true
+      for (const chunk of audioChunks) this.sendAudioToSocket(socket, chunk)
+      socket.send(JSON.stringify({realtimeInput: {activityEnd: {}}}))
+      ended = true
+    } catch {
+      if (started && !ended && socket.readyState === WS_OPEN) {
+        try {
+          socket.send(JSON.stringify({realtimeInput: {activityEnd: {}}}))
+        } catch {
+          /* provider state is already fatal */
+        }
+      }
+      const error = new Error("Gemini manual activity send failed")
+      this.reportError(error)
+      throw error
+    }
+  }
+
+  private sendAudioToSocket(socket: SocketLike, base64Pcm: string): void {
+    socket.send(
       JSON.stringify({
         realtimeInput: {audio: {data: base64Pcm, mimeType: "audio/pcm;rate=16000"}},
       }),
@@ -214,14 +250,14 @@ export class GeminiLiveController {
     }
   }
 
-  private async requestStart(): Promise<StartResponse> {
+  private async requestStart(mode: SessionMode): Promise<StartResponse> {
     let response: Response
     for (let attempt = 0; ; attempt += 1) {
       response = await this.request("/integration/mentra/session/start", {
         user_id: this.config.userId,
         soul_id: this.config.soulId,
         device_session_id: this.config.deviceSessionId,
-        mode: "continuous",
+        mode,
       })
       if (response.ok) break
       const errorBody = response.status === 409 ? await response.clone().json().catch(() => null) : null
