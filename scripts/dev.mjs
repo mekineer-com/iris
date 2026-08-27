@@ -9,18 +9,18 @@ import {loadEnvLocal} from "./load-env-local.mjs"
 const root = join(dirname(fileURLToPath(import.meta.url)), "..")
 loadEnvLocal(root)
 
-const miniapp = spawn("bun", ["x", "mentra-miniapp", "dev"], {
+const miniapp = spawn(join(root, "node_modules", ".bin", "mentra-miniapp"), ["dev"], {
   cwd: root,
   env: process.env,
   stdio: "inherit",
 })
 
-function shutdown(signal) {
-  if (miniapp && !miniapp.killed) miniapp.kill(signal)
+function shutdown() {
+  miniapp.kill("SIGTERM")
 }
 
-process.on("SIGINT", () => shutdown("SIGINT"))
-process.on("SIGTERM", () => shutdown("SIGTERM"))
+process.on("SIGINT", shutdown)
+process.on("SIGTERM", shutdown)
 
 miniapp.on("exit", (code) => {
   process.exit(code ?? 0)

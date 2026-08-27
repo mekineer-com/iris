@@ -25,7 +25,7 @@ export function findReleaseUri(output) {
 export function run() {
   loadEnvLocal(root)
   const host = process.env.MENTRA_RELEASE_HOST ?? "10.77.0.1"
-  const miniapp = spawn("bun", ["x", "mentra-miniapp", "release"], {
+  const miniapp = spawn(join(root, "node_modules", ".bin", "mentra-miniapp"), ["release"], {
     cwd: root,
     env: process.env,
     stdio: ["inherit", "pipe", "inherit"],
@@ -49,12 +49,12 @@ export function run() {
     console.log(`\nPrivate WireGuard release:\n${uri}\nQR image: ${qrPath}\n`)
   })
 
-  function shutdown(signal) {
-    if (!miniapp.killed) miniapp.kill(signal)
+  function shutdown() {
+    miniapp.kill("SIGTERM")
   }
 
-  process.on("SIGINT", () => shutdown("SIGINT"))
-  process.on("SIGTERM", () => shutdown("SIGTERM"))
+  process.on("SIGINT", shutdown)
+  process.on("SIGTERM", shutdown)
   miniapp.on("exit", (code) => process.exit(code ?? 0))
   miniapp.on("error", (error) => {
     console.error(`Could not start Mentra release server: ${error.message}`)
