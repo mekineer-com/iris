@@ -1,21 +1,43 @@
-import {useState} from "react"
+import {useRef, useState} from "react"
 import {useRpc} from "@mentra/miniapp/ui"
 
 import type {Channels} from "../../shared/channels"
 import type {ConnectionState, ManualAction, ManualPhase, SessionMode} from "../../shared/types"
 import {useChannel} from "../hooks/useChannel"
 
-function statusText(connection: ConnectionState, mode: SessionMode, manualPhase: ManualPhase): string {
-  if (connection === "starting") return "Starting..."
-  if (connection === "stopping") return "Stopping..."
-  if (connection === "error") return "Error"
-  if (connection === "speaking") return "Speaking"
-  if (connection === "idle") return "Idle"
+function unreachable(value: never): never {
+  throw new Error(`Unhandled session state: ${value}`)
+}
+
+export function statusText(connection: ConnectionState, mode: SessionMode, manualPhase: ManualPhase): string {
+  switch (connection) {
+    case "starting": return "Starting..."
+    case "stopping": return "Stopping..."
+    case "error": return "Error"
+    case "speaking": return "Speaking"
+    case "idle": return "Idle"
+    case "listening": break
+    default: return unreachable(connection)
+  }
   if (mode === "continuous") return "Listening"
-  if (manualPhase === "recording") return "Recording..."
-  if (manualPhase === "review") return "Review recording"
-  if (manualPhase === "submitted") return "Waiting for Siri..."
-  return "Ready"
+  if (mode !== "manual") return unreachable(mode)
+  switch (manualPhase) {
+    case "idle": return "Ready"
+    case "recording": return "Recording..."
+    case "review": return "Review recording"
+    case "submitted": return "Waiting for Siri..."
+    default: return unreachable(manualPhase)
+  }
+}
+
+export function visibleConnection(
+  connection: ConnectionState,
+  startPending: boolean,
+  stopPending: boolean,
+): ConnectionState {
+  if (stopPending) return "stopping"
+  if (startPending && (connection === "idle" || connection === "error")) return "starting"
+  return connection
 }
 
 export default function SessionPage() {
@@ -29,34 +51,35 @@ export default function SessionPage() {
   const [modePending, setModePending] = useState(false)
   const [manualPending, setManualPending] = useState(false)
   const [rpcError, setRpcError] = useState<string | null>(null)
+  const startOwner = useRef(0)
 
   const connection = snapshot?.connection ?? "idle"
   const mode = snapshot?.mode ?? "continuous"
   const manualPhase = snapshot?.manualPhase ?? "idle"
-  const controllerActive = connection === "starting" || connection === "listening" || connection === "speaking"
-  const visibleConnection = stopPending && controllerActive
-    ? "stopping"
-    : startPending && (connection === "idle" || connection === "error")
-      ? "starting"
-      : connection
-  const starting = visibleConnection === "starting"
-  const stopping = visibleConnection === "stopping"
-  const active = starting || visibleConnection === "listening" || visibleConnection === "speaking"
+  const visible = visibleConnection(connection, startPending, stopPending)
+  const starting = visible === "starting"
+  const stopping = visible === "stopping"
+  const active = starting || visible === "listening" || visible === "speaking"
   const modeDisabled = active || stopping || startPending || stopPending || modePending
 
   const onStart = async () => {
+    const owner = ++startOwner.current
     setRpcError(null)
     setStartPending(true)
     try {
       await startRpc({mode})
     } catch (error) {
-      setRpcError(error instanceof Error ? error.message : String(error))
+      if (owner === startOwner.current) {
+        setRpcError(error instanceof Error ? error.message : String(error))
+      }
     } finally {
-      setStartPending(false)
+      if (owner === startOwner.current) setStartPending(false)
     }
   }
 
   const onStop = async () => {
+    startOwner.current += 1
+    setStartPending(false)
     setRpcError(null)
     setStopPending(true)
     try {
@@ -98,13 +121,13 @@ export default function SessionPage() {
       ? "Cancel"
       : active
         ? "Stop"
-        : visibleConnection === "error"
+        : visible === "error"
           ? "Retry"
           : "Start"
   const sittingDisabled = stopping || stopPending || modePending || (!active && startPending)
   const showSpinner = starting || stopping
-  const manualDisabled = manualPending || visibleConnection === "speaking"
-  const voiceReady = visibleConnection === "listening" || visibleConnection === "speaking"
+  const manualDisabled = manualPending || visible === "speaking"
+  const voiceReady = visible === "listening" || visible === "speaking"
 
   return (
     <main>
@@ -114,7 +137,7 @@ export default function SessionPage() {
       </header>
       <p className="status" role="status" aria-live="polite">
         {showSpinner ? <span className="spinner" aria-hidden="true" /> : null}
-        {statusText(visibleConnection, mode, manualPhase)}
+        {statusText(visible, mode, manualPhase)}
       </p>
       <label className="mode-control">
         <span>Speech mode</span>

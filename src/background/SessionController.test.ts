@@ -552,6 +552,26 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "idle", lastError: null})
   })
 
+  test("first Siri audio cancels the Manual no-response watchdog", async () => {
+    const harness = setup({responseWatchdogMs: 10})
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+    harness.session.handlers["openalma:manual-action"]({action: "send"})
+    harness.live.audio()
+
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(lastSnapshot(harness.session)).toMatchObject({
+      connection: "speaking",
+      manualPhase: "submitted",
+      lastError: null,
+    })
+    harness.live.turnComplete()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", manualPhase: "idle"})
+  })
+
   test("Manual recording uses a 120-second PCM byte bound and clears its warning on Send", async () => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "manual"})
@@ -564,6 +584,11 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)).toMatchObject({manualPhase: "recording", lastError: null})
 
     harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    expect(lastSnapshot(harness.session)).toMatchObject({
+      manualPhase: "review",
+      lastError: "Manual recording reached 120-second limit",
+    })
+    harness.live.persistence(null)
     expect(lastSnapshot(harness.session)).toMatchObject({
       manualPhase: "review",
       lastError: "Manual recording reached 120-second limit",

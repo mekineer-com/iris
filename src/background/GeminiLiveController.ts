@@ -177,7 +177,11 @@ export class GeminiLiveController {
       socket.send(JSON.stringify({realtimeInput: {activityStart: {}}}))
       started = true
       this.turnActive = true
-      for (const chunk of audioChunks) this.sendAudioToSocket(socket, chunk)
+      for (const chunk of audioChunks) {
+        if (socket.readyState !== WS_OPEN) throw new Error("socket closed during Manual activity")
+        this.sendAudioToSocket(socket, chunk)
+      }
+      if (socket.readyState !== WS_OPEN) throw new Error("socket closed during Manual activity")
       socket.send(JSON.stringify({realtimeInput: {activityEnd: {}}}))
       ended = true
     } catch {

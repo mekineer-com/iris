@@ -52,8 +52,6 @@ export class SessionController {
   private manualAudio: string[] = []
   private manualAudioBytes = 0
   private manualResponseTimeout: ReturnType<typeof setTimeout> | null = null
-  private manualResponsePromise: Promise<void> | null = null
-  private manualResponseResolve: (() => void) | null = null
   private interruptPromise: Promise<void> | null = null
   private lastError: string | null = null
   private startInFlight = false
@@ -233,6 +231,7 @@ export class SessionController {
           },
           onPersistenceError: (message) => {
             if (this.teardownKind === "fail") return
+            if (message === null && this.lastError === MANUAL_LIMIT_MESSAGE) return
             this.lastError = message
             this.pushSnapshot()
           },
@@ -424,7 +423,7 @@ export class SessionController {
   }
 
   private handlePcmFrame(chunk: AudioChunkData): void {
-    if (!ACTIVE.has(this.connection) && this.connection !== "starting") return
+    if (!ACTIVE.has(this.connection)) return
     if (this.connection === "speaking") return
     try {
       const normalized = normalizePcm16Audio(chunk)
@@ -459,6 +458,7 @@ export class SessionController {
       return
     }
     if (!reflection && this.connection !== "listening" && this.connection !== "speaking") return
+    if (this.manualPhase === "submitted") this.clearManualResponseWatchdog()
     if (!reflection && this.connection !== "speaking") {
       this.connection = "speaking"
       trace("session.speaking")
@@ -587,22 +587,17 @@ export class SessionController {
     this.clearManualAudio()
     this.manualPhase = "idle"
     this.clearManualResponseWatchdog()
-    this.resolveManualResponse()
   }
 
   private completeManualResponse(): boolean {
     if (this.manualPhase !== "submitted") return false
     this.manualPhase = "idle"
     this.clearManualResponseWatchdog()
-    this.resolveManualResponse()
     return true
   }
 
   private beginManualResponse(): void {
     this.clearManualResponseWatchdog()
-    this.manualResponsePromise = new Promise<void>((resolve) => {
-      this.manualResponseResolve = resolve
-    })
     this.manualResponseTimeout = setTimeout(() => {
       if (this.manualPhase === "submitted") {
         void this.fail(new Error("Gemini did not answer the Manual recording"))
@@ -614,12 +609,6 @@ export class SessionController {
     if (!this.manualResponseTimeout) return
     clearTimeout(this.manualResponseTimeout)
     this.manualResponseTimeout = null
-  }
-
-  private resolveManualResponse(): void {
-    this.manualResponseResolve?.()
-    this.manualResponseResolve = null
-    this.manualResponsePromise = null
   }
 
   private async stopLiveController(

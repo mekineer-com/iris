@@ -15,6 +15,7 @@ class FakeSocket {
   readyState = 0
   sent: string[] = []
   failAtSendCount: number | null = null
+  closeAtSendCount: number | null = null
   private listeners: Record<string, Array<(event: any) => void>> = {}
 
   addEventListener(type: string, listener: (event: any) => void): void {
@@ -23,6 +24,8 @@ class FakeSocket {
 
   send(data: string): void {
     if (this.failAtSendCount === this.sent.length) throw new Error("socket send failed")
+    if (this.closeAtSendCount === this.sent.length) this.readyState = 3
+    if (this.readyState !== 1) return
     this.sent.push(data)
   }
 
@@ -213,6 +216,21 @@ describe("GeminiLiveController", () => {
       "Gemini manual activity send failed",
     )
     expect(h.errors).toEqual(["Gemini manual activity send failed"])
+    await h.controller.stop()
+  })
+
+  test("fails when the socket silently closes during a Manual activity", async () => {
+    const h = harness()
+    await start(h, "manual")
+    h.sockets[0].closeAtSendCount = 3
+
+    expect(() => h.controller.sendActivity(["AAAA", "BBBB"])).toThrow(
+      "Gemini manual activity send failed",
+    )
+    expect(h.errors).toEqual(["Gemini manual activity send failed"])
+    expect(h.sockets[0].sent.map((value) => JSON.parse(value)).at(-1)).toEqual({
+      realtimeInput: {audio: {data: "AAAA", mimeType: "audio/pcm;rate=16000"}},
+    })
     await h.controller.stop()
   })
 
