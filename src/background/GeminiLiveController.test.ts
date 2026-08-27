@@ -1037,6 +1037,37 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("keeps one reconnect operation alive while brief network loss blocks setup", async () => {
+    const h = harness({setupTimeoutMs: 20})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].close()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].error()
+    await waitFor(() => h.sockets.length === 3)
+    h.sockets[2].open()
+    h.sockets[2].message({setupComplete: {}})
+    await waitFor(() => h.reconnecting.length === 2)
+
+    expect(h.reconnecting).toEqual([true, false])
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("Stop during network recovery stays stopped without a late setup error", async () => {
+    const h = harness({setupTimeoutMs: 20})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].close()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].error()
+    await h.controller.stop()
+    await waitFor(() => h.reconnecting.at(-1) === false)
+
+    expect(h.errors).toEqual([])
+    expect(h.sockets).toHaveLength(2)
+  })
+
   test("resumable false clears the latest private handle", async () => {
     const h = harness()
     await start(h)

@@ -79,6 +79,7 @@ const WS_OPEN = 1
 const REQUEST_TIMEOUT_MS = 10_000
 const RECALL_TIMEOUT_MS = 30_000
 const REFLECTION_TIMEOUT_MS = 8_000
+const RECONNECT_SETUP_ATTEMPTS = 6
 const JOURNAL_KEY = "openalma:gemini-session-v1"
 const RESUMPTION_MAX_AGE_MS = 2 * 60 * 60 * 1000
 export const SITTING_REFLECTION_PROMPT =
@@ -1009,7 +1010,7 @@ export class GeminiLiveController {
       this.reconnectAttempted = true
       this.callbacks.onReconnecting(true)
       try {
-        const replacement = await this.connectSocket(this.resumptionHandle)
+        const replacement = await this.connectAfterNetworkLoss()
         if (replacement.readyState !== WS_OPEN) {
           throw new Error("Gemini replacement socket closed after setup")
         }
@@ -1019,12 +1020,30 @@ export class GeminiLiveController {
       } catch (error) {
         this.callbacks.onReconnecting(false)
         this.reconnecting = false
-        this.reportError(error instanceof Error ? error : new Error(String(error)))
+        if (!this.stopping) this.reportError(error instanceof Error ? error : new Error(String(error)))
         return
       }
     }
     this.reconnecting = false
     this.reportError(new Error("Gemini connection closed"))
+  }
+
+  private async connectAfterNetworkLoss(): Promise<SocketLike> {
+    let lastError = new Error("Gemini reconnect failed")
+    for (let attempt = 0; attempt < RECONNECT_SETUP_ATTEMPTS && !this.stopping; attempt += 1) {
+      try {
+        return await this.connectSocket(this.resumptionHandle)
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error))
+        this.socket?.close()
+        if (attempt + 1 < RECONNECT_SETUP_ATTEMPTS && !this.stopping) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, Math.min(1_000, Math.max(1, Math.floor(this.setupTimeoutMs / 10)))),
+          )
+        }
+      }
+    }
+    throw lastError
   }
 
   private async heartbeat(): Promise<void> {
