@@ -14,16 +14,18 @@ const miniapp = spawn(join(root, "node_modules", ".bin", "mentra-miniapp"), ["de
   env: process.env,
   stdio: "inherit",
 })
+let shutdownRequested = false
 
 function shutdown() {
+  shutdownRequested = true
   miniapp.kill("SIGTERM")
 }
 
 process.on("SIGINT", shutdown)
 process.on("SIGTERM", shutdown)
 
-miniapp.on("exit", (code) => {
-  process.exit(code ?? 0)
+miniapp.on("exit", (code, signal) => {
+  process.exit(code ?? (shutdownRequested ? 0 : signal ? 1 : 0))
 })
 
 miniapp.on("error", (error) => {
