@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "dev": "node ./scripts/dev.mjs",
+    "release:private": "node ./scripts/release-private.mjs",
     "build": "bun run build.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
@@ -16,6 +17,7 @@
     "@mentra/miniapp-cli": "0.1.0-dev.1",
     "@types/react": "^19.1.6",
     "@types/react-dom": "^19.1.6",
+    "qrcode": "1.5.4",
     "typescript": "^5.8.0"
   }
 }

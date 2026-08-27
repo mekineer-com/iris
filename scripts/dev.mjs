@@ -9,7 +9,7 @@ import {loadEnvLocal} from "./load-env-local.mjs"
 const root = join(dirname(fileURLToPath(import.meta.url)), "..")
 loadEnvLocal(root)
 
-const miniapp = spawn("bunx", ["mentra-miniapp", "dev"], {
+const miniapp = spawn("bun", ["x", "mentra-miniapp", "dev"], {
   cwd: root,
   env: process.env,
   stdio: "inherit",
@@ -24,4 +24,9 @@ process.on("SIGTERM", () => shutdown("SIGTERM"))
 
 miniapp.on("exit", (code) => {
   process.exit(code ?? 0)
+})
+
+miniapp.on("error", (error) => {
+  console.error(`Could not start Mentra dev server: ${error.message}`)
+  process.exit(1)
 })
