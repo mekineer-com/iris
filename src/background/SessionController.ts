@@ -232,10 +232,9 @@ export class SessionController {
             this.interruptPromise = interrupting
           },
           onPersistenceError: (message) => {
-            if (message || this.lastError === "Transcript sync failed; retrying") {
-              this.lastError = message
-              this.pushSnapshot()
-            }
+            if (this.teardownKind === "fail") return
+            this.lastError = message
+            this.pushSnapshot()
           },
           onError: (error) => void this.fail(error),
         })
@@ -325,18 +324,6 @@ export class SessionController {
       }
       await this.teardownPromise
       return
-    }
-    if (_reason === "user" && this.manualPhase === "submitted" && this.manualResponsePromise) {
-      this.connection = "stopping"
-      this.teardownKind = "stop"
-      this.clearFirstPcmTimeout()
-      this.stopMic()
-      this.pushSnapshot()
-      await this.manualResponsePromise
-      if (this.teardownPromise) {
-        await this.teardownPromise
-        return
-      }
     }
     this.teardownKind = "stop"
     this.teardownPromise = this.runTeardown().finally(() => {
@@ -529,18 +516,18 @@ export class SessionController {
     await Promise.all(this.pendingSpeechWrites)
     if (this.interruptPromise) await this.interruptPromise
     if (epoch !== this.speakerEpoch) return
-    const writer = this.speakerWriter ?? (await this.speakerOpenPromise)
-    if (!writer || epoch !== this.speakerEpoch) {
-      const manualFinished = finalResponse && this.completeManualResponse()
-      if (this.connection === "speaking") {
-        this.connection = "listening"
-        this.pushSnapshot()
-      } else if (manualFinished) {
-        this.pushSnapshot()
-      }
-      return
-    }
     try {
+      const writer = this.speakerWriter ?? (await this.speakerOpenPromise)
+      if (!writer || epoch !== this.speakerEpoch) {
+        const manualFinished = finalResponse && this.completeManualResponse()
+        if (this.connection === "speaking") {
+          this.connection = "listening"
+          this.pushSnapshot()
+        } else if (manualFinished) {
+          this.pushSnapshot()
+        }
+        return
+      }
       await writer.close()
       if (this.speakerWriter === writer) this.speakerWriter = null
       if (epoch === this.speakerEpoch) {
@@ -584,6 +571,7 @@ export class SessionController {
       if (!this.liveController) throw new Error("Gemini controller is not available")
       this.liveController.sendActivity(this.manualAudio)
       this.clearManualAudio()
+      this.lastError = null
       this.manualPhase = "submitted"
       this.beginManualResponse()
     }

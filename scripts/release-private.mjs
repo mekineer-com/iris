@@ -33,7 +33,7 @@ export function run() {
   let output = ""
   let emitted = false
 
-  miniapp.stdout.on("data", async (chunk) => {
+  miniapp.stdout.on("data", (chunk) => {
     process.stdout.write(chunk)
     if (emitted) return
     output = (output + chunk).slice(-16_384)
@@ -45,8 +45,9 @@ export function run() {
     const release = new URL(uri)
     const version = release.searchParams.get("version")
     const qrPath = join(root, "build", `openalma-${version}-wireguard-qr.png`)
-    await QRCode.toFile(qrPath, uri, {width: 1024, margin: 4, errorCorrectionLevel: "M"})
-    console.log(`\nPrivate WireGuard release:\n${uri}\nQR image: ${qrPath}\n`)
+    void QRCode.toFile(qrPath, uri, {width: 1024, margin: 4, errorCorrectionLevel: "M"})
+      .then(() => console.log(`\nPrivate WireGuard release:\n${uri}\nQR image: ${qrPath}\n`))
+      .catch((error) => console.error(`Could not write private release QR: ${error.message}`))
   })
 
   function shutdown() {

@@ -163,6 +163,7 @@ export default function SessionPage() {
                 </button>
               </>
             ) : null}
+            {manualPhase === "submitted" ? <button type="button" disabled>Send</button> : null}
           </div>
         ) : null}
       </section>

@@ -452,6 +452,7 @@ describe("SessionController", () => {
       lastError: null,
     })
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    harness.live.persistenceOnStop = "Transcript sync failed; last turns were not saved"
     harness.live.fail("provider failed")
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(lastSnapshot(harness.session)?.connection).toBe("error")
@@ -461,10 +462,10 @@ describe("SessionController", () => {
   test("temporary transcript failure is visible without stopping voice", async () => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
-    harness.live.persistence("Transcript sync failed; retrying")
+    harness.live.persistence("Memory recall unavailable; voice is continuing")
     expect(lastSnapshot(harness.session)).toMatchObject({
       connection: "listening",
-      lastError: "Transcript sync failed; retrying",
+      lastError: "Memory recall unavailable; voice is continuing",
     })
     harness.live.persistence(null)
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", lastError: null})
@@ -532,28 +533,43 @@ describe("SessionController", () => {
     expect(harness.live.activities).toEqual([])
   })
 
-  test("Stop after Manual Send waits for the submitted response", async () => {
-    const harness = setup()
+  test("Stop after Manual Send cancels the submitted response watchdog", async () => {
+    const harness = setup({responseWatchdogMs: 10})
     await harness.session.handlers["openalma:start"]({mode: "manual"})
     harness.session.handlers["openalma:manual-action"]({action: "talk"})
     harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
     harness.session.handlers["openalma:manual-action"]({action: "done"})
     harness.session.handlers["openalma:manual-action"]({action: "send"})
 
-    let stopped = false
-    const stop = Promise.resolve(harness.session.handlers["openalma:stop"]({})).then(() => {
-      stopped = true
-    })
-    await Promise.resolve()
-    expect(stopped).toBe(false)
-    expect(harness.live.stops).toBe(0)
-    expect(lastSnapshot(harness.session)?.connection).toBe("stopping")
-    expect(harness.session.micHandler).toBeNull()
-
-    harness.live.turnComplete()
-    await stop
+    await harness.session.handlers["openalma:stop"]({})
     expect(harness.live.stops).toBe(1)
-    expect(lastSnapshot(harness.session)?.connection).toBe("idle")
+    expect(lastSnapshot(harness.session)).toMatchObject({
+      connection: "idle",
+      manualPhase: "idle",
+      lastError: null,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(lastSnapshot(harness.session)).toMatchObject({connection: "idle", lastError: null})
+  })
+
+  test("Manual recording uses a 120-second PCM byte bound and clears its warning on Send", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    harness.session.micHandler?.({
+      data: Buffer.alloc(16000 * 2 * 120).toString("base64"),
+      format: "pcm_s16le",
+      sampleRate: 16000,
+    })
+    expect(lastSnapshot(harness.session)).toMatchObject({manualPhase: "recording", lastError: null})
+
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    expect(lastSnapshot(harness.session)).toMatchObject({
+      manualPhase: "review",
+      lastError: "Manual recording reached 120-second limit",
+    })
+    harness.session.handlers["openalma:manual-action"]({action: "send"})
+    expect(lastSnapshot(harness.session)).toMatchObject({manualPhase: "submitted", lastError: null})
   })
 
   test("tool boundary and interrupted abort cannot release Manual early", async () => {
@@ -637,7 +653,7 @@ describe("SessionController", () => {
     })
   })
 
-  test("Manual timeout cannot deadlock on a hung speaker close", async () => {
+  test("Stop cancels Manual timeout before a pending speaker close", async () => {
     const harness = setup({responseWatchdogMs: 10})
     await harness.session.handlers["openalma:start"]({mode: "manual"})
     harness.session.handlers["openalma:manual-action"]({action: "talk"})
@@ -655,8 +671,8 @@ describe("SessionController", () => {
       new Promise((_, reject) => setTimeout(() => reject(new Error("Stop deadlocked")), 100)),
     ])
     expect(lastSnapshot(harness.session)).toMatchObject({
-      connection: "error",
-      lastError: "Gemini did not answer the Manual recording",
+      connection: "idle",
+      lastError: null,
     })
 
     harness.session.closeGate = null
