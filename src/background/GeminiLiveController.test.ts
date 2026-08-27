@@ -55,11 +55,32 @@ class FakeSocket {
   }
 }
 
+class FakeStorage {
+  values = new Map<string, string>()
+  setCalls = 0
+  setGate: Promise<void> | null = null
+
+  async get(key: string): Promise<string | null> {
+    return this.values.get(key) ?? null
+  }
+
+  async set(key: string, value: string): Promise<void> {
+    this.setCalls += 1
+    if (this.setGate) await this.setGate
+    this.values.set(key, value)
+  }
+
+  async delete(key: string): Promise<void> {
+    this.values.delete(key)
+  }
+}
+
 function harness(
   options: {
     heartbeatMs?: number
     setupTimeoutMs?: number
     heartbeatStatus?: number
+    heartbeatThrows?: boolean
     startGate?: Promise<void>
     startStatus?: number
     startBody?: unknown
@@ -69,6 +90,8 @@ function harness(
     recallGate?: Promise<void>
     recallStatus?: number
     recallBody?: unknown
+    storage?: FakeStorage
+    warningSeconds?: number
   } = {},
 ) {
   const sockets: FakeSocket[] = []
@@ -77,6 +100,9 @@ function harness(
   const events: string[] = []
   const errors: string[] = []
   const persistenceErrors: Array<string | null> = []
+  const reconnecting: boolean[] = []
+  const usage: number[] = []
+  let durationWarnings = 0
   const appendStatuses = [...(options.appendStatuses ?? [])]
   const startResults = [...(options.startResults ?? [])]
   const fetchFn = async (input: string | URL | Request, init?: RequestInit) => {
@@ -98,11 +124,15 @@ function harness(
             output_audio_rate_hz: 24000,
           },
           lease_seconds: options.leaseSeconds ?? 90,
+          session_warning_seconds: options.warningSeconds ?? 0,
         },
         {status: result?.status ?? options.startStatus ?? 200},
       )
     }
-    if (url.endsWith("/heartbeat")) return Response.json({ok: true}, {status: options.heartbeatStatus ?? 200})
+    if (url.endsWith("/heartbeat")) {
+      if (options.heartbeatThrows) throw new Error("fictional network miss")
+      return Response.json({ok: true}, {status: options.heartbeatStatus ?? 200})
+    }
     if (url.endsWith("/recall")) {
       if (options.recallGate) await options.recallGate
       return Response.json(
@@ -124,6 +154,11 @@ function harness(
       onAudio: (data) => audio.push(data),
       onTurnComplete: (finalResponse) => events.push(finalResponse ? "turnComplete" : "toolBoundary"),
       onInterrupted: () => events.push("interrupted"),
+      onReconnecting: (value) => reconnecting.push(value),
+      onUsage: (totalTokens) => usage.push(totalTokens),
+      onDurationWarning: () => {
+        durationWarnings += 1
+      },
       onPersistenceError: (message) => persistenceErrors.push(message),
       onError: (error) => errors.push(error.message),
     },
@@ -136,9 +171,23 @@ function harness(
       },
       heartbeatMs: options.heartbeatMs,
       setupTimeoutMs: options.setupTimeoutMs,
+      storage: options.storage,
     },
   )
-  return {controller, sockets, requests, audio, events, errors, persistenceErrors}
+  return {
+    controller,
+    sockets,
+    requests,
+    audio,
+    events,
+    errors,
+    persistenceErrors,
+    reconnecting,
+    usage,
+    get durationWarnings() {
+      return durationWarnings
+    },
+  }
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -251,6 +300,7 @@ describe("GeminiLiveController", () => {
               output_audio_rate_hz: 24000,
             },
             lease_seconds: 90,
+            session_warning_seconds: 0,
           },
         },
       ],
@@ -657,6 +707,117 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("writes the existing outbox journal before transcript append", async () => {
+    let release!: () => void
+    const storage = new FakeStorage()
+    storage.setGate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const h = harness({storage})
+    await start(h)
+    completeTurn(h)
+    await waitFor(() => storage.setCalls === 1)
+    expect(h.requests.some((request) => request.url.endsWith("/transcripts/append"))).toBe(false)
+    release()
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+    await h.controller.stop()
+  })
+
+  test("hydrates and rebases only the unacknowledged transcript suffix", async () => {
+    const storage = new FakeStorage()
+    storage.values.set(
+      "openalma:gemini-session-v1",
+      JSON.stringify({
+        version: 1,
+        scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+        resumption: {handle: "private-handle", updatedAt: Date.now()},
+        pendingTranscripts: [
+          {
+            event_id: "old-sitting:40",
+            sequence: 40,
+            event_kind: "transcript",
+            role: "user",
+            content: "already accepted",
+            status: "complete",
+          },
+          {
+            event_id: "old-sitting:41",
+            sequence: 41,
+            event_kind: "transcript",
+            role: "assistant",
+            content: "unacknowledged suffix",
+            status: "complete",
+          },
+        ],
+      }),
+    )
+    const h = harness({
+      storage,
+      startBody: {
+        session_id: "replacement-sitting",
+        next_transcript_sequence: 41,
+        ephemeral_token: "ephemeral/test",
+        websocket: {
+          api_version: "v1alpha",
+          method: "BidiGenerateContentConstrained",
+          input_audio_rate_hz: 16000,
+          output_audio_rate_hz: 24000,
+        },
+        lease_seconds: 90,
+        session_warning_seconds: 0,
+      },
+    })
+    const starting = h.controller.start()
+    await waitFor(() => h.sockets.length === 1)
+    h.sockets[0].open()
+    expect(JSON.parse(h.sockets[0].sent[0])).toEqual({
+      setup: {sessionResumption: {handle: "private-handle"}},
+    })
+    h.sockets[0].message({setupComplete: {}})
+    await starting
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+    const append = h.requests.find((request) => request.url.endsWith("/transcripts/append"))!
+    expect(append.body.events).toEqual([
+      expect.objectContaining({
+        event_id: "replacement-sitting:41",
+        sequence: 41,
+        content: "unacknowledged suffix",
+      }),
+    ])
+    await waitFor(() => {
+      const raw = storage.values.get("openalma:gemini-session-v1")
+      return Boolean(raw && JSON.parse(raw).pendingTranscripts.length === 0)
+    })
+    await h.controller.stop()
+    expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
+  })
+
+  test("drops a journal event that mcp would reject", async () => {
+    const storage = new FakeStorage()
+    storage.values.set(
+      "openalma:gemini-session-v1",
+      JSON.stringify({
+        version: 1,
+        scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+        resumption: {handle: "must-not-resume", updatedAt: Date.now()},
+        pendingTranscripts: [
+          {
+            event_id: "old:41",
+            sequence: 41,
+            event_kind: "transcript",
+            role: "user",
+            content: "blank status is invalid",
+          },
+        ],
+      }),
+    )
+    const h = harness({storage})
+    await start(h)
+    expect(JSON.parse(h.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
+    expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
+    await h.controller.stop()
+  })
+
   test("drains a retained queue in server-sized batches", async () => {
     const h = harness({appendStatuses: [503, 200, 200]})
     await start(h)
@@ -818,7 +979,7 @@ describe("GeminiLiveController", () => {
     expect(h.sockets).toHaveLength(1)
   })
 
-  test("resumes once with the latest private handle", async () => {
+  test("resumes with the latest private handle and resets only after a completed turn", async () => {
     const h = harness()
     await start(h)
     h.sockets[0].message({serverContent: {inputTranscription: {text: "before drop"}}})
@@ -826,12 +987,15 @@ describe("GeminiLiveController", () => {
     h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
     h.sockets[0].error()
     await waitFor(() => h.sockets.length === 2)
+    expect(h.events).toContain("interrupted")
     expect(() => h.controller.sendAudio("AAAA")).not.toThrow()
     h.sockets[1].open()
     expect(JSON.parse(h.sockets[1].sent[0])).toEqual({
       setup: {sessionResumption: {handle: "private-handle"}},
     })
     h.sockets[1].message({setupComplete: {}})
+    await waitFor(() => h.reconnecting.length === 2)
+    expect(h.reconnecting).toEqual([true, false])
     completeTurn(h, "after resume", "fresh answer")
     await waitFor(
       () =>
@@ -853,10 +1017,101 @@ describe("GeminiLiveController", () => {
     h.controller.sendAudio("AAAA")
     expect(h.sockets[1].sent).toHaveLength(2)
     h.sockets[1].close()
+    await waitFor(() => h.sockets.length === 3)
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("does not loop when the replacement closes before a completed turn", async () => {
+    const h = harness()
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].close()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    h.sockets[1].message({setupComplete: {}})
+    h.sockets[1].close()
     await waitFor(() => h.errors.length === 1)
     expect(h.sockets).toHaveLength(2)
-    expect(h.errors).toEqual(["Gemini connection closed"])
+    expect(h.errors).toEqual(["Gemini replacement socket closed after setup"])
     await h.controller.stop()
+  })
+
+  test("resumable false clears the latest private handle", async () => {
+    const h = harness()
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: false}})
+    h.sockets[0].close()
+    await waitFor(() => h.errors.length === 1)
+    expect(h.sockets).toHaveLength(1)
+    await h.controller.stop()
+  })
+
+  test("GoAway rotates immediately while idle and fences the old socket", async () => {
+    const h = harness()
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].message({goAway: {timeLeft: "50s"}})
+    await waitFor(() => h.sockets.length === 2)
+    expect(h.sockets[0].readyState).toBe(3)
+    expect(h.reconnecting).toEqual([true])
+    h.sockets[1].open()
+    expect(JSON.parse(h.sockets[1].sent[0])).toEqual({
+      setup: {sessionResumption: {handle: "private-handle"}},
+    })
+    h.sockets[1].message({setupComplete: {}})
+    await waitFor(() => h.reconnecting.length === 2)
+    expect(h.reconnecting).toEqual([true, false])
+    h.sockets[0].message({setupComplete: {}})
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("GoAway waits for an active turn boundary", async () => {
+    const h = harness()
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "active turn"}}})
+    h.sockets[0].message({goAway: {timeLeft: "50s"}})
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(h.sockets).toHaveLength(1)
+    h.sockets[0].message({
+      serverContent: {outputTranscription: {text: "finished"}, turnComplete: true},
+    })
+    await waitFor(() => h.sockets.length === 2)
+    await h.controller.stop()
+  })
+
+  test("GoAway deadline interrupts once and malformed duration fails loud", async () => {
+    const deadline = harness()
+    await start(deadline)
+    deadline.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    deadline.sockets[0].message({serverContent: {inputTranscription: {text: "partial"}}})
+    deadline.sockets[0].message({goAway: {timeLeft: "0.01s"}})
+    await waitFor(() => deadline.sockets.length === 2)
+    expect(deadline.events.filter((event) => event === "interrupted")).toHaveLength(1)
+    await deadline.controller.stop()
+
+    const malformed = harness()
+    await start(malformed)
+    malformed.sockets[0].message({goAway: {timeLeft: 50}})
+    expect(malformed.errors).toEqual(["Gemini returned malformed GoAway"])
+    await malformed.controller.stop()
+  })
+
+  test("Stop during GoAway setup prevents a late replacement", async () => {
+    const h = harness()
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].message({goAway: {timeLeft: "50s"}})
+    await waitFor(() => h.sockets.length === 2)
+    await h.controller.stop()
+    h.sockets[1].open()
+    h.sockets[1].message({setupComplete: {}})
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(h.sockets).toHaveLength(2)
+    expect(h.errors).toEqual([])
   })
 
   test("malformed known messages fail loud after setup", async () => {
@@ -916,6 +1171,58 @@ describe("GeminiLiveController", () => {
     await start(h)
     await waitFor(() => h.errors.length === 1)
     expect(h.errors).toEqual(["OpenAlma heartbeat failed (404)"])
+    await h.controller.stop()
+  })
+
+  test("publishes latest valid usage at turn boundaries and ignores malformed metadata", async () => {
+    const h = harness()
+    await start(h)
+    h.sockets[0].message({
+      usageMetadata: {totalTokenCount: 123},
+      serverContent: {
+        inputTranscription: {text: "hello"},
+        outputTranscription: {text: "hi"},
+        turnComplete: true,
+      },
+    })
+    h.sockets[0].message({
+      usageMetadata: {totalTokenCount: "private-bad"},
+      serverContent: {
+        inputTranscription: {text: "again"},
+        outputTranscription: {text: "still here"},
+        turnComplete: true,
+      },
+    })
+    expect(h.usage).toEqual([123, 123])
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("duration warning fires once without stopping the sitting", async () => {
+    const h = harness({warningSeconds: 0.01})
+    await start(h)
+    await waitFor(() => h.durationWarnings === 1)
+    expect(h.sockets[0].readyState).toBe(1)
+    expect(h.requests.filter((request) => request.url.endsWith("/end"))).toHaveLength(0)
+    await h.controller.stop()
+  })
+
+  test("temporary heartbeat failures do not tear down a healthy provider socket", async () => {
+    for (const options of [{heartbeatStatus: 503}, {heartbeatThrows: true}]) {
+      const h = harness({leaseSeconds: 0.03, ...options})
+      await start(h)
+      await waitFor(() => h.requests.some((request) => request.url.endsWith("/heartbeat")))
+      expect(h.errors).toEqual([])
+      expect(h.sockets[0].readyState).toBe(1)
+      await h.controller.stop()
+    }
+  })
+
+  test("persistent heartbeat failure becomes fatal when the known lease expires", async () => {
+    const h = harness({leaseSeconds: 0.03, heartbeatStatus: 503})
+    await start(h)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(h.errors).toEqual(["OpenAlma heartbeat lease expired"])
     await h.controller.stop()
   })
 })

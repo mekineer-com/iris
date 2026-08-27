@@ -13,12 +13,16 @@ type StartResponse = {
     output_audio_rate_hz: number
   }
   lease_seconds: number
+  session_warning_seconds: number
 }
 
 export type GeminiCallbacks = {
   onAudio: (base64Pcm: string) => void
   onTurnComplete: (finalResponse: boolean) => void
   onInterrupted: () => void
+  onReconnecting: (reconnecting: boolean) => void
+  onUsage: (totalTokens: number) => void
+  onDurationWarning: () => void
   onPersistenceError: (message: string | null) => void
   onError: (error: Error) => void
 }
@@ -30,6 +34,19 @@ type TranscriptEvent = {
   role: "user" | "assistant"
   content: string
   status?: "complete" | "interrupted"
+}
+
+type StorageLike = {
+  get(key: string): Promise<string | null>
+  set(key: string, value: string): Promise<void>
+  delete(key: string): Promise<void>
+}
+
+type SessionJournal = {
+  version: 1
+  scope: {userId: string; soulId: string; deviceSessionId: string}
+  resumption: {handle: string; updatedAt: number} | null
+  pendingTranscripts: TranscriptEvent[]
 }
 
 type PendingToolCall = {
@@ -55,12 +72,15 @@ export type GeminiLiveControllerOptions = {
   openSocket?: (url: string) => SocketLike
   setupTimeoutMs?: number
   heartbeatMs?: number
+  storage?: StorageLike
 }
 
 const WS_OPEN = 1
 const REQUEST_TIMEOUT_MS = 10_000
 const RECALL_TIMEOUT_MS = 30_000
 const REFLECTION_TIMEOUT_MS = 8_000
+const JOURNAL_KEY = "openalma:gemini-session-v1"
+const RESUMPTION_MAX_AGE_MS = 2 * 60 * 60 * 1000
 export const SITTING_REFLECTION_PROMPT =
   "Reflect briefly in first person on the emotional tone, subtext, or meaningful shift in this sitting that the literal transcript may not preserve. Do not recap the conversation. Respond with one or two natural sentences, or exactly NO_SUMMARY if nothing worthwhile would be added."
 
@@ -69,15 +89,21 @@ export class GeminiLiveController {
   private readonly openSocket: (url: string) => SocketLike
   private readonly setupTimeoutMs: number
   private readonly heartbeatMs?: number
+  private readonly storage?: StorageLike
   private socket: SocketLike | null = null
   private token = ""
   private sessionId = ""
   private nextTranscriptSequence = 1
   private resumptionHandle = ""
+  private resumptionUpdatedAt = 0
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  private durationWarningTimer: ReturnType<typeof setTimeout> | null = null
+  private goAwayTimer: ReturnType<typeof setTimeout> | null = null
+  private goAwayPending = false
   private stopping = false
   private ended = true
   private reconnectAttempted = false
+  private reconnecting = false
   private errorReported = false
   private inputTranscript = ""
   private outputTranscript = ""
@@ -87,6 +113,7 @@ export class GeminiLiveController {
   private pendingEvents: TranscriptEvent[] = []
   private appendTail: Promise<void> = Promise.resolve()
   private persistenceFatal = false
+  private journalUnavailable = false
   private reflecting = false
   private reflectionResolve: ((value: string | null) => void) | null = null
   private stopPromise: Promise<void> | null = null
@@ -97,6 +124,9 @@ export class GeminiLiveController {
   private audioFramesSent = 0
   private providerAudioChunks = 0
   private mode: SessionMode = "continuous"
+  private latestUsageTotal: number | null = null
+  private leaseDurationMs = 0
+  private lastHeartbeatSuccessAt = 0
 
   constructor(
     private readonly config: OpenAlmaConfig,
@@ -107,6 +137,7 @@ export class GeminiLiveController {
     this.openSocket = options.openSocket ?? ((url) => new WebSocket(url) as unknown as SocketLike)
     this.setupTimeoutMs = options.setupTimeoutMs ?? REQUEST_TIMEOUT_MS
     this.heartbeatMs = options.heartbeatMs
+    this.storage = options.storage
   }
 
   async start(mode: SessionMode = "continuous"): Promise<void> {
@@ -116,7 +147,9 @@ export class GeminiLiveController {
     this.ready = false
     this.ended = true
     this.resumptionHandle = ""
+    this.resumptionUpdatedAt = 0
     this.reconnectAttempted = false
+    this.reconnecting = false
     this.errorReported = false
     this.inputTranscript = ""
     this.outputTranscript = ""
@@ -126,6 +159,7 @@ export class GeminiLiveController {
     this.pendingEvents = []
     this.appendTail = Promise.resolve()
     this.persistenceFatal = false
+    this.journalUnavailable = false
     this.reflecting = false
     this.reflectionResolve = null
     this.stopPromise = null
@@ -134,21 +168,35 @@ export class GeminiLiveController {
     this.audioFramesSent = 0
     this.providerAudioChunks = 0
     this.mode = mode
+    this.latestUsageTotal = null
+    this.clearDurationWarning()
+    this.clearGoAway()
     try {
+      await this.hydrateJournal()
       const response = await this.requestStart(mode)
+      await this.reconcileJournal()
       trace("provider.bootstrap.ready")
       this.token = response.ephemeral_token
+      this.leaseDurationMs = response.lease_seconds * 1000
+      this.lastHeartbeatSuccessAt = Date.now()
       if (generation !== this.generation) {
         await this.endLease()
         throw new Error("Gemini start cancelled")
       }
-      await this.connectSocket("")
+      await this.connectSocket(this.resumptionHandle)
       trace("provider.socket.ready")
       if (generation !== this.generation) throw new Error("Gemini start cancelled")
       this.heartbeatTimer = setInterval(
         () => void this.heartbeat(),
         this.heartbeatMs ?? Math.floor((response.lease_seconds * 1000) / 3),
       )
+      if (response.session_warning_seconds > 0) {
+        const sittingId = response.session_id
+        this.durationWarningTimer = setTimeout(() => {
+          if (!this.stopping && this.sessionId === sittingId) this.callbacks.onDurationWarning()
+        }, response.session_warning_seconds * 1000)
+      }
+      if (this.pendingEvents.length) this.scheduleAppend()
     } catch (error) {
       await this.stop()
       throw error
@@ -245,6 +293,11 @@ export class GeminiLiveController {
       this.stopping = true
       this.ready = false
       this.clearHeartbeat()
+      this.clearDurationWarning()
+      this.clearGoAway()
+      this.resumptionHandle = ""
+      this.resumptionUpdatedAt = 0
+      await this.persistJournal()
       const socket = this.socket
       this.socket = null
       socket?.close()
@@ -294,7 +347,10 @@ export class GeminiLiveController {
       ws.output_audio_rate_hz !== 24000 ||
       typeof body.lease_seconds !== "number" ||
       !Number.isFinite(body.lease_seconds) ||
-      body.lease_seconds <= 0
+      body.lease_seconds <= 0 ||
+      typeof body.session_warning_seconds !== "number" ||
+      !Number.isFinite(body.session_warning_seconds) ||
+      body.session_warning_seconds < 0
     ) {
       throw new Error("OpenAlma Start returned an invalid session contract")
     }
@@ -302,7 +358,7 @@ export class GeminiLiveController {
     return body as StartResponse
   }
 
-  private async connectSocket(handle: string): Promise<void> {
+  private async connectSocket(handle: string): Promise<SocketLike> {
     const url =
       "wss://generativelanguage.googleapis.com/ws/" +
       "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained" +
@@ -355,6 +411,7 @@ export class GeminiLiveController {
         if (ready && !this.stopping && this.socket === socket) void this.handleUnexpectedClose()
       })
     })
+    return socket
   }
 
   private parseMessage(data: unknown): Record<string, any> {
@@ -368,10 +425,27 @@ export class GeminiLiveController {
   }
 
   private handleMessage(message: Record<string, any>): void {
-    const update = message.sessionResumptionUpdate
-    if (update?.resumable === true && typeof update.newHandle === "string" && update.newHandle.trim()) {
-      this.resumptionHandle = update.newHandle
+    const usage = message.usageMetadata
+    if (
+      usage &&
+      typeof usage === "object" &&
+      Number.isSafeInteger(usage.totalTokenCount) &&
+      usage.totalTokenCount >= 0
+    ) {
+      this.latestUsageTotal = usage.totalTokenCount
     }
+    const update = message.sessionResumptionUpdate
+    if (update?.resumable === false) {
+      this.resumptionHandle = ""
+      this.resumptionUpdatedAt = 0
+      this.queueJournalWrite()
+    } else if (update?.resumable === true && typeof update.newHandle === "string" && update.newHandle.trim()) {
+      this.resumptionHandle = update.newHandle
+      this.resumptionUpdatedAt = Date.now()
+      this.queueJournalWrite()
+    }
+
+    if (message.goAway !== undefined) this.handleGoAway(message.goAway)
 
     const hasToolCall = message.toolCall !== undefined
     if (hasToolCall) trace("provider.tool_call")
@@ -381,6 +455,54 @@ export class GeminiLiveController {
     if (hasToolCall) this.handleToolCall(message.toolCall)
     if (message.toolCallCancellation !== undefined) {
       this.handleToolCancellation(message.toolCallCancellation)
+    }
+    if (this.goAwayPending && !this.turnActive && !this.reflecting) void this.rotateForGoAway()
+  }
+
+  private handleGoAway(value: unknown): void {
+    const timeLeft = value && typeof value === "object" ? (value as {timeLeft?: unknown}).timeLeft : null
+    const match = typeof timeLeft === "string" ? /^(\d+(?:\.\d+)?)s$/.exec(timeLeft) : null
+    const seconds = match ? Number(match[1]) : Number.NaN
+    if (!Number.isFinite(seconds) || seconds <= 0) throw new Error("Gemini returned malformed GoAway")
+    if (this.goAwayPending || this.reconnecting) return
+    this.goAwayPending = true
+    this.goAwayTimer = setTimeout(
+      () => void this.rotateForGoAway(),
+      Math.max(0, seconds * 1000 - 2_000),
+    )
+  }
+
+  private async rotateForGoAway(): Promise<void> {
+    if (!this.goAwayPending || this.reconnecting || this.stopping) return
+    this.goAwayPending = false
+    this.clearGoAway()
+    if (!this.resumptionHandle) {
+      this.reportError(new Error("Gemini requested rollover without a resumable handle"))
+      return
+    }
+    this.reconnecting = true
+    this.ready = false
+    this.callbacks.onReconnecting(true)
+    if (this.reflecting) this.finishReflection(null)
+    if (this.turnActive || this.inputTranscript.trim() || this.outputTranscript.trim()) {
+      this.finalizeInterruptedTurn()
+      this.interruptionFinalized = false
+      this.turnActive = false
+      this.callbacks.onInterrupted()
+    }
+    const oldSocket = this.socket
+    this.socket = null
+    oldSocket?.close()
+    try {
+      const replacement = await this.connectSocket(this.resumptionHandle)
+      if (replacement.readyState !== WS_OPEN) {
+        throw new Error("Gemini replacement socket closed after setup")
+      }
+      if (!this.stopping) this.callbacks.onReconnecting(false)
+    } catch (error) {
+      this.reportError(error instanceof Error ? error : new Error(String(error)))
+    } finally {
+      this.reconnecting = false
     }
   }
 
@@ -454,6 +576,8 @@ export class GeminiLiveController {
         this.finalizeCompleteTurn(hasToolCall)
       }
       this.turnActive = false
+      this.reconnectAttempted = false
+      if (this.latestUsageTotal !== null) this.callbacks.onUsage(this.latestUsageTotal)
       this.callbacks.onTurnComplete(!hasToolCall)
     }
   }
@@ -656,6 +780,7 @@ export class GeminiLiveController {
 
   private async flushPendingEvents(): Promise<void> {
     while (this.pendingEvents.length && !this.persistenceFatal) {
+      await this.persistJournal()
       const batch = this.pendingEvents.slice(0, 16)
       let response: Response
       try {
@@ -679,8 +804,151 @@ export class GeminiLiveController {
         throw new Error("OpenAlma transcript append returned an invalid acknowledgement")
       }
       this.pendingEvents = this.pendingEvents.filter((event) => event.sequence > Number(ack))
+      await this.persistJournal()
     }
-    if (!this.pendingEvents.length) this.callbacks.onPersistenceError(null)
+    if (!this.pendingEvents.length && !this.journalUnavailable) this.callbacks.onPersistenceError(null)
+  }
+
+  private queueJournalWrite(): void {
+    this.appendTail = this.appendTail.then(() => this.persistJournal())
+  }
+
+  private async hydrateJournal(): Promise<void> {
+    if (!this.storage) return
+    let raw: string | null
+    try {
+      raw = await this.storage.get(JOURNAL_KEY)
+    } catch {
+      this.journalUnavailable = true
+      this.callbacks.onPersistenceError("Local transcript backup unavailable")
+      return
+    }
+    if (!raw) return
+    let value: unknown
+    try {
+      value = JSON.parse(raw)
+    } catch {
+      await this.deleteJournal()
+      return
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      await this.deleteJournal()
+      return
+    }
+    const journal = value as Partial<SessionJournal>
+    const scope = journal.scope
+    if (
+      journal.version !== 1 ||
+      scope?.userId !== this.config.userId ||
+      scope.soulId !== this.config.soulId ||
+      scope.deviceSessionId !== this.config.deviceSessionId ||
+      !this.validPendingEvents(journal.pendingTranscripts)
+    ) {
+      await this.deleteJournal()
+      return
+    }
+    this.pendingEvents = journal.pendingTranscripts.map((event) => ({...event}))
+    const resumption = journal.resumption
+    if (
+      resumption &&
+      typeof resumption.handle === "string" &&
+      resumption.handle.trim() &&
+      Number.isFinite(resumption.updatedAt) &&
+      Date.now() - resumption.updatedAt <= RESUMPTION_MAX_AGE_MS
+    ) {
+      this.resumptionHandle = resumption.handle
+      this.resumptionUpdatedAt = resumption.updatedAt
+    }
+  }
+
+  private validPendingEvents(value: unknown): value is TranscriptEvent[] {
+    return (
+      Array.isArray(value) &&
+      value.length <= 512 &&
+      value.every((event) => {
+        if (!event || typeof event !== "object") return false
+        const keys = Object.keys(event)
+        if (keys.some((key) => !["event_id", "sequence", "event_kind", "role", "content", "status"].includes(key))) {
+          return false
+        }
+        if (
+          typeof event.event_id !== "string" ||
+          event.event_id !== event.event_id.trim() ||
+          event.event_id.length < 1 ||
+          event.event_id.length > 256 ||
+          !Number.isSafeInteger(event.sequence) ||
+          event.sequence < 1 ||
+          typeof event.content !== "string" ||
+          event.content !== event.content.trim() ||
+          event.content.length < 1 ||
+          event.content.length > 16_000
+        ) {
+          return false
+        }
+        if (event.event_kind === "transcript") {
+          return (
+            (event.role === "user" || event.role === "assistant") &&
+            (event.status === "complete" || event.status === "interrupted")
+          )
+        }
+        return event.event_kind === "sitting_summary" && event.role === "assistant" && event.status === undefined
+      })
+    )
+  }
+
+  private async reconcileJournal(): Promise<void> {
+    this.pendingEvents = this.pendingEvents.filter((event) => event.sequence >= this.nextTranscriptSequence)
+    for (let index = 0; index < this.pendingEvents.length; index += 1) {
+      if (this.pendingEvents[index].sequence !== this.nextTranscriptSequence + index) {
+        this.pendingEvents = []
+        await this.persistJournal()
+        throw new Error("Local transcript backup has a sequence gap")
+      }
+    }
+    this.pendingEvents = this.pendingEvents.map((event) => ({
+      ...event,
+      event_id: `${this.sessionId}:${event.sequence}`,
+    }))
+    this.nextTranscriptSequence += this.pendingEvents.length
+    await this.persistJournal()
+  }
+
+  private async persistJournal(): Promise<void> {
+    if (!this.storage) return
+    try {
+      if (!this.resumptionHandle && !this.pendingEvents.length) {
+        await this.storage.delete(JOURNAL_KEY)
+        this.journalUnavailable = false
+        return
+      }
+      const journal: SessionJournal = {
+        version: 1,
+        scope: {
+          userId: this.config.userId,
+          soulId: this.config.soulId,
+          deviceSessionId: this.config.deviceSessionId,
+        },
+        resumption: this.resumptionHandle
+          ? {handle: this.resumptionHandle, updatedAt: this.resumptionUpdatedAt}
+          : null,
+        pendingTranscripts: this.pendingEvents,
+      }
+      await this.storage.set(JOURNAL_KEY, JSON.stringify(journal))
+      this.journalUnavailable = false
+    } catch {
+      this.journalUnavailable = true
+      this.callbacks.onPersistenceError("Local transcript backup unavailable")
+    }
+  }
+
+  private async deleteJournal(): Promise<void> {
+    try {
+      await this.storage?.delete(JOURNAL_KEY)
+      this.journalUnavailable = false
+    } catch {
+      this.journalUnavailable = true
+      this.callbacks.onPersistenceError("Local transcript backup unavailable")
+    }
   }
 
   private requestReflection(): Promise<string | null> {
@@ -718,13 +986,17 @@ export class GeminiLiveController {
   }
 
   private async handleUnexpectedClose(): Promise<void> {
+    if (this.reconnecting) return
+    this.reconnecting = true
     trace("provider.socket.closed", {resumable: Boolean(this.resumptionHandle)})
     this.socket = null
     this.ready = false
     if (this.reflecting) {
       this.finishReflection(null)
+      this.reconnecting = false
       return
     }
+    const interrupted = this.turnActive || Boolean(this.inputTranscript.trim() || this.outputTranscript.trim())
     if (this.inputTranscript.trim() || this.outputTranscript.trim()) {
       this.finalizeInterruptedTurn()
     } else {
@@ -732,16 +1004,26 @@ export class GeminiLiveController {
     }
     this.interruptionFinalized = false
     this.turnActive = false
+    if (interrupted) this.callbacks.onInterrupted()
     if (this.resumptionHandle && !this.reconnectAttempted) {
       this.reconnectAttempted = true
+      this.callbacks.onReconnecting(true)
       try {
-        await this.connectSocket(this.resumptionHandle)
+        const replacement = await this.connectSocket(this.resumptionHandle)
+        if (replacement.readyState !== WS_OPEN) {
+          throw new Error("Gemini replacement socket closed after setup")
+        }
+        this.callbacks.onReconnecting(false)
+        this.reconnecting = false
         return
       } catch (error) {
+        this.callbacks.onReconnecting(false)
+        this.reconnecting = false
         this.reportError(error instanceof Error ? error : new Error(String(error)))
         return
       }
     }
+    this.reconnecting = false
     this.reportError(new Error("Gemini connection closed"))
   }
 
@@ -752,9 +1034,29 @@ export class GeminiLiveController {
         user_id: this.config.userId,
         soul_id: this.config.soulId,
       })
-      if (!response.ok) throw new Error(`OpenAlma heartbeat failed (${response.status})`)
+      if (response.status === 404) {
+        this.reportError(new Error("OpenAlma heartbeat failed (404)"))
+      } else if (!response.ok) {
+        trace("provider.heartbeat.missed", {status: response.status})
+        this.expireMissedHeartbeat()
+      } else {
+        this.lastHeartbeatSuccessAt = Date.now()
+      }
     } catch (error) {
-      this.reportError(error instanceof Error ? error : new Error(String(error)))
+      trace("provider.heartbeat.missed", {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      this.expireMissedHeartbeat()
+    }
+  }
+
+  private expireMissedHeartbeat(): void {
+    if (
+      this.leaseDurationMs > 0 &&
+      this.lastHeartbeatSuccessAt > 0 &&
+      Date.now() - this.lastHeartbeatSuccessAt >= this.leaseDurationMs
+    ) {
+      this.reportError(new Error("OpenAlma heartbeat lease expired"))
     }
   }
 
@@ -790,12 +1092,25 @@ export class GeminiLiveController {
     this.heartbeatTimer = null
   }
 
+  private clearDurationWarning(): void {
+    if (this.durationWarningTimer) clearTimeout(this.durationWarningTimer)
+    this.durationWarningTimer = null
+  }
+
+  private clearGoAway(): void {
+    if (this.goAwayTimer) clearTimeout(this.goAwayTimer)
+    this.goAwayTimer = null
+    this.goAwayPending = false
+  }
+
   private reportError(error: Error): void {
     if (this.stopping || this.errorReported) return
     this.errorReported = true
     this.pendingToolCalls.clear()
     this.deliveredToolResultIds.clear()
     this.clearHeartbeat()
+    this.clearDurationWarning()
+    this.clearGoAway()
     this.callbacks.onError(error)
   }
 }

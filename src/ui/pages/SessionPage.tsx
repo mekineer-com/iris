@@ -12,6 +12,7 @@ function unreachable(value: never): never {
 export function statusText(connection: ConnectionState, mode: SessionMode, manualPhase: ManualPhase): string {
   switch (connection) {
     case "starting": return "Starting..."
+    case "reconnecting": return "Reconnecting..."
     case "stopping": return "Stopping..."
     case "error": return "Error"
     case "speaking": return "Speaking"
@@ -59,7 +60,8 @@ export default function SessionPage() {
   const visible = visibleConnection(connection, startPending, stopPending)
   const starting = visible === "starting"
   const stopping = visible === "stopping"
-  const active = starting || visible === "listening" || visible === "speaking"
+  const reconnecting = visible === "reconnecting"
+  const active = starting || reconnecting || visible === "listening" || visible === "speaking"
   const modeDisabled = active || stopping || startPending || stopPending || modePending
 
   const onStart = async () => {
@@ -125,7 +127,7 @@ export default function SessionPage() {
           ? "Retry"
           : "Start"
   const sittingDisabled = stopping || stopPending || modePending || (!active && startPending)
-  const showSpinner = starting || stopping
+  const showSpinner = starting || reconnecting || stopping
   const manualDisabled = manualPending || visible === "speaking"
   const voiceReady = visible === "listening" || visible === "speaking"
 
@@ -191,6 +193,10 @@ export default function SessionPage() {
         ) : null}
       </section>
       {snapshot?.lastError ? <p role="alert">{snapshot.lastError}</p> : null}
+      {snapshot?.durationWarning ? <p role="status">Session duration warning</p> : null}
+      {snapshot?.usageTotalTokens !== null && snapshot?.usageTotalTokens !== undefined ? (
+        <p>Provider tokens: {snapshot.usageTotalTokens.toLocaleString()}</p>
+      ) : null}
       {rpcError ? <p role="alert">{rpcError}</p> : null}
     </main>
   )

@@ -5,7 +5,14 @@ import {GeminiLiveController} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {SessionController} from "./SessionController"
 
-type Snapshot = {mode: string; connection: string; manualPhase: string; lastError: string | null}
+type Snapshot = {
+  mode: string
+  connection: string
+  manualPhase: string
+  lastError: string | null
+  usageTotalTokens: number | null
+  durationWarning: boolean
+}
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://127.0.0.1:9999",
@@ -71,6 +78,18 @@ class FakeLive {
 
   interrupted(): void {
     this.callbacks.onInterrupted()
+  }
+
+  reconnecting(value: boolean): void {
+    this.callbacks.onReconnecting(value)
+  }
+
+  usage(totalTokens: number): void {
+    this.callbacks.onUsage(totalTokens)
+  }
+
+  durationWarning(): void {
+    this.callbacks.onDurationWarning()
   }
 
   persistence(message: string | null): void {
@@ -211,6 +230,18 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
 }
 
 describe("SessionController", () => {
+  test("projects provider rollover as reconnecting with Stop ownership", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    harness.live.reconnecting(true)
+    expect(lastSnapshot(harness.session)?.connection).toBe("reconnecting")
+    harness.live.reconnecting(false)
+    expect(lastSnapshot(harness.session)?.connection).toBe("listening")
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(harness.session.plays.at(-1)?.audioUrl).toEndWith("/earcons/listen-start.wav")
+    await harness.session.handlers["openalma:stop"]({})
+  })
+
   test("starts Gemini before mic and stops both", async () => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
@@ -450,6 +481,8 @@ describe("SessionController", () => {
       connection: "idle",
       manualPhase: "idle",
       lastError: null,
+      usageTotalTokens: null,
+      durationWarning: false,
     })
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     harness.live.persistenceOnStop = "Transcript sync failed; last turns were not saved"

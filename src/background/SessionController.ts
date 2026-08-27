@@ -32,7 +32,7 @@ export type SessionControllerOptions = {
   createLiveController?: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
 }
 
-const ACTIVE: ReadonlySet<ConnectionState> = new Set(["starting", "listening", "speaking"])
+const ACTIVE: ReadonlySet<ConnectionState> = new Set(["starting", "reconnecting", "listening", "speaking"])
 const MAX_MANUAL_AUDIO_BYTES = 16000 * 2 * 120
 const MANUAL_LIMIT_MESSAGE = "Manual recording reached 120-second limit"
 
@@ -54,6 +54,8 @@ export class SessionController {
   private manualResponseTimeout: ReturnType<typeof setTimeout> | null = null
   private interruptPromise: Promise<void> | null = null
   private lastError: string | null = null
+  private usageTotalTokens: number | null = null
+  private durationWarning = false
   private startInFlight = false
   private startGeneration = 0
   private speakerEpoch = 0
@@ -85,7 +87,8 @@ export class SessionController {
     this.responseWatchdogMs = options.responseWatchdogMs ?? 60_000
     this.config = options.config
     this.createLiveController =
-      options.createLiveController ?? ((config, callbacks) => new GeminiLiveController(config, callbacks))
+      options.createLiveController ??
+      ((config, callbacks) => new GeminiLiveController(config, callbacks, {storage: this.session.storage}))
     this.liveController = null
   }
 
@@ -194,6 +197,8 @@ export class SessionController {
       connection: this.connection,
       manualPhase: this.manualPhase,
       lastError: this.lastError,
+      usageTotalTokens: this.usageTotalTokens,
+      durationWarning: this.durationWarning,
     }
   }
 
@@ -209,6 +214,8 @@ export class SessionController {
     const generation = ++this.startGeneration
     this.mode = mode
     this.lastError = null
+    this.usageTotalTokens = null
+    this.durationWarning = false
     this.resetManualState()
     this.sawMicFrame = false
     this.connection = "starting"
@@ -228,6 +235,28 @@ export class SessionController {
               if (this.interruptPromise === interrupting) this.interruptPromise = null
             })
             this.interruptPromise = interrupting
+          },
+          onReconnecting: (reconnecting) => {
+            if (reconnecting && (this.connection === "listening" || this.connection === "speaking")) {
+              this.connection = "reconnecting"
+            } else if (!reconnecting && this.connection === "reconnecting") {
+              this.connection = "listening"
+              const generation = this.startGeneration
+              void this.speechFinishTail.then(() => {
+                if (generation === this.startGeneration && this.connection === "listening") {
+                  return this.playEarcon("listen-start")
+                }
+              })
+            }
+            this.pushSnapshot()
+          },
+          onUsage: (totalTokens) => {
+            this.usageTotalTokens = totalTokens
+            this.pushSnapshot()
+          },
+          onDurationWarning: () => {
+            this.durationWarning = true
+            this.pushSnapshot()
           },
           onPersistenceError: (message) => {
             if (this.teardownKind === "fail") return

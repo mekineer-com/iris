@@ -9,6 +9,7 @@ describe("SessionPage state projection", () => {
     expect(statusText("listening", "manual", "review")).toBe("Review recording")
     expect(statusText("listening", "manual", "submitted")).toBe("Waiting for Siri...")
     expect(statusText("listening", "continuous", "idle")).toBe("Listening")
+    expect(statusText("reconnecting", "continuous", "idle")).toBe("Reconnecting...")
   })
 
   test("Stop projection overrides a pending Start", () => {
