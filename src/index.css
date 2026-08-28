@@ -69,6 +69,18 @@ h1 {
   font-weight: 700;
 }
 
+.camera-probe {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 1.5rem;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.camera-probe input {
+  max-width: 100%;
+}
+
 button,
 select {
   font: inherit;

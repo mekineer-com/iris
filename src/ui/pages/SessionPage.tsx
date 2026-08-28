@@ -41,6 +41,11 @@ export function visibleConnection(
   return connection
 }
 
+export function cameraProbeLabel(file: Pick<File, "size"> | null | undefined): string | null {
+  if (!file || file.size <= 0) return null
+  return `Photo ready (${Math.ceil(file.size / 1024)} KB)`
+}
+
 export default function SessionPage() {
   const snapshot = useChannel("openalma:update")
   const startRpc = useRpc<Channels, "openalma:start">("openalma:start")
@@ -51,6 +56,7 @@ export default function SessionPage() {
   const [stopPending, setStopPending] = useState(false)
   const [modePending, setModePending] = useState(false)
   const [manualPending, setManualPending] = useState(false)
+  const [cameraProbe, setCameraProbe] = useState<string | null>(null)
   const [rpcError, setRpcError] = useState<string | null>(null)
   const startOwner = useRef(0)
 
@@ -192,6 +198,19 @@ export default function SessionPage() {
           </div>
         ) : null}
       </section>
+      <label className="camera-probe">
+        <span>Try phone camera</span>
+        <input
+          type="file"
+          accept="image/*"
+          onChange={(event) => {
+            const label = cameraProbeLabel(event.currentTarget.files?.[0])
+            if (label) setCameraProbe(label)
+            event.currentTarget.value = ""
+          }}
+        />
+      </label>
+      {cameraProbe ? <p role="status">{cameraProbe}</p> : null}
       {snapshot?.lastError ? <p role="alert">{snapshot.lastError}</p> : null}
       {snapshot?.durationWarning ? <p role="status">Session duration warning</p> : null}
       {snapshot?.usageTotalTokens !== null && snapshot?.usageTotalTokens !== undefined ? (
