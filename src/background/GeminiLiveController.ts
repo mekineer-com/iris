@@ -80,6 +80,7 @@ const REQUEST_TIMEOUT_MS = 10_000
 const RECALL_TIMEOUT_MS = 30_000
 const REFLECTION_TIMEOUT_MS = 8_000
 const RECONNECT_SETUP_ATTEMPTS = 6
+const GO_AWAY_MARGIN_MS = 2_000
 const JOURNAL_KEY = "openalma:gemini-session-v1"
 const RESUMPTION_MAX_AGE_MS = 30 * 60 * 1000
 export const SITTING_REFLECTION_PROMPT =
@@ -495,10 +496,13 @@ export class GeminiLiveController {
     if (!Number.isFinite(seconds) || seconds <= 0) throw new Error("Gemini returned malformed GoAway")
     if (this.goAwayPending || this.reconnecting) return
     this.goAwayPending = true
-    this.goAwayDeadlineAt = Date.now() + Math.max(0, seconds * 1000 - 2_000)
+    this.goAwayDeadlineAt = Date.now() + seconds * 1000
     this.goAwayTimer = setTimeout(
       () => void this.rotateForGoAway(),
-      Math.max(0, this.goAwayDeadlineAt - Date.now()),
+      Math.max(
+        0,
+        this.goAwayDeadlineAt - Date.now() - REQUEST_TIMEOUT_MS - this.setupTimeoutMs - GO_AWAY_MARGIN_MS,
+      ),
     )
   }
 
