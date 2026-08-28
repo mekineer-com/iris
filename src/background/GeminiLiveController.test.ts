@@ -1193,6 +1193,28 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("GoAway keeps the old socket until transient token mint recovers", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const h = harness({setupTimeoutMs: 20, tokenGate: gate, tokenStatuses: [503, 200]})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].message({goAway: {timeLeft: "50s"}})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/token")))
+    expect(h.sockets[0].readyState).toBe(1)
+    release()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    h.sockets[1].message({setupComplete: {}})
+    await waitFor(() => h.reconnecting.at(-1) === false)
+
+    expect(h.requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(2)
+    expect(h.errors).toEqual([])
+    await h.controller.stop(true)
+  })
+
   test("unexpected close clears a pending GoAway before recovery", async () => {
     const h = harness()
     await start(h)
@@ -1227,6 +1249,40 @@ describe("GeminiLiveController", () => {
     await h.controller.stop(true)
   })
 
+  test("network recovery re-mints after Gemini setup failure", async () => {
+    const h = harness({setupTimeoutMs: 20})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].close()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].error()
+    await waitFor(() => h.sockets.length === 3)
+    h.sockets[2].open()
+    h.sockets[2].message({setupComplete: {}})
+    await waitFor(() => h.reconnecting.at(-1) === false)
+
+    expect(h.requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(2)
+    expect(h.socketUrls[1]).toContain("access_token=ephemeral%2Frefresh-1")
+    expect(h.socketUrls[2]).toContain("access_token=ephemeral%2Frefresh-2")
+    expect(h.errors).toEqual([])
+    await h.controller.stop(true)
+  })
+
+  test("network recovery stops retrying when the mcp lease expires", async () => {
+    const h = harness({setupTimeoutMs: 20, leaseSeconds: 0.05, heartbeatStatus: 503})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].close()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    await new Promise((resolve) => setTimeout(resolve, 80))
+
+    expect(h.errors).toHaveLength(1)
+    expect(h.requests.filter((request) => request.url.endsWith("/token")).length).toBeLessThan(6)
+    expect(h.sockets.length).toBeLessThan(7)
+    await h.controller.stop(true)
+  })
+
   test("dead lease never opens a replacement with the old token", async () => {
     const h = harness({tokenStatuses: [404]})
     await start(h)
@@ -1249,6 +1305,7 @@ describe("GeminiLiveController", () => {
     h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
     h.sockets[0].message({goAway: {timeLeft: "50s"}})
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/token")))
+    expect(h.sockets[0].readyState).toBe(1)
     const stopping = h.controller.stop(true)
     release()
     await stopping

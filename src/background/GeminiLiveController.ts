@@ -107,6 +107,7 @@ export class GeminiLiveController {
   private durationWarningTimer: ReturnType<typeof setTimeout> | null = null
   private goAwayTimer: ReturnType<typeof setTimeout> | null = null
   private goAwayPending = false
+  private goAwayDeadlineAt = 0
   private stopping = false
   private ended = true
   private reconnectAttempted = false
@@ -386,7 +387,7 @@ export class GeminiLiveController {
     return body as StartResponse
   }
 
-  private async connectSocket(handle: string): Promise<SocketLike> {
+  private async connectSocket(handle: string, timeoutMs = this.setupTimeoutMs): Promise<SocketLike> {
     const url =
       "wss://generativelanguage.googleapis.com/ws/" +
       "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained" +
@@ -397,7 +398,7 @@ export class GeminiLiveController {
     await new Promise<void>((resolve, reject) => {
       let settled = false
       let ready = false
-      const timeout = setTimeout(() => finish(new Error("Gemini setup timed out")), this.setupTimeoutMs)
+      const timeout = setTimeout(() => finish(new Error("Gemini setup timed out")), timeoutMs)
       const finish = (error?: Error) => {
         if (settled) return
         settled = true
@@ -494,14 +495,16 @@ export class GeminiLiveController {
     if (!Number.isFinite(seconds) || seconds <= 0) throw new Error("Gemini returned malformed GoAway")
     if (this.goAwayPending || this.reconnecting) return
     this.goAwayPending = true
+    this.goAwayDeadlineAt = Date.now() + Math.max(0, seconds * 1000 - 2_000)
     this.goAwayTimer = setTimeout(
       () => void this.rotateForGoAway(),
-      Math.max(0, seconds * 1000 - 2_000),
+      Math.max(0, this.goAwayDeadlineAt - Date.now()),
     )
   }
 
   private async rotateForGoAway(): Promise<void> {
     if (!this.goAwayPending || this.reconnecting || this.stopping) return
+    const deadlineAt = this.goAwayDeadlineAt
     this.goAwayPending = false
     this.clearGoAway()
     if (!this.resumptionHandle) {
@@ -518,14 +521,14 @@ export class GeminiLiveController {
       this.turnActive = false
       this.callbacks.onInterrupted()
     }
-    const oldSocket = this.socket
-    this.socket = null
-    oldSocket?.close()
     const generation = this.generation
     const sessionId = this.sessionId
+    const oldSocket = this.socket
     try {
-      await this.refreshToken(generation, sessionId)
-      const replacement = await this.connectSocket(this.resumptionHandle)
+      const replacement = await this.connectReplacement(generation, sessionId, deadlineAt, () => {
+        if (this.socket === oldSocket) this.socket = null
+        oldSocket?.close()
+      })
       if (replacement.readyState !== WS_OPEN) {
         throw new Error("Gemini replacement socket closed after setup")
       }
@@ -1045,7 +1048,7 @@ export class GeminiLiveController {
       const generation = this.generation
       const sessionId = this.sessionId
       try {
-        const replacement = await this.connectAfterNetworkLoss(generation, sessionId)
+        const replacement = await this.connectReplacement(generation, sessionId)
         if (replacement.readyState !== WS_OPEN) {
           throw new Error("Gemini replacement socket closed after setup")
         }
@@ -1065,42 +1068,55 @@ export class GeminiLiveController {
     this.reportError(new Error("Gemini connection closed"))
   }
 
-  private async connectAfterNetworkLoss(generation: number, sessionId: string): Promise<SocketLike> {
+  private async connectReplacement(
+    generation: number,
+    sessionId: string,
+    goAwayDeadlineAt = Number.POSITIVE_INFINITY,
+    beforeFirstConnect?: () => void,
+  ): Promise<SocketLike> {
     let lastError = new Error("Gemini reconnect failed")
-    let tokenAttempts = 0
-    let setupAttempts = 0
-    while (
-      tokenAttempts < RECONNECT_SETUP_ATTEMPTS &&
-      setupAttempts < RECONNECT_SETUP_ATTEMPTS &&
-      !this.stopPromise &&
-      !this.stopping &&
-      generation === this.generation &&
-      sessionId === this.sessionId
-    ) {
+    for (let attempt = 0; attempt < RECONNECT_SETUP_ATTEMPTS; attempt += 1) {
+      const deadlineAt = Math.min(
+        goAwayDeadlineAt,
+        this.lastHeartbeatSuccessAt + this.leaseDurationMs,
+      )
+      if (!this.reconnectOwned(generation, sessionId) || (attempt > 0 && Date.now() >= deadlineAt)) break
       try {
-        await this.refreshToken(generation, sessionId)
+        await this.refreshToken(generation, sessionId, deadlineAt)
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
         if (!(error instanceof TokenRefreshError) || !error.retryable) throw error
-        tokenAttempts += 1
-        if (tokenAttempts >= RECONNECT_SETUP_ATTEMPTS) break
-        await this.reconnectDelay()
+        if (attempt + 1 < RECONNECT_SETUP_ATTEMPTS) await this.reconnectDelay(deadlineAt)
         continue
       }
+      beforeFirstConnect?.()
+      beforeFirstConnect = undefined
       try {
-        return await this.connectSocket(this.resumptionHandle)
+        return await this.connectSocket(
+          this.resumptionHandle,
+          Math.max(1, Math.min(this.setupTimeoutMs, deadlineAt - Date.now())),
+        )
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
-        setupAttempts += 1
         this.socket?.close()
-        if (setupAttempts < RECONNECT_SETUP_ATTEMPTS && !this.stopPromise) await this.reconnectDelay()
+        if (attempt + 1 < RECONNECT_SETUP_ATTEMPTS) await this.reconnectDelay(deadlineAt)
       }
     }
     throw lastError
   }
 
-  private async refreshToken(generation: number, sessionId: string): Promise<void> {
-    if (this.stopPromise || this.stopping || generation !== this.generation || sessionId !== this.sessionId) {
+  private reconnectOwned(generation: number, sessionId: string): boolean {
+    return (
+      !this.stopPromise &&
+      !this.stopping &&
+      !this.errorReported &&
+      generation === this.generation &&
+      sessionId === this.sessionId
+    )
+  }
+
+  private async refreshToken(generation: number, sessionId: string, deadlineAt: number): Promise<void> {
+    if (!this.reconnectOwned(generation, sessionId)) {
       throw new TokenRefreshError("Gemini reconnect cancelled", false)
     }
     let response: Response
@@ -1108,7 +1124,7 @@ export class GeminiLiveController {
       response = await this.request(`/integration/mentra/session/${sessionId}/token`, {
         user_id: this.config.userId,
         soul_id: this.config.soulId,
-      })
+      }, Math.max(1, Math.min(REQUEST_TIMEOUT_MS, deadlineAt - Date.now())))
     } catch {
       throw new TokenRefreshError("OpenAlma token refresh failed", true)
     }
@@ -1121,15 +1137,18 @@ export class GeminiLiveController {
     const body = await response.json().catch(() => null)
     const token = typeof body?.ephemeral_token === "string" ? body.ephemeral_token.trim() : ""
     if (!token) throw new TokenRefreshError("OpenAlma token refresh returned an invalid contract", false)
-    if (this.stopPromise || this.stopping || generation !== this.generation || sessionId !== this.sessionId) {
+    if (!this.reconnectOwned(generation, sessionId)) {
       throw new TokenRefreshError("Gemini reconnect cancelled", false)
     }
     this.token = token
   }
 
-  private reconnectDelay(): Promise<void> {
+  private reconnectDelay(deadlineAt: number): Promise<void> {
     return new Promise((resolve) =>
-      setTimeout(resolve, Math.min(1_000, Math.max(1, Math.floor(this.setupTimeoutMs / 10)))),
+      setTimeout(
+        resolve,
+        Math.max(0, Math.min(1_000, Math.floor(this.setupTimeoutMs / 10), deadlineAt - Date.now())),
+      ),
     )
   }
 
@@ -1207,6 +1226,7 @@ export class GeminiLiveController {
     if (this.goAwayTimer) clearTimeout(this.goAwayTimer)
     this.goAwayTimer = null
     this.goAwayPending = false
+    this.goAwayDeadlineAt = 0
   }
 
   private reportError(error: Error): void {
