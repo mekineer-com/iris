@@ -43,7 +43,7 @@ export function visibleConnection(
 
 export function cameraProbeLabel(file: Pick<File, "size"> | null | undefined): string | null {
   if (!file || file.size <= 0) return null
-  return `Photo ready (${Math.ceil(file.size / 1024)} KB)`
+  return `Photo selected locally (${Math.ceil(file.size / 1024)} KB; not sent)`
 }
 
 export default function SessionPage() {

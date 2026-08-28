@@ -19,7 +19,7 @@ describe("SessionPage state projection", () => {
   })
 
   test("phone camera probe accepts only nonempty files", () => {
-    expect(cameraProbeLabel({size: 1025})).toBe("Photo ready (2 KB)")
+    expect(cameraProbeLabel({size: 1025})).toBe("Photo selected locally (2 KB; not sent)")
     expect(cameraProbeLabel({size: 0})).toBeNull()
     expect(cameraProbeLabel(null)).toBeNull()
   })
