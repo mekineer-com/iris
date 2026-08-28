@@ -85,6 +85,8 @@ function harness(
     startStatus?: number
     startBody?: unknown
     startResults?: Array<{status: number; body: unknown}>
+    tokenGate?: Promise<void>
+    tokenStatuses?: number[]
     leaseSeconds?: number
     appendStatuses?: number[]
     recallGate?: Promise<void>
@@ -95,6 +97,7 @@ function harness(
   } = {},
 ) {
   const sockets: FakeSocket[] = []
+  const socketUrls: string[] = []
   const requests: Array<{url: string; body: any; authorization: string | null}> = []
   const audio: string[] = []
   const events: string[] = []
@@ -105,6 +108,8 @@ function harness(
   let durationWarnings = 0
   const appendStatuses = [...(options.appendStatuses ?? [])]
   const startResults = [...(options.startResults ?? [])]
+  const tokenStatuses = [...(options.tokenStatuses ?? [])]
+  let refreshedTokens = 0
   const fetchFn = async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input)
     const body = JSON.parse(String(init?.body ?? "{}"))
@@ -127,6 +132,14 @@ function harness(
           session_warning_seconds: options.warningSeconds ?? 0,
         },
         {status: result?.status ?? options.startStatus ?? 200},
+      )
+    }
+    if (url.endsWith("/token")) {
+      if (options.tokenGate) await options.tokenGate
+      refreshedTokens += 1
+      return Response.json(
+        {ephemeral_token: `ephemeral/refresh-${refreshedTokens}`},
+        {status: tokenStatuses.shift() ?? 200},
       )
     }
     if (url.endsWith("/heartbeat")) {
@@ -164,9 +177,10 @@ function harness(
     },
     {
       fetchFn: fetchFn as typeof fetch,
-      openSocket: () => {
+      openSocket: (url) => {
         const socket = new FakeSocket()
         sockets.push(socket)
+        socketUrls.push(url)
         return socket
       },
       heartbeatMs: options.heartbeatMs,
@@ -177,6 +191,7 @@ function harness(
   return {
     controller,
     sockets,
+    socketUrls,
     requests,
     audio,
     events,
@@ -1148,6 +1163,8 @@ describe("GeminiLiveController", () => {
     h.sockets[0].message({goAway: {timeLeft: "50s"}})
     await waitFor(() => h.sockets.length === 2)
     expect(h.sockets[0].readyState).toBe(3)
+    expect(h.requests.filter((request) => request.url.endsWith("/token"))).toHaveLength(1)
+    expect(h.socketUrls[1]).toContain("access_token=ephemeral%2Frefresh-1")
     expect(h.reconnecting).toEqual([true])
     h.sockets[1].open()
     expect(JSON.parse(h.sockets[1].sent[0])).toEqual({
@@ -1191,6 +1208,54 @@ describe("GeminiLiveController", () => {
     expect(h.sockets).toHaveLength(2)
     expect(h.errors).toEqual([])
     await h.controller.stop(true)
+  })
+
+  test("network recovery retries token mint separately from Gemini setup", async () => {
+    const h = harness({setupTimeoutMs: 20, tokenStatuses: [503, 503, 200]})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].close()
+    await waitFor(() => h.requests.filter((request) => request.url.endsWith("/token")).length === 3)
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    h.sockets[1].message({setupComplete: {}})
+    await waitFor(() => h.reconnecting.at(-1) === false)
+
+    expect(h.sockets).toHaveLength(2)
+    expect(h.socketUrls[1]).toContain("access_token=ephemeral%2Frefresh-3")
+    expect(h.errors).toEqual([])
+    await h.controller.stop(true)
+  })
+
+  test("dead lease never opens a replacement with the old token", async () => {
+    const h = harness({tokenStatuses: [404]})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].close()
+    await waitFor(() => h.errors.length === 1)
+
+    expect(h.errors).toEqual(["OpenAlma token refresh failed (404)"])
+    expect(h.sockets).toHaveLength(1)
+    await h.controller.stop(true)
+  })
+
+  test("Stop during token mint opens no replacement socket", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const h = harness({tokenGate: gate})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].message({goAway: {timeLeft: "50s"}})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/token")))
+    const stopping = h.controller.stop(true)
+    release()
+    await stopping
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(h.sockets).toHaveLength(1)
+    expect(h.errors).toEqual([])
   })
 
   test("GoAway deadline interrupts once and malformed duration fails loud", async () => {

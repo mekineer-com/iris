@@ -85,6 +85,12 @@ const RESUMPTION_MAX_AGE_MS = 30 * 60 * 1000
 export const SITTING_REFLECTION_PROMPT =
   "Reflect briefly in first person on the emotional tone, subtext, or meaningful shift in this sitting that the literal transcript may not preserve. Do not recap the conversation. Respond with one or two natural sentences, or exactly NO_SUMMARY if nothing worthwhile would be added."
 
+class TokenRefreshError extends Error {
+  constructor(message: string, readonly retryable: boolean) {
+    super(message)
+  }
+}
+
 export class GeminiLiveController {
   private readonly fetchFn: typeof fetch
   private readonly openSocket: (url: string) => SocketLike
@@ -515,14 +521,19 @@ export class GeminiLiveController {
     const oldSocket = this.socket
     this.socket = null
     oldSocket?.close()
+    const generation = this.generation
+    const sessionId = this.sessionId
     try {
+      await this.refreshToken(generation, sessionId)
       const replacement = await this.connectSocket(this.resumptionHandle)
       if (replacement.readyState !== WS_OPEN) {
         throw new Error("Gemini replacement socket closed after setup")
       }
-      if (!this.stopping) this.callbacks.onReconnecting(false)
+      if (!this.stopPromise && !this.stopping) this.callbacks.onReconnecting(false)
     } catch (error) {
-      this.reportError(error instanceof Error ? error : new Error(String(error)))
+      if (!this.stopPromise && generation === this.generation && sessionId === this.sessionId) {
+        this.reportError(error instanceof Error ? error : new Error(String(error)))
+      }
     } finally {
       this.reconnecting = false
     }
@@ -1031,8 +1042,10 @@ export class GeminiLiveController {
     if (this.resumptionHandle && !this.reconnectAttempted) {
       this.reconnectAttempted = true
       this.callbacks.onReconnecting(true)
+      const generation = this.generation
+      const sessionId = this.sessionId
       try {
-        const replacement = await this.connectAfterNetworkLoss()
+        const replacement = await this.connectAfterNetworkLoss(generation, sessionId)
         if (replacement.readyState !== WS_OPEN) {
           throw new Error("Gemini replacement socket closed after setup")
         }
@@ -1042,7 +1055,9 @@ export class GeminiLiveController {
       } catch (error) {
         this.callbacks.onReconnecting(false)
         this.reconnecting = false
-        if (!this.stopping) this.reportError(error instanceof Error ? error : new Error(String(error)))
+        if (!this.stopPromise && generation === this.generation && sessionId === this.sessionId) {
+          this.reportError(error instanceof Error ? error : new Error(String(error)))
+        }
         return
       }
     }
@@ -1050,22 +1065,72 @@ export class GeminiLiveController {
     this.reportError(new Error("Gemini connection closed"))
   }
 
-  private async connectAfterNetworkLoss(): Promise<SocketLike> {
+  private async connectAfterNetworkLoss(generation: number, sessionId: string): Promise<SocketLike> {
     let lastError = new Error("Gemini reconnect failed")
-    for (let attempt = 0; attempt < RECONNECT_SETUP_ATTEMPTS && !this.stopping; attempt += 1) {
+    let tokenAttempts = 0
+    let setupAttempts = 0
+    while (
+      tokenAttempts < RECONNECT_SETUP_ATTEMPTS &&
+      setupAttempts < RECONNECT_SETUP_ATTEMPTS &&
+      !this.stopPromise &&
+      !this.stopping &&
+      generation === this.generation &&
+      sessionId === this.sessionId
+    ) {
+      try {
+        await this.refreshToken(generation, sessionId)
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error))
+        if (!(error instanceof TokenRefreshError) || !error.retryable) throw error
+        tokenAttempts += 1
+        if (tokenAttempts >= RECONNECT_SETUP_ATTEMPTS) break
+        await this.reconnectDelay()
+        continue
+      }
       try {
         return await this.connectSocket(this.resumptionHandle)
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
+        setupAttempts += 1
         this.socket?.close()
-        if (attempt + 1 < RECONNECT_SETUP_ATTEMPTS && !this.stopping) {
-          await new Promise((resolve) =>
-            setTimeout(resolve, Math.min(1_000, Math.max(1, Math.floor(this.setupTimeoutMs / 10)))),
-          )
-        }
+        if (setupAttempts < RECONNECT_SETUP_ATTEMPTS && !this.stopPromise) await this.reconnectDelay()
       }
     }
     throw lastError
+  }
+
+  private async refreshToken(generation: number, sessionId: string): Promise<void> {
+    if (this.stopPromise || this.stopping || generation !== this.generation || sessionId !== this.sessionId) {
+      throw new TokenRefreshError("Gemini reconnect cancelled", false)
+    }
+    let response: Response
+    try {
+      response = await this.request(`/integration/mentra/session/${sessionId}/token`, {
+        user_id: this.config.userId,
+        soul_id: this.config.soulId,
+      })
+    } catch {
+      throw new TokenRefreshError("OpenAlma token refresh failed", true)
+    }
+    if (!response.ok) {
+      throw new TokenRefreshError(
+        `OpenAlma token refresh failed (${response.status})`,
+        response.status >= 500,
+      )
+    }
+    const body = await response.json().catch(() => null)
+    const token = typeof body?.ephemeral_token === "string" ? body.ephemeral_token.trim() : ""
+    if (!token) throw new TokenRefreshError("OpenAlma token refresh returned an invalid contract", false)
+    if (this.stopPromise || this.stopping || generation !== this.generation || sessionId !== this.sessionId) {
+      throw new TokenRefreshError("Gemini reconnect cancelled", false)
+    }
+    this.token = token
+  }
+
+  private reconnectDelay(): Promise<void> {
+    return new Promise((resolve) =>
+      setTimeout(resolve, Math.min(1_000, Math.max(1, Math.floor(this.setupTimeoutMs / 10)))),
+    )
   }
 
   private async heartbeat(): Promise<void> {
