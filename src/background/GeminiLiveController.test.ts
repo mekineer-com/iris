@@ -788,8 +788,70 @@ describe("GeminiLiveController", () => {
       const raw = storage.values.get("openalma:gemini-session-v1")
       return Boolean(raw && JSON.parse(raw).pendingTranscripts.length === 0)
     })
-    await h.controller.stop()
+    await h.controller.stop(true)
     expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
+  })
+
+  test("ignores a resumption handle older than the measured token window", async () => {
+    const storage = new FakeStorage()
+    storage.values.set(
+      "openalma:gemini-session-v1",
+      JSON.stringify({
+        version: 1,
+        scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+        resumption: {handle: "expired-handle", updatedAt: Date.now() - 31 * 60 * 1000},
+        pendingTranscripts: [],
+      }),
+    )
+    const h = harness({storage})
+    await start(h)
+    expect(JSON.parse(h.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
+    await h.controller.stop(true)
+  })
+
+  test("falls back cold after a stored handle fails setup", async () => {
+    const storage = new FakeStorage()
+    storage.values.set(
+      "openalma:gemini-session-v1",
+      JSON.stringify({
+        version: 1,
+        scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+        resumption: {handle: "private-handle", updatedAt: Date.now()},
+        pendingTranscripts: [],
+      }),
+    )
+    const h = harness({storage})
+    const starting = h.controller.start()
+    await waitFor(() => h.sockets.length === 1)
+    h.sockets[0].error()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    expect(JSON.parse(h.sockets[1].sent[0])).toEqual({setup: {sessionResumption: {}}})
+    h.sockets[1].message({setupComplete: {}})
+    await starting
+    expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
+    await h.controller.stop(true)
+  })
+
+  test("failed recovery preserves the hydrated handle for Retry", async () => {
+    const storage = new FakeStorage()
+    storage.values.set(
+      "openalma:gemini-session-v1",
+      JSON.stringify({
+        version: 1,
+        scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+        resumption: {handle: "private-handle", updatedAt: Date.now()},
+        pendingTranscripts: [],
+      }),
+    )
+    const h = harness({storage})
+    const starting = h.controller.start()
+    await waitFor(() => h.sockets.length === 1)
+    h.sockets[0].error()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].error()
+    await expect(starting).rejects.toThrow("Gemini socket failed during setup")
+    expect(JSON.parse(storage.values.get("openalma:gemini-session-v1")!).resumption.handle).toBe("private-handle")
   })
 
   test("drops a journal event that mcp would reject", async () => {
@@ -1112,6 +1174,23 @@ describe("GeminiLiveController", () => {
     })
     await waitFor(() => h.sockets.length === 2)
     await h.controller.stop()
+  })
+
+  test("unexpected close clears a pending GoAway before recovery", async () => {
+    const h = harness()
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "active turn"}}})
+    h.sockets[0].message({goAway: {timeLeft: "50s"}})
+    h.sockets[0].close()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    h.sockets[1].message({setupComplete: {}})
+    await waitFor(() => h.reconnecting.at(-1) === false)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(h.sockets).toHaveLength(2)
+    expect(h.errors).toEqual([])
+    await h.controller.stop(true)
   })
 
   test("GoAway deadline interrupts once and malformed duration fails loud", async () => {

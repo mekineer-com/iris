@@ -81,7 +81,7 @@ const RECALL_TIMEOUT_MS = 30_000
 const REFLECTION_TIMEOUT_MS = 8_000
 const RECONNECT_SETUP_ATTEMPTS = 6
 const JOURNAL_KEY = "openalma:gemini-session-v1"
-const RESUMPTION_MAX_AGE_MS = 2 * 60 * 60 * 1000
+const RESUMPTION_MAX_AGE_MS = 30 * 60 * 1000
 export const SITTING_REFLECTION_PROMPT =
   "Reflect briefly in first person on the emotional tone, subtext, or meaningful shift in this sitting that the literal transcript may not preserve. Do not recap the conversation. Respond with one or two natural sentences, or exactly NO_SUMMARY if nothing worthwhile would be added."
 
@@ -184,7 +184,26 @@ export class GeminiLiveController {
         await this.endLease()
         throw new Error("Gemini start cancelled")
       }
-      await this.connectSocket(this.resumptionHandle)
+      const hydratedHandle = this.resumptionHandle
+      try {
+        await this.connectSocket(hydratedHandle)
+      } catch (error) {
+        if (!hydratedHandle || generation !== this.generation) throw error
+        this.socket?.close()
+        this.socket = null
+        try {
+          await this.connectSocket("")
+          this.resumptionHandle = ""
+          this.resumptionUpdatedAt = 0
+          await this.persistJournal()
+        } catch (coldError) {
+          if (!this.stopping && generation === this.generation) {
+            this.resumptionHandle = hydratedHandle
+            await this.persistJournal()
+          }
+          throw coldError
+        }
+      }
       trace("provider.socket.ready")
       if (generation !== this.generation) throw new Error("Gemini start cancelled")
       this.heartbeatTimer = setInterval(
@@ -296,8 +315,10 @@ export class GeminiLiveController {
       this.clearHeartbeat()
       this.clearDurationWarning()
       this.clearGoAway()
-      this.resumptionHandle = ""
-      this.resumptionUpdatedAt = 0
+      if (graceful) {
+        this.resumptionHandle = ""
+        this.resumptionUpdatedAt = 0
+      }
       await this.persistJournal()
       const socket = this.socket
       this.socket = null
@@ -988,6 +1009,7 @@ export class GeminiLiveController {
 
   private async handleUnexpectedClose(): Promise<void> {
     if (this.reconnecting) return
+    this.clearGoAway()
     this.reconnecting = true
     trace("provider.socket.closed", {resumable: Boolean(this.resumptionHandle)})
     this.socket = null
