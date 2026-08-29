@@ -123,6 +123,12 @@ export default function SessionPage() {
     }
   }
 
+  const onImagePicked = (input: HTMLInputElement) => {
+    const label = cameraProbeLabel(input.files?.[0])
+    if (label) setCameraProbe(label)
+    input.value = ""
+  }
+
   const sittingLabel = stopping
     ? "Stopping..."
     : starting
@@ -198,19 +204,25 @@ export default function SessionPage() {
           </div>
         ) : null}
       </section>
-      <label className="camera-probe">
-        <span>Take photo</span>
-        <input
-          type="file"
-          accept="image/*"
-          capture="environment"
-          onChange={(event) => {
-            const label = cameraProbeLabel(event.currentTarget.files?.[0])
-            if (label) setCameraProbe(label)
-            event.currentTarget.value = ""
-          }}
-        />
-      </label>
+      <div className="camera-probe-actions">
+        <label className="camera-probe">
+          <span>Take photo</span>
+          <input
+            type="file"
+            accept="image/*"
+            capture="environment"
+            onChange={(event) => onImagePicked(event.currentTarget)}
+          />
+        </label>
+        <label className="camera-probe">
+          <span>Choose image</span>
+          <input
+            type="file"
+            accept="image/*"
+            onChange={(event) => onImagePicked(event.currentTarget)}
+          />
+        </label>
+      </div>
       {cameraProbe ? <p role="status">{cameraProbe}</p> : null}
       {snapshot?.lastError ? <p role="alert">{snapshot.lastError}</p> : null}
       {snapshot?.durationWarning ? <p role="status">Session duration warning</p> : null}

@@ -69,11 +69,17 @@ h1 {
   font-weight: 700;
 }
 
+.camera-probe-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  margin-top: 1.5rem;
+}
+
 .camera-probe {
   display: grid;
   min-height: 3rem;
   place-items: center;
-  margin-top: 1.5rem;
   border: 1px solid rgb(24 49 39 / 28%);
   border-radius: 0.65rem;
   color: #fff;
