@@ -199,10 +199,11 @@ export default function SessionPage() {
         ) : null}
       </section>
       <label className="camera-probe">
-        <span>Try phone camera</span>
+        <span>Take photo</span>
         <input
           type="file"
           accept="image/*"
+          capture="environment"
           onChange={(event) => {
             const label = cameraProbeLabel(event.currentTarget.files?.[0])
             if (label) setCameraProbe(label)

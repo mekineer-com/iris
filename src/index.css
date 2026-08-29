@@ -71,14 +71,29 @@ h1 {
 
 .camera-probe {
   display: grid;
-  gap: 0.5rem;
+  min-height: 3rem;
+  place-items: center;
   margin-top: 1.5rem;
+  border: 1px solid rgb(24 49 39 / 28%);
+  border-radius: 0.65rem;
+  color: #fff;
+  background: var(--leaf);
   font-size: 0.86rem;
   font-weight: 700;
 }
 
 .camera-probe input {
-  max-width: 100%;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.camera-probe:has(input:focus-visible) {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
 }
 
 button,
