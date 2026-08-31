@@ -107,6 +107,8 @@ class TokenRefreshError extends Error {
   }
 }
 
+class ImageTurnInterruptedError extends Error {}
+
 export class GeminiLiveController {
   private readonly fetchFn: typeof fetch
   private readonly openSocket: (url: string) => SocketLike
@@ -405,7 +407,7 @@ export class GeminiLiveController {
         try {
           this.finalizeInterruptedTurn()
         } catch (error) {
-          if (!(error instanceof Error) || error.message !== "Gemini image turn was interrupted") throw error
+          if (!(error instanceof ImageTurnInterruptedError)) throw error
           this.callbacks.onPersistenceError("Photo description was interrupted; the photo remains pending")
         }
         this.interruptionFinalized = false
@@ -639,6 +641,7 @@ export class GeminiLiveController {
     const oldSocket = this.socket
     try {
       if (this.turnActive || this.inputTranscript.trim() || this.outputTranscript.trim()) {
+        // An interrupted photo is fatal; the catch below reports it instead of opening a replacement socket.
         this.finalizeInterruptedTurn()
         this.interruptionFinalized = false
         this.turnActive = false
@@ -926,7 +929,7 @@ export class GeminiLiveController {
     this.interruptionFinalized = true
     if (input || output) this.scheduleAppend()
     if (this.pendingImage?.providerSent && !this.pendingImage.caption && !this.pendingImage.captureAfterCurrent) {
-      throw new Error("Gemini image turn was interrupted")
+      throw new ImageTurnInterruptedError("Gemini image turn was interrupted")
     }
     if (this.pendingImage?.providerSent && this.pendingImage.captureAfterCurrent) {
       this.pendingImage.captureAfterCurrent = false
