@@ -819,41 +819,44 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
-  test("pending recall follows a same-sitting socket replacement", async () => {
-    let release!: () => void
-    const gate = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    const h = harness({recallGate: gate})
-    await start(h)
-    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
-    h.sockets[0].message({
-      toolCall: {
-        functionCalls: [{id: "call-4", name: "recall_memory", args: {query: "resume"}}],
-      },
-    })
-    await waitFor(() => h.requests.some((request) => request.url.endsWith("/recall")))
-    h.sockets[0].error()
-    await waitFor(() => h.sockets.length === 2)
-    h.sockets[1].open()
-    h.sockets[1].message({setupComplete: {}})
-    release()
-    await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).toolResponse))
-
-    expect(h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse)).toBe(false)
-    expect(JSON.parse(h.sockets[1].sent.find((value) => JSON.parse(value).toolResponse)!))
-      .toEqual({
-        toolResponse: {
-          functionResponses: [{
-            id: "call-4",
-            name: "recall_memory",
-            response: {result: "A compact fictional memory."},
-            scheduling: "SILENT",
-          }],
+  test("pending recall follows unexpected-close and GoAway replacements", async () => {
+    for (const cause of ["close", "goAway"] as const) {
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const h = harness({recallGate: gate})
+      await start(h)
+      h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+      h.sockets[0].message({
+        toolCall: {
+          functionCalls: [{id: "call-4", name: "recall_memory", args: {query: "resume"}}],
         },
       })
-    expect(h.errors).toEqual([])
-    await h.controller.stop()
+      await waitFor(() => h.requests.some((request) => request.url.endsWith("/recall")))
+      if (cause === "close") h.sockets[0].error()
+      else h.sockets[0].message({goAway: {timeLeft: "0.1s"}})
+      await waitFor(() => h.sockets.length === 2)
+      h.sockets[1].open()
+      h.sockets[1].message({setupComplete: {}})
+      release()
+      await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).toolResponse))
+
+      expect(h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse)).toBe(false)
+      expect(JSON.parse(h.sockets[1].sent.find((value) => JSON.parse(value).toolResponse)!))
+        .toEqual({
+          toolResponse: {
+            functionResponses: [{
+              id: "call-4",
+              name: "recall_memory",
+              response: {result: "A compact fictional memory."},
+              scheduling: "SILENT",
+            }],
+          },
+        })
+      expect(h.errors).toEqual([])
+      await h.controller.stop()
+    }
   })
 
   test("graceful reflection discards a late recall result", async () => {
