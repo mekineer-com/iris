@@ -315,7 +315,7 @@ export class GeminiLiveController {
       await this.persistJournal()
       if (this.journalUnavailable) throw new Error("Local image journal unavailable")
     }
-    if (this.pendingImage?.providerSent) throw new Error("Photo response is still pending")
+    if (this.pendingImage?.providerSent) return
 
     const generation = this.generation
     const sessionId = this.sessionId
@@ -402,7 +402,12 @@ export class GeminiLiveController {
     try {
       const stoppedMidTurn = this.turnActive
       if (this.inputTranscript.trim() || this.outputTranscript.trim()) {
-        this.finalizeInterruptedTurn()
+        try {
+          this.finalizeInterruptedTurn()
+        } catch (error) {
+          if (!(error instanceof Error) || error.message !== "Gemini image turn was interrupted") throw error
+          this.callbacks.onPersistenceError("Photo description was interrupted; the photo remains pending")
+        }
         this.interruptionFinalized = false
       }
       if (graceful && !stoppedMidTurn && this.ready && this.completeUserTurns >= 2) {
@@ -751,8 +756,10 @@ export class GeminiLiveController {
     this.clearTurn()
     if (capturesImage) {
       if (toolCallBoundary && !input && !output) return
-      if (input || !output) {
-        throw new Error("Gemini image turn completed without a usable caption")
+      if (!output) throw new Error("Gemini image turn completed without a usable caption")
+      if (input) {
+        this.enqueueEvent("transcript", "user", input, "complete")
+        this.completeUserTurns += 1
       }
       const event = this.enqueueEvent("transcript", "assistant", output, "complete")
       pendingImage!.caption = output

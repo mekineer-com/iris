@@ -89,6 +89,7 @@ function harness(
     tokenStatuses?: number[]
     leaseSeconds?: number
     appendStatuses?: number[]
+    appendGates?: Promise<void>[]
     snapshotStatus?: number
     snapshotGate?: Promise<void>
     finalizeStatuses?: number[]
@@ -110,6 +111,7 @@ function harness(
   const usage: number[] = []
   let durationWarnings = 0
   const appendStatuses = [...(options.appendStatuses ?? [])]
+  const appendGates = [...(options.appendGates ?? [])]
   const startResults = [...(options.startResults ?? [])]
   const tokenStatuses = [...(options.tokenStatuses ?? [])]
   const finalizeStatuses = [...(options.finalizeStatuses ?? [])]
@@ -158,6 +160,7 @@ function harness(
       )
     }
     if (url.endsWith("/transcripts/append")) {
+      await appendGates.shift()
       return Response.json(
         {ok: true, ack_sequence: body.events.at(-1)?.sequence ?? 0},
         {status: appendStatuses.shift() ?? 200},
@@ -350,15 +353,57 @@ describe("GeminiLiveController", () => {
   })
 
   test("retains image finalization until the caption transcript is acknowledged", async () => {
-    const h = harness({storage: new FakeStorage(), appendStatuses: [503, 503]})
+    let releaseImage!: () => void
+    let releaseCaption!: () => void
+    const imageGate = new Promise<void>((resolve) => {
+      releaseImage = resolve
+    })
+    const captionGate = new Promise<void>((resolve) => {
+      releaseCaption = resolve
+    })
+    const h = harness({storage: new FakeStorage(), appendGates: [imageGate, captionGate]})
     await start(h)
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
     await waitFor(() => h.requests.filter((request) => request.url.endsWith("/transcripts/append")).length === 1)
+    releaseImage()
+    await new Promise((resolve) => setTimeout(resolve, 0))
     h.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional blue square."}, turnComplete: true}})
     await waitFor(() => h.requests.filter((request) => request.url.endsWith("/transcripts/append")).length === 2)
     expect(h.requests.some((request) => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    releaseCaption()
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
     await h.controller.stop()
-    expect(h.requests.some((request) => request.url.endsWith("/snapshot/finalize"))).toBe(true)
+  })
+
+  test("uses the image response as its caption when the user also asks a question", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    h.sockets[0].message({serverContent: {
+      inputTranscription: {text: "What do you see?"},
+      outputTranscription: {text: "I see a fictional blue square."},
+      turnComplete: true,
+    }})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
+
+    expect(h.requests.find((request) => request.url.endsWith("/snapshot/finalize"))?.body.caption).toBe(
+      "I see a fictional blue square.",
+    )
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("Stop during a photo description reports the photo instead of transcript failure", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "A partial description."}}})
+
+    await h.controller.stop()
+
+    expect(h.errors).toEqual([])
+    expect(h.persistenceErrors).toContain("Photo description was interrupted; the photo remains pending")
+    expect(h.persistenceErrors).not.toContain("Transcript sync failed; last turns were not saved")
   })
 
   test("does not treat later speech as the image turn while finalization retries", async () => {
