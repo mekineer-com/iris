@@ -50,6 +50,7 @@ export class SessionController {
   private mode: SessionMode = "continuous"
   private connection: ConnectionState = "idle"
   private manualPhase: ManualPhase = "idle"
+  private photoRetryPending = false
   private manualAudio: string[] = []
   private manualAudioBytes = 0
   private manualResponseTimeout: ReturnType<typeof setTimeout> | null = null
@@ -220,6 +221,7 @@ export class SessionController {
       mode: this.mode,
       connection: this.connection,
       manualPhase: this.manualPhase,
+      photoRetryPending: this.photoRetryPending,
       lastError: this.lastError,
       usageTotalTokens: this.usageTotalTokens,
       durationWarning: this.durationWarning,
@@ -237,6 +239,7 @@ export class SessionController {
     this.startInFlight = true
     const generation = ++this.startGeneration
     this.mode = mode
+    this.photoRetryPending = false
     this.lastError = null
     this.usageTotalTokens = null
     this.durationWarning = false
@@ -280,6 +283,10 @@ export class SessionController {
           },
           onDurationWarning: () => {
             this.durationWarning = true
+            this.pushSnapshot()
+          },
+          onPhotoRetryChange: (pending) => {
+            this.photoRetryPending = pending
             this.pushSnapshot()
           },
           onPersistenceError: (message) => {

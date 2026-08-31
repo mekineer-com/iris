@@ -93,6 +93,7 @@ export default function SessionPage() {
   const connection = snapshot?.connection ?? "idle"
   const mode = snapshot?.mode ?? "continuous"
   const manualPhase = snapshot?.manualPhase ?? "idle"
+  const photoRetryPending = snapshot?.photoRetryPending ?? false
   const visible = visibleConnection(connection, startPending, stopPending)
   const starting = visible === "starting"
   const stopping = visible === "stopping"
@@ -300,7 +301,7 @@ export default function SessionPage() {
             type="file"
             accept="image/*"
             capture="environment"
-            disabled={!voiceReady || imagePending || stopping}
+            disabled={!voiceReady || imagePending || stopping || photoRetryPending}
             onChange={(event) => onImagePicked(event.currentTarget)}
           />
         </label>
@@ -309,13 +310,13 @@ export default function SessionPage() {
           <input
             type="file"
             accept="image/*"
-            disabled={!voiceReady || imagePending || stopping}
+            disabled={!voiceReady || imagePending || stopping || photoRetryPending}
             onChange={(event) => onImagePicked(event.currentTarget)}
           />
         </label>
       </div>
       {pendingPhoto?.previewUrl ? <img className="image-preview" src={pendingPhoto.previewUrl} alt="Selected photo preview" /> : null}
-      {pendingPhoto ? (
+      {pendingPhoto && !photoRetryPending ? (
         <div className="image-review">
           <button type="button" disabled={imagePending || !voiceReady} onClick={() => void submitPhoto(pendingPhoto)}>
             {imagePending ? "Sending..." : imageStatus ? "Retry" : "Send"}
@@ -324,13 +325,16 @@ export default function SessionPage() {
         </div>
       ) : null}
       {imageStatus ? <p role="status">{imageStatus}</p> : null}
-      {snapshot?.lastError === PHOTO_RETRY_MESSAGE ? (
-        <div className="image-review">
-          <button type="button" disabled={imagePending || !voiceReady} onClick={() => void handleStoredPhoto("retry")}>Retry</button>
-          <button type="button" disabled={imagePending} onClick={() => void handleStoredPhoto("discard")}>Discard</button>
+      {photoRetryPending && voiceReady ? (
+        <div>
+          <p role="status">{PHOTO_RETRY_MESSAGE}</p>
+          <div className="image-review">
+            <button type="button" disabled={imagePending} onClick={() => void handleStoredPhoto("retry")}>Retry</button>
+            <button type="button" disabled={imagePending} onClick={() => void handleStoredPhoto("discard")}>Discard</button>
+          </div>
         </div>
       ) : null}
-      {snapshot?.lastError ? <p role="alert">{snapshot.lastError}</p> : null}
+      {snapshot?.lastError && snapshot.lastError !== PHOTO_RETRY_MESSAGE ? <p role="alert">{snapshot.lastError}</p> : null}
       {snapshot?.durationWarning ? <p role="status">Session duration warning</p> : null}
       {snapshot?.usageTotalTokens !== null && snapshot?.usageTotalTokens !== undefined ? (
         <p>Provider tokens: {snapshot.usageTotalTokens.toLocaleString()}</p>

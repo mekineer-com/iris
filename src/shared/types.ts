@@ -9,6 +9,7 @@ export interface SessionSnapshot {
   mode: SessionMode
   connection: ConnectionState
   manualPhase: ManualPhase
+  photoRetryPending: boolean
   lastError: string | null
   usageTotalTokens: number | null
   durationWarning: boolean

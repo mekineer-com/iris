@@ -24,6 +24,7 @@ export type GeminiCallbacks = {
   onReconnecting: (reconnecting: boolean) => void
   onUsage: (totalTokens: number) => void
   onDurationWarning: () => void
+  onPhotoRetryChange: (pending: boolean) => void
   onPersistenceError: (message: string | null) => void
   onError: (error: Error) => void
 }
@@ -385,6 +386,7 @@ export class GeminiLiveController {
     if (!this.pendingImage) return
     this.pendingImage = null
     await this.persistJournal()
+    this.callbacks.onPhotoRetryChange(false)
     this.callbacks.onPersistenceError(null)
   }
 
@@ -416,6 +418,7 @@ export class GeminiLiveController {
         image_id: pending.imageId,
       }).catch(() => null)
       if (!response || response.status >= 500) {
+        this.callbacks.onPhotoRetryChange(true)
         this.callbacks.onPersistenceError(PHOTO_RETRY_MESSAGE)
         return
       }
@@ -458,6 +461,7 @@ export class GeminiLiveController {
       this.turnActive = true
       await this.persistJournal()
       this.scheduleAppend()
+      this.callbacks.onPhotoRetryChange(false)
       this.callbacks.onPersistenceError(null)
     } finally {
       this.imageRetrying = false

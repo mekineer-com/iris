@@ -9,6 +9,7 @@ type Snapshot = {
   mode: string
   connection: string
   manualPhase: string
+  photoRetryPending: boolean
   lastError: string | null
   usageTotalTokens: number | null
   durationWarning: boolean
@@ -109,6 +110,10 @@ class FakeLive {
 
   persistence(message: string | null): void {
     this.callbacks.onPersistenceError(message)
+  }
+
+  photoRetry(pending: boolean): void {
+    this.callbacks.onPhotoRetryChange(pending)
   }
 
   fail(message: string): void {
@@ -509,6 +514,7 @@ describe("SessionController", () => {
       mode: "continuous",
       connection: "idle",
       manualPhase: "idle",
+      photoRetryPending: false,
       lastError: null,
       usageTotalTokens: null,
       durationWarning: false,
@@ -529,6 +535,8 @@ describe("SessionController", () => {
       connection: "listening",
       lastError: "Memory recall unavailable; voice is continuing",
     })
+    harness.live.photoRetry(true)
+    expect(lastSnapshot(harness.session)?.photoRetryPending).toBe(true)
     harness.live.persistence(null)
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", lastError: null})
     await harness.session.handlers["openalma:stop"]({})

@@ -95,6 +95,7 @@ function harness(
     snapshotGate?: Promise<void>
     replayGates?: Promise<void>[]
     replayStatuses?: number[]
+    replayBodies?: unknown[]
     finalizeStatuses?: number[]
     recallGate?: Promise<void>
     recallStatus?: number
@@ -110,6 +111,7 @@ function harness(
   const events: string[] = []
   const errors: string[] = []
   const persistenceErrors: Array<string | null> = []
+  const photoRetryChanges: boolean[] = []
   const reconnecting: boolean[] = []
   const usage: number[] = []
   let durationWarnings = 0
@@ -120,6 +122,7 @@ function harness(
   const finalizeStatuses = [...(options.finalizeStatuses ?? [])]
   const replayGates = [...(options.replayGates ?? [])]
   const replayStatuses = [...(options.replayStatuses ?? [])]
+  const replayBodies = [...(options.replayBodies ?? [])]
   let refreshedTokens = 0
   const fetchFn = async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input)
@@ -176,7 +179,10 @@ function harness(
     }
     if (url.endsWith("/snapshot/replay")) {
       await replayGates.shift()
-      return Response.json({mime_type: "image/png", data: "AQID"}, {status: replayStatuses.shift() ?? 200})
+      return Response.json(
+        replayBodies.shift() ?? {mime_type: "image/png", data: "AQID"},
+        {status: replayStatuses.shift() ?? 200},
+      )
     }
     if (url.endsWith("/snapshot")) {
       if (options.snapshotGate) await options.snapshotGate
@@ -199,6 +205,7 @@ function harness(
       onDurationWarning: () => {
         durationWarnings += 1
       },
+      onPhotoRetryChange: (pending) => photoRetryChanges.push(pending),
       onPersistenceError: (message) => persistenceErrors.push(message),
       onError: (error) => errors.push(error.message),
     },
@@ -224,6 +231,7 @@ function harness(
     events,
     errors,
     persistenceErrors,
+    photoRetryChanges,
     reconnecting,
     usage,
     get durationWarnings() {
@@ -415,29 +423,34 @@ describe("GeminiLiveController", () => {
   })
 
   test("fails loud when a durable photo cannot be replayed", async () => {
-    const storage = new FakeStorage()
-    storage.values.set("openalma:gemini-session-v1", JSON.stringify({
-      version: 1,
-      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
-      resumption: null,
-      pendingTranscripts: [],
-      pendingImage: {
-        imageId: "missing-image",
-        mediaRef: "mentra_media/test-phone/missing-image.png",
-        providerSent: false,
-        captureAfterCurrent: false,
-        generation: 1,
-        sessionId: "old-sitting",
-      },
-    }))
-    const h = harness({storage, replayStatuses: [404]})
-    await start(h)
-    await waitFor(() => h.errors.length === 1)
+    for (const [status, body, message] of [
+      [404, undefined, "OpenAlma snapshot replay failed (404)"],
+      [200, {}, "OpenAlma snapshot replay returned invalid image data"],
+    ] as const) {
+      const storage = new FakeStorage()
+      storage.values.set("openalma:gemini-session-v1", JSON.stringify({
+        version: 1,
+        scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+        resumption: null,
+        pendingTranscripts: [],
+        pendingImage: {
+          imageId: "missing-image",
+          mediaRef: "mentra_media/test-phone/missing-image.png",
+          providerSent: false,
+          captureAfterCurrent: false,
+          generation: 1,
+          sessionId: "old-sitting",
+        },
+      }))
+      const h = harness({storage, replayStatuses: [status], replayBodies: body ? [body] : []})
+      await start(h)
+      await waitFor(() => h.errors.length === 1)
 
-    expect(h.errors).toEqual(["OpenAlma snapshot replay failed (404)"])
-    expect(h.persistenceErrors).not.toContain(PHOTO_RETRY_MESSAGE)
-    expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
-    await h.controller.stop()
+      expect(h.errors).toEqual([message])
+      expect(h.persistenceErrors).not.toContain(PHOTO_RETRY_MESSAGE)
+      expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
+      await h.controller.stop()
+    }
   })
 
   test("keeps a transiently failed replay for an explicit retry", async () => {
@@ -459,6 +472,7 @@ describe("GeminiLiveController", () => {
     const h = harness({storage, replayStatuses: [503, 200]})
     await start(h)
     await waitFor(() => h.persistenceErrors.at(-1) === PHOTO_RETRY_MESSAGE)
+    expect(h.photoRetryChanges.at(-1)).toBe(true)
     h.sockets[0].message({toolCall: {
       functionCalls: [{id: "before-retry", name: "recall_memory", args: {query: "fictional context"}}],
     }})
@@ -477,6 +491,7 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
 
     expect(h.persistenceErrors.at(-1)).toBeNull()
+    expect(h.photoRetryChanges.at(-1)).toBe(false)
     expect(h.requests.filter((request) => request.url.endsWith("/snapshot/replay"))).toHaveLength(2)
     expect(h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
       .flatMap((request) => request.body.events)
