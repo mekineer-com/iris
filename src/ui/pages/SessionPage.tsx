@@ -1,7 +1,8 @@
-import {useRef, useState} from "react"
+import {useEffect, useRef, useState} from "react"
 import {useRpc} from "@mentra/miniapp/ui"
 
 import type {Channels} from "../../shared/channels"
+import type {ImageRequest} from "../../shared/channels"
 import type {ConnectionState, ManualAction, ManualPhase, SessionMode} from "../../shared/types"
 import {useChannel} from "../hooks/useChannel"
 
@@ -41,10 +42,25 @@ export function visibleConnection(
   return connection
 }
 
-export function cameraProbeLabel(file: Pick<File, "size"> | null | undefined): string | null {
-  if (!file || file.size <= 0) return null
-  return `Photo selected locally (${Math.ceil(file.size / 1024)} KB; not sent)`
+const MAX_IMAGE_BYTES = 1024 * 1024
+
+export function validateImageFile(file: Pick<File, "size" | "type">): "image/jpeg" | "image/png" {
+  if (file.type !== "image/jpeg" && file.type !== "image/png") throw new Error("Choose a JPEG or PNG image")
+  if (file.size <= 0 || file.size > MAX_IMAGE_BYTES) throw new Error("Photo must be between 1 byte and 1 MB")
+  return file.type
 }
+
+export async function imageRequest(file: File, imageId: string): Promise<ImageRequest> {
+  const mimeType = validateImageFile(file)
+  const bytes = new Uint8Array(await file.arrayBuffer())
+  let binary = ""
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
+  }
+  return {imageId, mimeType, data: btoa(binary)}
+}
+
+type PendingPhoto = {file: File; imageId: string; previewUrl: string | null}
 
 export default function SessionPage() {
   const snapshot = useChannel("openalma:update")
@@ -52,13 +68,26 @@ export default function SessionPage() {
   const stopRpc = useRpc<Channels, "openalma:stop">("openalma:stop")
   const modeRpc = useRpc<Channels, "openalma:set-mode">("openalma:set-mode")
   const manualRpc = useRpc<Channels, "openalma:manual-action">("openalma:manual-action")
+  const imageRpc = useRpc<Channels, "openalma:image">("openalma:image")
   const [startPending, setStartPending] = useState(false)
   const [stopPending, setStopPending] = useState(false)
   const [modePending, setModePending] = useState(false)
   const [manualPending, setManualPending] = useState(false)
-  const [cameraProbe, setCameraProbe] = useState<string | null>(null)
+  const [previewImages, setPreviewImages] = useState(false)
+  const [pendingPhoto, setPendingPhoto] = useState<PendingPhoto | null>(null)
+  const [imagePending, setImagePending] = useState(false)
+  const [imageStatus, setImageStatus] = useState<string | null>(null)
   const [rpcError, setRpcError] = useState<string | null>(null)
   const startOwner = useRef(0)
+  const imageOwner = useRef(0)
+
+  useEffect(() => () => {
+    if (pendingPhoto?.previewUrl) URL.revokeObjectURL(pendingPhoto.previewUrl)
+  }, [pendingPhoto])
+
+  const discardPhoto = () => {
+    setPendingPhoto(null)
+  }
 
   const connection = snapshot?.connection ?? "idle"
   const mode = snapshot?.mode ?? "continuous"
@@ -90,6 +119,9 @@ export default function SessionPage() {
     setStartPending(false)
     setRpcError(null)
     setStopPending(true)
+    imageOwner.current += 1
+    setImagePending(false)
+    discardPhoto()
     try {
       await stopRpc({})
     } catch (error) {
@@ -102,6 +134,9 @@ export default function SessionPage() {
   const onMode = async (next: SessionMode) => {
     setRpcError(null)
     setModePending(true)
+    imageOwner.current += 1
+    setImagePending(false)
+    discardPhoto()
     try {
       await modeRpc({mode: next})
     } catch (error) {
@@ -123,10 +158,46 @@ export default function SessionPage() {
     }
   }
 
+  const submitPhoto = async (photo: PendingPhoto) => {
+    const owner = ++imageOwner.current
+    setRpcError(null)
+    setImageStatus(null)
+    setImagePending(true)
+    try {
+      await imageRpc(await imageRequest(photo.file, photo.imageId))
+      if (owner !== imageOwner.current) return
+      discardPhoto()
+      setImageStatus("Photo sent")
+    } catch (error) {
+      if (owner !== imageOwner.current) return
+      setPendingPhoto(photo)
+      setRpcError(error instanceof Error ? error.message : String(error))
+      setImageStatus("Photo ready to retry")
+    } finally {
+      if (owner === imageOwner.current) setImagePending(false)
+    }
+  }
+
   const onImagePicked = (input: HTMLInputElement) => {
-    const label = cameraProbeLabel(input.files?.[0])
-    if (label) setCameraProbe(label)
+    const file = input.files?.[0]
     input.value = ""
+    if (!file) return
+    setRpcError(null)
+    setImageStatus(null)
+    try {
+      validateImageFile(file)
+    } catch (error) {
+      setRpcError(error instanceof Error ? error.message : String(error))
+      return
+    }
+    discardPhoto()
+    const photo = {
+      file,
+      imageId: `image-${crypto.randomUUID()}`,
+      previewUrl: previewImages ? URL.createObjectURL(file) : null,
+    }
+    setPendingPhoto(photo)
+    if (!previewImages) void submitPhoto(photo)
   }
 
   const sittingLabel = stopping
@@ -204,26 +275,41 @@ export default function SessionPage() {
           </div>
         ) : null}
       </section>
-      <div className="camera-probe-actions">
-        <label className="camera-probe">
+      <label className="preview-control">
+        <input type="checkbox" checked={previewImages} onChange={(event) => setPreviewImages(event.target.checked)} />
+        Preview before send
+      </label>
+      <div className="image-actions">
+        <label className="image-picker">
           <span>Take photo</span>
           <input
             type="file"
             accept="image/*"
             capture="environment"
+            disabled={!voiceReady || imagePending || stopping}
             onChange={(event) => onImagePicked(event.currentTarget)}
           />
         </label>
-        <label className="camera-probe">
+        <label className="image-picker">
           <span>Choose image</span>
           <input
             type="file"
             accept="image/*"
+            disabled={!voiceReady || imagePending || stopping}
             onChange={(event) => onImagePicked(event.currentTarget)}
           />
         </label>
       </div>
-      {cameraProbe ? <p role="status">{cameraProbe}</p> : null}
+      {pendingPhoto?.previewUrl ? <img className="image-preview" src={pendingPhoto.previewUrl} alt="Selected photo preview" /> : null}
+      {pendingPhoto ? (
+        <div className="image-review">
+          <button type="button" disabled={imagePending || !voiceReady} onClick={() => void submitPhoto(pendingPhoto)}>
+            {imagePending ? "Sending..." : imageStatus ? "Retry" : "Send"}
+          </button>
+          <button type="button" disabled={imagePending} onClick={() => discardPhoto()}>Retake</button>
+        </div>
+      ) : null}
+      {imageStatus ? <p role="status">{imageStatus}</p> : null}
       {snapshot?.lastError ? <p role="alert">{snapshot.lastError}</p> : null}
       {snapshot?.durationWarning ? <p role="status">Session duration warning</p> : null}
       {snapshot?.usageTotalTokens !== null && snapshot?.usageTotalTokens !== undefined ? (

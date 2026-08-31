@@ -89,6 +89,9 @@ function harness(
     tokenStatuses?: number[]
     leaseSeconds?: number
     appendStatuses?: number[]
+    snapshotStatus?: number
+    snapshotGate?: Promise<void>
+    finalizeStatuses?: number[]
     recallGate?: Promise<void>
     recallStatus?: number
     recallBody?: unknown
@@ -109,6 +112,7 @@ function harness(
   const appendStatuses = [...(options.appendStatuses ?? [])]
   const startResults = [...(options.startResults ?? [])]
   const tokenStatuses = [...(options.tokenStatuses ?? [])]
+  const finalizeStatuses = [...(options.finalizeStatuses ?? [])]
   let refreshedTokens = 0
   const fetchFn = async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input)
@@ -157,6 +161,17 @@ function harness(
       return Response.json(
         {ok: true, ack_sequence: body.events.at(-1)?.sequence ?? 0},
         {status: appendStatuses.shift() ?? 200},
+      )
+    }
+    if (url.endsWith("/snapshot/finalize")) {
+      return Response.json({ok: true}, {status: finalizeStatuses.shift() ?? 200})
+    }
+    if (url.endsWith("/snapshot")) {
+      if (options.snapshotGate) await options.snapshotGate
+      const extension = body.mime_type === "image/jpeg" ? "jpg" : "png"
+      return Response.json(
+        {ok: true, media_ref: `mentra_media/test-phone/${body.image_id}.${extension}`},
+        {status: options.snapshotStatus ?? 200},
       )
     }
     return Response.json({ok: true})
@@ -230,6 +245,131 @@ function completeTurn(h: ReturnType<typeof harness>, input = "hello", output = "
 }
 
 describe("GeminiLiveController", () => {
+  test("snapshots, sends, journals, acknowledges, then finalizes one image", async () => {
+    const storage = new FakeStorage()
+    const h = harness({storage})
+    await start(h)
+
+    await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    expect(h.requests.find((request) => request.url.endsWith("/snapshot"))?.body).toEqual({
+      user_id: "Test User",
+      soul_id: "Test Soul",
+      image_id: "image-1",
+      mime_type: "image/png",
+      data: "AQID",
+    })
+    expect(JSON.parse(h.sockets[0].sent.at(-1)!)).toEqual({
+      clientContent: {
+        turns: [{role: "user", parts: [
+          {inlineData: {data: "AQID", mimeType: "image/png"}},
+          {text: "Describe this image."},
+        ]}],
+        turnComplete: true,
+      },
+    })
+
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional blue square."}, turnComplete: true}})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
+    const appended = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
+      .flatMap((request) => request.body.events)
+    expect(appended).toContainEqual({
+      event_id: "sitting-1:41",
+      sequence: 41,
+      event_kind: "image",
+      role: "user",
+      content: "Shared a photo.",
+      media_ref: "mentra_media/test-phone/image-1.png",
+    })
+    expect(appended).toContainEqual({
+      event_id: "sitting-1:42",
+      sequence: 42,
+      event_kind: "transcript",
+      role: "assistant",
+      content: "A fictional blue square.",
+      status: "complete",
+    })
+    expect(h.requests.find((request) => request.url.endsWith("/snapshot/finalize"))?.body).toEqual({
+      user_id: "Test User",
+      soul_id: "Test Soul",
+      image_id: "image-1",
+      caption: "A fictional blue square.",
+    })
+    await h.controller.stop()
+  })
+
+  test("does not send Gemini when durable snapshot fails", async () => {
+    const h = harness({storage: new FakeStorage(), snapshotStatus: 503})
+    await start(h)
+    await expect(h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})).rejects.toThrow(
+      "OpenAlma snapshot failed (503)",
+    )
+    expect(h.sockets[0].sent).toHaveLength(1)
+    await h.controller.stop()
+  })
+
+  test("retries the same durable image after provider send failure", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    const image = {imageId: "image-1", mimeType: "image/png" as const, data: "AQID"}
+    h.sockets[0].failAtSendCount = 1
+    await expect(h.controller.sendImage(image)).rejects.toThrow("Gemini image send failed")
+    h.sockets[0].failAtSendCount = null
+    await h.controller.sendImage(image)
+    expect(h.requests.filter((request) => request.url.endsWith("/snapshot"))).toHaveLength(2)
+    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
+    await h.controller.stop()
+  })
+
+  test("Stop during snapshot never sends the stale image turn", async () => {
+    let release!: () => void
+    const snapshotGate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const h = harness({storage: new FakeStorage(), snapshotGate})
+    await start(h)
+    const sending = h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot")))
+    await h.controller.stop()
+    release()
+    await expect(sending).rejects.toThrow("Photo send cancelled")
+    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(0)
+  })
+
+  test("retains image finalization until the caption transcript is acknowledged", async () => {
+    const h = harness({storage: new FakeStorage(), appendStatuses: [503, 503]})
+    await start(h)
+    await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    await waitFor(() => h.requests.filter((request) => request.url.endsWith("/transcripts/append")).length === 1)
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional blue square."}, turnComplete: true}})
+    await waitFor(() => h.requests.filter((request) => request.url.endsWith("/transcripts/append")).length === 2)
+    expect(h.requests.some((request) => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    await h.controller.stop()
+    expect(h.requests.some((request) => request.url.endsWith("/snapshot/finalize"))).toBe(true)
+  })
+
+  test("does not bind an already-active speech turn as the image caption", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    h.sockets[0].message({serverContent: {
+      inputTranscription: {text: "Current user turn."},
+      outputTranscription: {text: "Current answer."},
+    }})
+    await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    h.sockets[0].message({serverContent: {turnComplete: true}})
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(h.requests.some((request) => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+
+    h.sockets[0].message({serverContent: {
+      outputTranscription: {text: "The photo shows a fictional blue square."},
+      turnComplete: true,
+    }})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
+    expect(h.requests.find((request) => request.url.endsWith("/snapshot/finalize"))?.body.caption).toBe(
+      "The photo shows a fictional blue square.",
+    )
+    await h.controller.stop()
+  })
+
   test("starts with the exact OpenAlma and Gemini contracts", async () => {
     const h = harness()
     await start(h)

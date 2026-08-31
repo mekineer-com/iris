@@ -14,6 +14,8 @@ MentraOS `package.json` lists `miniapps/*` as workspaces. Keep OpenAlma out of t
 
 The MiniApp connects OpenAlma's authenticated Mentra bootstrap to Gemini Live native audio and sitting-scoped durable transcripts. Continuous mode uses provider VAD. Manual mode records one memory-only take, then waits for `Send` or `Redo`; `Done` never sends by itself. Temporary transcript-sync failure remains visible and retries without ending voice; contract rejection ends the sitting. Graceful Stop may play and persist one short first-person reflection after two completed user turns.
 
+While a sitting is active, **Take photo** and **Choose image** durably store a JPEG/PNG up to 1 MB before sending it to Gemini. Immediate send is the default; optional preview provides Send/Retake. Gemini's spoken description is saved as the image caption only after its transcript is acknowledged.
+
 Create `.env.local` from `.env.example`. The dedicated bearer is bundled into the private MiniApp and only grants access over the private WireGuard route; the permanent Gemini key stays on the OpenAlma server.
 
 ```

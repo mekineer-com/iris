@@ -1,6 +1,7 @@
 import type {AudioChunkData, MiniappSession, UnsubscribeFn} from "@mentra/miniapp/background"
 
 import type {Channels} from "../shared/channels"
+import type {ImageRequest} from "../shared/channels"
 import type {
   ConnectionState,
   EarconName,
@@ -143,6 +144,16 @@ export class SessionController {
           throw new Error("Unknown Manual action")
         }
         this.handleManualAction(action)
+        return {ok: true as const}
+      }),
+    )
+    this.unsubs.push(
+      ui.handle("openalma:image", async (payload) => {
+        if (this.connection !== "listening" && this.connection !== "speaking") {
+          throw new Error("Start Iris before sending a photo")
+        }
+        if (!this.liveController) throw new Error("Gemini is not ready")
+        await this.liveController.sendImage(payload as ImageRequest)
         return {ok: true as const}
       }),
     )

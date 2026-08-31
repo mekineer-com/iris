@@ -69,14 +69,14 @@ h1 {
   font-weight: 700;
 }
 
-.camera-probe-actions {
+.image-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 0.75rem;
   margin-top: 1.5rem;
 }
 
-.camera-probe {
+.image-picker {
   display: grid;
   min-height: 3rem;
   place-items: center;
@@ -88,7 +88,7 @@ h1 {
   font-weight: 700;
 }
 
-.camera-probe input {
+.image-picker input {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -97,9 +97,34 @@ h1 {
   white-space: nowrap;
 }
 
-.camera-probe:has(input:focus-visible) {
+.image-picker:has(input:focus-visible) {
   outline: 2px solid var(--signal);
   outline-offset: 2px;
+}
+
+.preview-control {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 1.5rem;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.image-preview {
+  display: block;
+  width: 100%;
+  max-height: 18rem;
+  margin-top: 1rem;
+  border-radius: 0.65rem;
+  object-fit: contain;
+}
+
+.image-review {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
 }
 
 button,

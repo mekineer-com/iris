@@ -37,6 +37,7 @@ class FakeLive {
   sent: string[] = []
   startModes: string[] = []
   activities: string[][] = []
+  images: unknown[] = []
   activityError: Error | null = null
   startGate: Promise<void> | null = null
   stopGate: Promise<void> | null = null
@@ -58,6 +59,10 @@ class FakeLive {
   sendActivity(chunks: readonly string[]): void {
     if (this.activityError) throw this.activityError
     this.activities.push([...chunks])
+  }
+
+  async sendImage(image: unknown): Promise<void> {
+    this.images.push(image)
   }
 
   async stop(graceful = false): Promise<void> {
@@ -230,6 +235,16 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
 }
 
 describe("SessionController", () => {
+  test("routes images only while a sitting is active", async () => {
+    const harness = setup()
+    await expect(harness.session.handlers["openalma:image"]({})).rejects.toThrow("Start Iris")
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    const image = {imageId: "image-1", mimeType: "image/png", data: "AQID"}
+    await harness.session.handlers["openalma:image"](image)
+    expect(harness.live.images).toEqual([image])
+    await harness.session.handlers["openalma:stop"]({})
+  })
+
   test("projects provider rollover as reconnecting with Stop ownership", async () => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "continuous"})

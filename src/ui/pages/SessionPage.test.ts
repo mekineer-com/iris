@@ -1,6 +1,6 @@
 import {describe, expect, test} from "bun:test"
 
-import {cameraProbeLabel, statusText, visibleConnection} from "./SessionPage"
+import {imageRequest, statusText, validateImageFile, visibleConnection} from "./SessionPage"
 
 describe("SessionPage state projection", () => {
   test("renders every Manual listening phase", () => {
@@ -18,9 +18,14 @@ describe("SessionPage state projection", () => {
     expect(visibleConnection("idle", false, false)).toBe("idle")
   })
 
-  test("phone camera probe accepts only nonempty files", () => {
-    expect(cameraProbeLabel({size: 1025})).toBe("Photo selected locally (2 KB; not sent)")
-    expect(cameraProbeLabel({size: 0})).toBeNull()
-    expect(cameraProbeLabel(null)).toBeNull()
+  test("accepts only bounded JPEG and PNG files", () => {
+    expect(validateImageFile({size: 80_000, type: "image/jpeg"})).toBe("image/jpeg")
+    expect(() => validateImageFile({size: 0, type: "image/png"})).toThrow("between 1 byte and 1 MB")
+    expect(() => validateImageFile({size: 12, type: "image/webp"})).toThrow("JPEG or PNG")
+  })
+
+  test("encodes one validated file for the image RPC", async () => {
+    const payload = await imageRequest(new File([new Uint8Array([1, 2, 3])], "photo.png", {type: "image/png"}), "image-1")
+    expect(payload).toEqual({imageId: "image-1", mimeType: "image/png", data: "AQID"})
   })
 })
