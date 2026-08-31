@@ -307,8 +307,13 @@ export class GeminiLiveController {
     if (!this.ready || this.stopping || !socket || socket.readyState !== WS_OPEN) {
       throw new Error("Gemini socket is not ready")
     }
-    if (this.pendingImage && this.pendingImage.imageId !== image.imageId) {
+    if (this.pendingImage?.providerSent && this.pendingImage.imageId !== image.imageId) {
       throw new Error("Another photo is still pending")
+    }
+    if (this.pendingImage && this.pendingImage.imageId !== image.imageId) {
+      this.pendingImage = null
+      await this.persistJournal()
+      if (this.journalUnavailable) throw new Error("Local image journal unavailable")
     }
     if (this.pendingImage?.providerSent) throw new Error("Photo response is still pending")
 
@@ -338,11 +343,16 @@ export class GeminiLiveController {
       imageId: image.imageId,
       mediaRef,
       providerSent: false,
-      captureAfterCurrent: this.turnActive || Boolean(this.inputTranscript || this.outputTranscript),
+      captureAfterCurrent: false,
       generation: this.generation,
       sessionId: this.sessionId,
     }
     if (pending.mediaRef !== mediaRef) throw new Error("OpenAlma snapshot media reference changed")
+    pending.captureAfterCurrent = this.turnActive || Boolean(
+      this.inputTranscript || this.outputTranscript || this.pendingToolCalls.size || this.deliveredToolResultIds.size,
+    )
+    pending.generation = this.generation
+    pending.sessionId = this.sessionId
     this.pendingImage = pending
     await this.persistJournal()
     if (this.journalUnavailable) throw new Error("Local image journal unavailable")
@@ -364,8 +374,10 @@ export class GeminiLiveController {
       throw new Error("Gemini image send failed")
     }
     pending.providerSent = true
-    const event = this.enqueueEvent("image", "user", "Shared a photo.", undefined, mediaRef)
-    pending.imageSequence = event.sequence
+    if (pending.imageSequence === undefined) {
+      const event = this.enqueueEvent("image", "user", "Shared a photo.", undefined, mediaRef)
+      pending.imageSequence = event.sequence
+    }
     this.turnActive = true
     await this.persistJournal()
     this.scheduleAppend()
@@ -617,16 +629,16 @@ export class GeminiLiveController {
     this.ready = false
     this.callbacks.onReconnecting(true)
     if (this.reflecting) this.finishReflection(null)
-    if (this.turnActive || this.inputTranscript.trim() || this.outputTranscript.trim()) {
-      this.finalizeInterruptedTurn()
-      this.interruptionFinalized = false
-      this.turnActive = false
-      this.callbacks.onInterrupted()
-    }
     const generation = this.generation
     const sessionId = this.sessionId
     const oldSocket = this.socket
     try {
+      if (this.turnActive || this.inputTranscript.trim() || this.outputTranscript.trim()) {
+        this.finalizeInterruptedTurn()
+        this.interruptionFinalized = false
+        this.turnActive = false
+        this.callbacks.onInterrupted()
+      }
       const replacement = await this.connectReplacement(generation, sessionId, deadlineAt, () => {
         if (this.socket === oldSocket) this.socket = null
         oldSocket?.close()
@@ -733,14 +745,13 @@ export class GeminiLiveController {
     const output = this.outputTranscript.trim()
     const pendingImage = this.pendingImage
     const capturesImage = Boolean(
-      pendingImage?.providerSent && !pendingImage.captureAfterCurrent &&
+      pendingImage?.providerSent && !pendingImage.caption && !pendingImage.captureAfterCurrent &&
       pendingImage.generation === this.generation && pendingImage.sessionId === this.sessionId,
     )
     this.clearTurn()
     if (capturesImage) {
+      if (toolCallBoundary && !input && !output) return
       if (input || !output) {
-        this.pendingImage = null
-        this.queueJournalWrite()
         throw new Error("Gemini image turn completed without a usable caption")
       }
       const event = this.enqueueEvent("transcript", "assistant", output, "complete")
@@ -907,9 +918,7 @@ export class GeminiLiveController {
     if (input && userComplete) this.completeUserTurns += 1
     this.interruptionFinalized = true
     if (input || output) this.scheduleAppend()
-    if (this.pendingImage?.providerSent && !this.pendingImage.captureAfterCurrent) {
-      this.pendingImage = null
-      this.queueJournalWrite()
+    if (this.pendingImage?.providerSent && !this.pendingImage.caption && !this.pendingImage.captureAfterCurrent) {
       throw new Error("Gemini image turn was interrupted")
     }
     if (this.pendingImage?.providerSent && this.pendingImage.captureAfterCurrent) {
@@ -1051,7 +1060,7 @@ export class GeminiLiveController {
       return
     }
     this.pendingEvents = journal.pendingTranscripts.map((event) => ({...event}))
-    this.pendingImage = journal.pendingImage?.caption ? {...journal.pendingImage} : null
+    this.pendingImage = journal.pendingImage ? {...journal.pendingImage} : null
     const resumption = journal.resumption
     if (
       resumption &&
@@ -1135,6 +1144,12 @@ export class GeminiLiveController {
       event_id: `${this.sessionId}:${event.sequence}`,
     }))
     this.nextTranscriptSequence += this.pendingEvents.length
+    if (this.pendingImage && !this.pendingImage.caption) {
+      this.pendingImage.providerSent = false
+      this.pendingImage.captureAfterCurrent = false
+      this.pendingImage.generation = this.generation
+      this.pendingImage.sessionId = this.sessionId
+    }
     await this.persistJournal()
   }
 
@@ -1224,10 +1239,16 @@ export class GeminiLiveController {
       return
     }
     const interrupted = this.turnActive || Boolean(this.inputTranscript.trim() || this.outputTranscript.trim())
-    if (this.inputTranscript.trim() || this.outputTranscript.trim()) {
-      this.finalizeInterruptedTurn()
-    } else {
-      this.clearTurn()
+    try {
+      if (this.inputTranscript.trim() || this.outputTranscript.trim()) {
+        this.finalizeInterruptedTurn()
+      } else {
+        this.clearTurn()
+      }
+    } catch (error) {
+      this.reconnecting = false
+      this.reportError(error instanceof Error ? error : new Error(String(error)))
+      return
     }
     this.interruptionFinalized = false
     this.turnActive = false

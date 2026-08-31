@@ -320,6 +320,20 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("allows a retake after provider send failure", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    h.sockets[0].failAtSendCount = 1
+    await expect(h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"}))
+      .rejects.toThrow("Gemini image send failed")
+
+    h.sockets[0].failAtSendCount = null
+    await h.controller.sendImage({imageId: "image-2", mimeType: "image/png", data: "AQID"})
+
+    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
+    await h.controller.stop()
+  })
+
   test("Stop during snapshot never sends the stale image turn", async () => {
     let release!: () => void
     const snapshotGate = new Promise<void>((resolve) => {
@@ -345,6 +359,99 @@ describe("GeminiLiveController", () => {
     expect(h.requests.some((request) => request.url.endsWith("/snapshot/finalize"))).toBe(false)
     await h.controller.stop()
     expect(h.requests.some((request) => request.url.endsWith("/snapshot/finalize"))).toBe(true)
+  })
+
+  test("does not treat later speech as the image turn while finalization retries", async () => {
+    const h = harness({storage: new FakeStorage(), finalizeStatuses: Array(10).fill(503)})
+    await start(h)
+    await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    h.sockets[0].message({serverContent: {
+      outputTranscription: {text: "A fictional blue square."},
+      turnComplete: true,
+    }})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
+
+    completeTurn(h, "A later question.", "A later answer.")
+    await waitFor(() => h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
+      .some((request) => request.body.events.some((event: any) => event.content === "A later question.")))
+    await h.controller.stop()
+
+    expect(h.requests.filter((request) => request.url.endsWith("/snapshot/finalize"))
+      .every((request) => request.body.caption === "A fictional blue square.")).toBe(true)
+    expect(h.errors).toEqual([])
+  })
+
+  test("does not bind an older tool continuation as the image caption", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const h = harness({storage: new FakeStorage(), recallGate: gate})
+    await start(h)
+    h.sockets[0].message({toolCall: {
+      functionCalls: [{id: "before-image", name: "recall_memory", args: {query: "older question"}}],
+    }})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/recall")))
+    await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    release()
+    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse))
+    h.sockets[0].message({serverContent: {
+      outputTranscription: {text: "The older tool answer."},
+      turnComplete: true,
+    }})
+    h.sockets[0].message({serverContent: {
+      outputTranscription: {text: "The photo shows a fictional blue square."},
+      turnComplete: true,
+    }})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
+
+    expect(h.requests.find((request) => request.url.endsWith("/snapshot/finalize"))?.body.caption).toBe(
+      "The photo shows a fictional blue square.",
+    )
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("hydrates an uncaptioned image for same-id retry without duplicating its event", async () => {
+    const storage = new FakeStorage()
+    storage.values.set("openalma:gemini-session-v1", JSON.stringify({
+      version: 1,
+      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+      resumption: null,
+      pendingTranscripts: [{
+        event_id: "old-sitting:41",
+        sequence: 41,
+        event_kind: "image",
+        role: "user",
+        content: "Shared a photo.",
+        media_ref: "mentra_media/test-phone/image-1.png",
+      }],
+      pendingImage: {
+        imageId: "image-1",
+        mediaRef: "mentra_media/test-phone/image-1.png",
+        providerSent: true,
+        captureAfterCurrent: false,
+        generation: 1,
+        sessionId: "old-sitting",
+        imageSequence: 41,
+      },
+    }))
+    const h = harness({storage})
+    await start(h)
+
+    await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    h.sockets[0].message({serverContent: {
+      outputTranscription: {text: "A fictional blue square."},
+      turnComplete: true,
+    }})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
+    const imageEvents = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
+      .flatMap((request) => request.body.events)
+      .filter((event) => event.event_kind === "image")
+
+    expect(new Set(imageEvents.map((event) => event.event_id))).toEqual(new Set(["sitting-1:41"]))
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
   })
 
   test("does not bind an already-active speech turn as the image caption", async () => {
@@ -1474,6 +1581,23 @@ describe("GeminiLiveController", () => {
     malformed.sockets[0].message({goAway: {timeLeft: 50}})
     expect(malformed.errors).toEqual(["Gemini returned malformed GoAway"])
     await malformed.controller.stop()
+  })
+
+  test("socket close and GoAway report an interrupted image without an unhandled rejection", async () => {
+    for (const cause of ["close", "goAway"] as const) {
+      const h = harness({storage: new FakeStorage()})
+      await start(h)
+      h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+      await h.controller.sendImage({imageId: `image-${cause}`, mimeType: "image/png", data: "AQID"})
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "Partial caption."}}})
+
+      if (cause === "close") h.sockets[0].close()
+      else h.sockets[0].message({goAway: {timeLeft: "0.1s"}})
+      await waitFor(() => h.errors.includes("Gemini image turn was interrupted"))
+
+      expect(h.errors).toEqual(["Gemini image turn was interrupted"])
+      await h.controller.stop()
+    }
   })
 
   test("Stop during GoAway setup prevents a late replacement", async () => {
