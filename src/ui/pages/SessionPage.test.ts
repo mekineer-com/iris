@@ -1,6 +1,6 @@
 import {describe, expect, test} from "bun:test"
 
-import {imageRequest, statusText, validateImageFile, visibleConnection} from "./SessionPage"
+import {imageRequest, newImageId, statusText, validateImageFile, visibleConnection} from "./SessionPage"
 
 describe("SessionPage state projection", () => {
   test("renders every Manual listening phase", () => {
@@ -27,5 +27,9 @@ describe("SessionPage state projection", () => {
   test("encodes one validated file for the image RPC", async () => {
     const payload = await imageRequest(new File([new Uint8Array([1, 2, 3])], "photo.png", {type: "image/png"}), "image-1")
     expect(payload).toEqual({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+  })
+
+  test("creates an image id without secure-context crypto", () => {
+    expect(newImageId(1234, 0.5)).toBe("image-ya-i")
   })
 })

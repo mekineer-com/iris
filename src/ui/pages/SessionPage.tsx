@@ -60,6 +60,9 @@ export async function imageRequest(file: File, imageId: string): Promise<ImageRe
   return {imageId, mimeType, data: btoa(binary)}
 }
 
+export const newImageId = (now = Date.now(), random = Math.random()) =>
+  `image-${now.toString(36)}-${random.toString(36).slice(2)}`
+
 type PendingPhoto = {file: File; imageId: string; previewUrl: string | null}
 
 export default function SessionPage() {
@@ -195,7 +198,7 @@ export default function SessionPage() {
     discardPhoto()
     const photo = {
       file,
-      imageId: `image-${crypto.randomUUID()}`,
+      imageId: newImageId(),
       previewUrl: previewImages ? URL.createObjectURL(file) : null,
     }
     setPendingPhoto(photo)
