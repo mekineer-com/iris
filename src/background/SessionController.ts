@@ -125,6 +125,16 @@ export class SessionController {
       }),
     )
     this.unsubs.push(
+      ui.handle("openalma:pending-image", async (payload) => {
+        const action = (payload as {action?: string} | null)?.action
+        if (!this.liveController) throw new Error("Gemini controller is not available")
+        if (action === "retry") await this.liveController.retryImage()
+        else if (action === "discard") await this.liveController.discardImage()
+        else throw new Error("Unknown pending photo action")
+        return {ok: true as const}
+      }),
+    )
+    this.unsubs.push(
       ui.handle("openalma:set-mode", (payload) => {
         const mode = (payload as {mode?: SessionMode} | null)?.mode
         if (mode !== "continuous" && mode !== "manual") throw new Error("Unknown speech mode")

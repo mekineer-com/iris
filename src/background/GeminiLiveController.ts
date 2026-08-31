@@ -1,7 +1,7 @@
 import {approxBase64ByteLength} from "./audioHelpers"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import type {ImageRequest} from "../shared/channels"
-import type {SessionMode} from "../shared/types"
+import {PHOTO_RETRY_MESSAGE, type SessionMode} from "../shared/types"
 
 type StartResponse = {
   session_id: string
@@ -374,6 +374,20 @@ export class GeminiLiveController {
     this.scheduleAppend()
   }
 
+  async retryImage(): Promise<void> {
+    if (!this.pendingImage || this.pendingImage.caption || this.pendingImage.providerSent) {
+      throw new Error("No photo is waiting to retry")
+    }
+    await this.retryPendingImage()
+  }
+
+  async discardImage(): Promise<void> {
+    if (!this.pendingImage) return
+    this.pendingImage = null
+    await this.persistJournal()
+    this.callbacks.onPersistenceError(null)
+  }
+
   private sendImageTurn(socket: SocketLike, mimeType: "image/jpeg" | "image/png", data: string): void {
     socket.send(JSON.stringify({
       clientContent: {
@@ -402,10 +416,11 @@ export class GeminiLiveController {
         image_id: pending.imageId,
       }).catch(() => null)
       if (!response || response.status >= 500) {
-        this.callbacks.onPersistenceError("Photo retry deferred")
+        this.callbacks.onPersistenceError(PHOTO_RETRY_MESSAGE)
         return
       }
       if (!response.ok) {
+        await this.discardImage()
         this.reportError(new Error(`OpenAlma snapshot replay failed (${response.status})`))
         return
       }
@@ -416,6 +431,7 @@ export class GeminiLiveController {
         (mimeType !== "image/jpeg" && mimeType !== "image/png") || typeof data !== "string" ||
         !data
       ) {
+        await this.discardImage()
         this.reportError(new Error("OpenAlma snapshot replay returned invalid image data"))
         return
       }
@@ -431,11 +447,18 @@ export class GeminiLiveController {
         return
       }
       pending.providerSent = true
-      pending.captureAfterCurrent = this.turnActive || Boolean(this.inputTranscript || this.outputTranscript)
+      pending.captureAfterCurrent = this.turnActive || Boolean(
+        this.inputTranscript || this.outputTranscript || this.pendingToolCalls.size || this.deliveredToolResultIds.size,
+      )
       pending.generation = this.generation
       pending.sessionId = this.sessionId
+      if (pending.imageSequence === undefined) {
+        pending.imageSequence = this.enqueueEvent("image", "user", "Shared a photo.", undefined, pending.mediaRef).sequence
+      }
       this.turnActive = true
       await this.persistJournal()
+      this.scheduleAppend()
+      this.callbacks.onPersistenceError(null)
     } finally {
       this.imageRetrying = false
       if (retryOnReplacement) void this.retryPendingImage()

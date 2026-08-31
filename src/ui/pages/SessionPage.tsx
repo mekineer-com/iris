@@ -3,7 +3,7 @@ import {useRpc} from "@mentra/miniapp/ui"
 
 import type {Channels} from "../../shared/channels"
 import type {ImageRequest} from "../../shared/channels"
-import type {ConnectionState, ManualAction, ManualPhase, SessionMode} from "../../shared/types"
+import {PHOTO_RETRY_MESSAGE, type ConnectionState, type ManualAction, type ManualPhase, type SessionMode} from "../../shared/types"
 import {useChannel} from "../hooks/useChannel"
 
 function unreachable(value: never): never {
@@ -69,6 +69,7 @@ export default function SessionPage() {
   const modeRpc = useRpc<Channels, "openalma:set-mode">("openalma:set-mode")
   const manualRpc = useRpc<Channels, "openalma:manual-action">("openalma:manual-action")
   const imageRpc = useRpc<Channels, "openalma:image">("openalma:image")
+  const pendingImageRpc = useRpc<Channels, "openalma:pending-image">("openalma:pending-image")
   const [startPending, setStartPending] = useState(false)
   const [stopPending, setStopPending] = useState(false)
   const [modePending, setModePending] = useState(false)
@@ -200,6 +201,19 @@ export default function SessionPage() {
     if (!previewImages) void submitPhoto(photo)
   }
 
+  const handleStoredPhoto = async (action: "retry" | "discard") => {
+    setImagePending(true)
+    setRpcError(null)
+    try {
+      await pendingImageRpc({action})
+      if (action === "discard") setImageStatus(null)
+    } catch (error) {
+      setRpcError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setImagePending(false)
+    }
+  }
+
   const sittingLabel = stopping
     ? "Stopping..."
     : starting
@@ -310,6 +324,12 @@ export default function SessionPage() {
         </div>
       ) : null}
       {imageStatus ? <p role="status">{imageStatus}</p> : null}
+      {snapshot?.lastError === PHOTO_RETRY_MESSAGE ? (
+        <div className="image-review">
+          <button type="button" disabled={imagePending || !voiceReady} onClick={() => void handleStoredPhoto("retry")}>Retry</button>
+          <button type="button" disabled={imagePending} onClick={() => void handleStoredPhoto("discard")}>Discard</button>
+        </div>
+      ) : null}
       {snapshot?.lastError ? <p role="alert">{snapshot.lastError}</p> : null}
       {snapshot?.durationWarning ? <p role="status">Session duration warning</p> : null}
       {snapshot?.usageTotalTokens !== null && snapshot?.usageTotalTokens !== undefined ? (

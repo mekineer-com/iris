@@ -14,6 +14,7 @@ export interface Channels {
   "openalma:set-mode": Rpc<{mode: SessionMode}, {ok: true}>
   "openalma:manual-action": Rpc<{action: ManualAction}, {ok: true}>
   "openalma:image": Rpc<ImageRequest, {ok: true}>
+  "openalma:pending-image": Rpc<{action: "retry" | "discard"}, {ok: true}>
 }
 
 declare global {

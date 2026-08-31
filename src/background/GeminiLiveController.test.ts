@@ -2,6 +2,7 @@ import {describe, expect, spyOn, test} from "bun:test"
 
 import {GeminiLiveController} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
+import {PHOTO_RETRY_MESSAGE} from "../shared/types"
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://127.0.0.1:9999",
@@ -93,7 +94,7 @@ function harness(
     snapshotStatus?: number
     snapshotGate?: Promise<void>
     replayGates?: Promise<void>[]
-    replayStatus?: number
+    replayStatuses?: number[]
     finalizeStatuses?: number[]
     recallGate?: Promise<void>
     recallStatus?: number
@@ -118,6 +119,7 @@ function harness(
   const tokenStatuses = [...(options.tokenStatuses ?? [])]
   const finalizeStatuses = [...(options.finalizeStatuses ?? [])]
   const replayGates = [...(options.replayGates ?? [])]
+  const replayStatuses = [...(options.replayStatuses ?? [])]
   let refreshedTokens = 0
   const fetchFn = async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input)
@@ -174,7 +176,7 @@ function harness(
     }
     if (url.endsWith("/snapshot/replay")) {
       await replayGates.shift()
-      return Response.json({mime_type: "image/png", data: "AQID"}, {status: options.replayStatus ?? 200})
+      return Response.json({mime_type: "image/png", data: "AQID"}, {status: replayStatuses.shift() ?? 200})
     }
     if (url.endsWith("/snapshot")) {
       if (options.snapshotGate) await options.snapshotGate
@@ -428,12 +430,57 @@ describe("GeminiLiveController", () => {
         sessionId: "old-sitting",
       },
     }))
-    const h = harness({storage, replayStatus: 404})
+    const h = harness({storage, replayStatuses: [404]})
     await start(h)
     await waitFor(() => h.errors.length === 1)
 
     expect(h.errors).toEqual(["OpenAlma snapshot replay failed (404)"])
-    expect(h.persistenceErrors).not.toContain("Photo retry deferred")
+    expect(h.persistenceErrors).not.toContain(PHOTO_RETRY_MESSAGE)
+    expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
+    await h.controller.stop()
+  })
+
+  test("keeps a transiently failed replay for an explicit retry", async () => {
+    const storage = new FakeStorage()
+    storage.values.set("openalma:gemini-session-v1", JSON.stringify({
+      version: 1,
+      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+      resumption: null,
+      pendingTranscripts: [],
+      pendingImage: {
+        imageId: "image-1",
+        mediaRef: "mentra_media/test-phone/image-1.png",
+        providerSent: false,
+        captureAfterCurrent: false,
+        generation: 1,
+        sessionId: "old-sitting",
+      },
+    }))
+    const h = harness({storage, replayStatuses: [503, 200]})
+    await start(h)
+    await waitFor(() => h.persistenceErrors.at(-1) === PHOTO_RETRY_MESSAGE)
+    h.sockets[0].message({toolCall: {
+      functionCalls: [{id: "before-retry", name: "recall_memory", args: {query: "fictional context"}}],
+    }})
+    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse))
+    await h.controller.retryImage()
+    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    h.sockets[0].message({serverContent: {
+      outputTranscription: {text: "The memory-tool follow-up."},
+      turnComplete: true,
+    }})
+    expect(h.requests.some((request) => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    h.sockets[0].message({serverContent: {
+      outputTranscription: {text: "A fictional blue square."},
+      turnComplete: true,
+    }})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
+
+    expect(h.persistenceErrors.at(-1)).toBeNull()
+    expect(h.requests.filter((request) => request.url.endsWith("/snapshot/replay"))).toHaveLength(2)
+    expect(h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
+      .flatMap((request) => request.body.events)
+      .some((event) => event.event_kind === "image")).toBe(true)
     await h.controller.stop()
   })
 

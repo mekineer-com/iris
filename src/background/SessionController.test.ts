@@ -38,6 +38,8 @@ class FakeLive {
   startModes: string[] = []
   activities: string[][] = []
   images: unknown[] = []
+  imageRetries = 0
+  imageDiscards = 0
   activityError: Error | null = null
   startGate: Promise<void> | null = null
   stopGate: Promise<void> | null = null
@@ -63,6 +65,14 @@ class FakeLive {
 
   async sendImage(image: unknown): Promise<void> {
     this.images.push(image)
+  }
+
+  async retryImage(): Promise<void> {
+    this.imageRetries += 1
+  }
+
+  async discardImage(): Promise<void> {
+    this.imageDiscards += 1
   }
 
   async stop(graceful = false): Promise<void> {
@@ -242,6 +252,9 @@ describe("SessionController", () => {
     const image = {imageId: "image-1", mimeType: "image/png", data: "AQID"}
     await harness.session.handlers["openalma:image"](image)
     expect(harness.live.images).toEqual([image])
+    await harness.session.handlers["openalma:pending-image"]({action: "retry"})
+    await harness.session.handlers["openalma:pending-image"]({action: "discard"})
+    expect([harness.live.imageRetries, harness.live.imageDiscards]).toEqual([1, 1])
     await harness.session.handlers["openalma:stop"]({})
   })
 
