@@ -403,7 +403,7 @@ describe("GeminiLiveController", () => {
 
     expect(h.errors).toEqual([])
     expect(h.persistenceErrors).toContain("Photo description was interrupted; the photo remains pending")
-    expect(h.persistenceErrors).not.toContain("Transcript sync failed; last turns were not saved")
+    expect(h.persistenceErrors).not.toContain("Transcript sync failed; pending turns remain saved on this device")
   })
 
   test("does not treat later speech as the image turn while finalization retries", async () => {
@@ -1211,13 +1211,13 @@ describe("GeminiLiveController", () => {
     expect(h.persistenceErrors.includes(null)).toBe(false)
   })
 
-  test("final Stop failure preserves an honest unsaved-transcript warning", async () => {
+  test("final Stop failure preserves an honest local-backup warning", async () => {
     const h = harness({appendStatuses: [503, 503]})
     await start(h)
     completeTurn(h)
     await waitFor(() => h.persistenceErrors.length === 1)
     await h.controller.stop()
-    expect(h.persistenceErrors.at(-1)).toBe("Transcript sync failed; last turns were not saved")
+    expect(h.persistenceErrors.at(-1)).toBe("Transcript sync failed; pending turns remain saved on this device")
     expect(h.requests.filter((request) => request.url.endsWith("/sitting-1/end"))).toHaveLength(1)
   })
 

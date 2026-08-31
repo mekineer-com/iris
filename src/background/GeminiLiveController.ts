@@ -424,11 +424,11 @@ export class GeminiLiveController {
       trace("provider.transcript_queue.drained")
       if (!this.persistenceFatal) await this.flushPendingEvents()
       if (this.pendingEvents.length) {
-        this.callbacks.onPersistenceError("Transcript sync failed; last turns were not saved")
+        this.callbacks.onPersistenceError("Transcript sync failed; pending turns remain saved on this device")
       }
     } catch (error) {
       this.persistenceFatal = true
-      this.callbacks.onPersistenceError("Transcript sync failed; last turns were not saved")
+      this.callbacks.onPersistenceError("Transcript sync failed; pending turns remain saved on this device")
       this.reportError(error instanceof Error ? error : new Error(String(error)))
     } finally {
       this.generation += 1

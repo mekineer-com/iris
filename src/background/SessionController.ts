@@ -185,6 +185,8 @@ export class SessionController {
           timeout = setTimeout(() => {
             trace("session.earcon.timeout", {name})
             if (epoch === this.speakerEpoch) {
+              this.lastError ??= "Audio cue unavailable; voice is still active"
+              this.pushSnapshot()
               try {
                 this.session.speaker.stop()
               } catch {
@@ -196,7 +198,8 @@ export class SessionController {
         }),
       ])
     } catch {
-      /* a missing cue must not block voice */
+      this.lastError ??= "Audio cue unavailable; voice is still active"
+      this.pushSnapshot()
     } finally {
       if (timeout) clearTimeout(timeout)
     }

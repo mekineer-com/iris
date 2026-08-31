@@ -301,6 +301,7 @@ describe("SessionController", () => {
 
     expect(harness.session.speakerStops).toBe(1)
     expect(lastSnapshot(harness.session)?.connection).toBe("listening")
+    expect(lastSnapshot(harness.session)?.lastError).toBe("Audio cue unavailable; voice is still active")
   })
 
   test("a stale start earcon cannot stop its replacement sitting", async () => {
@@ -500,7 +501,7 @@ describe("SessionController", () => {
       durationWarning: false,
     })
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
-    harness.live.persistenceOnStop = "Transcript sync failed; last turns were not saved"
+    harness.live.persistenceOnStop = "Transcript sync failed; pending turns remain saved on this device"
     harness.live.fail("provider failed")
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(lastSnapshot(harness.session)?.connection).toBe("error")
@@ -789,7 +790,7 @@ describe("SessionController", () => {
     harness.session.abortGate = new Promise<void>((resolve) => {
       release = resolve
     })
-    harness.live.persistenceOnStop = "Transcript sync failed; last turns were not saved"
+    harness.live.persistenceOnStop = "Transcript sync failed; pending turns remain saved on this device"
 
     harness.live.fail("provider failed")
     await Promise.resolve()
@@ -800,7 +801,7 @@ describe("SessionController", () => {
     expect(harness.live.stopArgs).toEqual([false])
     expect(lastSnapshot(harness.session)).toMatchObject({
       connection: "idle",
-      lastError: "Transcript sync failed; last turns were not saved",
+      lastError: "Transcript sync failed; pending turns remain saved on this device",
     })
   })
 
@@ -824,14 +825,14 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "idle", lastError: null})
   })
 
-  test("graceful Stop preserves a final unsaved-transcript warning", async () => {
+  test("graceful Stop preserves a final local-backup warning", async () => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
-    harness.live.persistenceOnStop = "Transcript sync failed; last turns were not saved"
+    harness.live.persistenceOnStop = "Transcript sync failed; pending turns remain saved on this device"
     await harness.session.handlers["openalma:stop"]({})
     expect(lastSnapshot(harness.session)).toMatchObject({
       connection: "idle",
-      lastError: "Transcript sync failed; last turns were not saved",
+      lastError: "Transcript sync failed; pending turns remain saved on this device",
     })
   })
 })
