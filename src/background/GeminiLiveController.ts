@@ -400,29 +400,42 @@ export class GeminiLiveController {
         user_id: this.config.userId,
         soul_id: this.config.soulId,
         image_id: pending.imageId,
-      })
-      if (!response.ok) throw new Error(`OpenAlma snapshot replay failed (${response.status})`)
-      const replay = (await response.json()) as {mime_type?: unknown; data?: unknown}
-      const mimeType = replay.mime_type
-      const data = replay.data
+      }).catch(() => null)
+      if (!response || response.status >= 500) {
+        this.callbacks.onPersistenceError("Photo retry deferred")
+        return
+      }
+      if (!response.ok) {
+        this.reportError(new Error(`OpenAlma snapshot replay failed (${response.status})`))
+        return
+      }
+      const replay = await response.json().catch(() => null) as {mime_type?: unknown; data?: unknown} | null
+      const mimeType = replay?.mime_type
+      const data = replay?.data
       if (
         (mimeType !== "image/jpeg" && mimeType !== "image/png") || typeof data !== "string" ||
         !data
-      ) throw new Error("OpenAlma snapshot replay returned invalid image data")
+      ) {
+        this.reportError(new Error("OpenAlma snapshot replay returned invalid image data"))
+        return
+      }
       if (this.pendingImage !== pending || this.stopping) return
       if (this.socket !== socket || socket.readyState !== WS_OPEN) {
         retryOnReplacement = true
         return
       }
-      this.sendImageTurn(socket, mimeType, data)
+      try {
+        this.sendImageTurn(socket, mimeType, data)
+      } catch {
+        this.reportError(new Error("Gemini image replay send failed"))
+        return
+      }
       pending.providerSent = true
       pending.captureAfterCurrent = this.turnActive || Boolean(this.inputTranscript || this.outputTranscript)
       pending.generation = this.generation
       pending.sessionId = this.sessionId
       this.turnActive = true
       await this.persistJournal()
-    } catch {
-      this.callbacks.onPersistenceError("Photo retry failed; retrying")
     } finally {
       this.imageRetrying = false
       if (retryOnReplacement) void this.retryPendingImage()
@@ -447,7 +460,7 @@ export class GeminiLiveController {
     trace("provider.stop.begin", {graceful, turnActive: this.turnActive})
     try {
       const stoppedMidTurn = this.turnActive
-      if (this.inputTranscript.trim() || this.outputTranscript.trim()) {
+      if (stoppedMidTurn || this.inputTranscript.trim() || this.outputTranscript.trim()) {
         this.finalizeInterruptedTurn()
         if (this.pendingImage && !this.pendingImage.providerSent && !this.pendingImage.caption) {
           this.callbacks.onPersistenceError("Photo description was interrupted; the photo remains pending")
@@ -1304,7 +1317,7 @@ export class GeminiLiveController {
     }
     const interrupted = this.turnActive || Boolean(this.inputTranscript.trim() || this.outputTranscript.trim())
     try {
-      if (this.inputTranscript.trim() || this.outputTranscript.trim()) {
+      if (interrupted) {
         this.finalizeInterruptedTurn()
       } else {
         this.clearTurn()

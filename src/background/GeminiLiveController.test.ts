@@ -93,6 +93,7 @@ function harness(
     snapshotStatus?: number
     snapshotGate?: Promise<void>
     replayGates?: Promise<void>[]
+    replayStatus?: number
     finalizeStatuses?: number[]
     recallGate?: Promise<void>
     recallStatus?: number
@@ -173,7 +174,7 @@ function harness(
     }
     if (url.endsWith("/snapshot/replay")) {
       await replayGates.shift()
-      return Response.json({mime_type: "image/png", data: "AQID"})
+      return Response.json({mime_type: "image/png", data: "AQID"}, {status: options.replayStatus ?? 200})
     }
     if (url.endsWith("/snapshot")) {
       if (options.snapshotGate) await options.snapshotGate
@@ -403,14 +404,37 @@ describe("GeminiLiveController", () => {
     const h = harness({storage: new FakeStorage()})
     await start(h)
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
-    h.sockets[0].message({serverContent: {outputTranscription: {text: "A partial description."}}})
-
     await h.controller.stop()
 
     expect(h.errors).toEqual([])
     expect(h.persistenceErrors).toContain("Photo description was interrupted; the photo remains pending")
     expect(h.persistenceErrors.at(-1)).toBe("Photo description was interrupted; the photo remains pending")
     expect(h.persistenceErrors).not.toContain("Transcript sync failed; pending turns remain saved on this device")
+  })
+
+  test("fails loud when a durable photo cannot be replayed", async () => {
+    const storage = new FakeStorage()
+    storage.values.set("openalma:gemini-session-v1", JSON.stringify({
+      version: 1,
+      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+      resumption: null,
+      pendingTranscripts: [],
+      pendingImage: {
+        imageId: "missing-image",
+        mediaRef: "mentra_media/test-phone/missing-image.png",
+        providerSent: false,
+        captureAfterCurrent: false,
+        generation: 1,
+        sessionId: "old-sitting",
+      },
+    }))
+    const h = harness({storage, replayStatus: 404})
+    await start(h)
+    await waitFor(() => h.errors.length === 1)
+
+    expect(h.errors).toEqual(["OpenAlma snapshot replay failed (404)"])
+    expect(h.persistenceErrors).not.toContain("Photo retry deferred")
+    await h.controller.stop()
   })
 
   test("does not treat later speech as the image turn while finalization retries", async () => {
@@ -1707,7 +1731,6 @@ describe("GeminiLiveController", () => {
       await start(h)
       h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
       await h.controller.sendImage({imageId: `image-${cause}`, mimeType: "image/png", data: "AQID"})
-      h.sockets[0].message({serverContent: {outputTranscription: {text: "Partial caption."}}})
 
       if (cause === "close") h.sockets[0].close()
       else h.sockets[0].message({goAway: {timeLeft: "0.1s"}})
