@@ -107,8 +107,6 @@ class TokenRefreshError extends Error {
   }
 }
 
-class ImageTurnInterruptedError extends Error {}
-
 export class GeminiLiveController {
   private readonly fetchFn: typeof fetch
   private readonly openSocket: (url: string) => SocketLike
@@ -138,6 +136,7 @@ export class GeminiLiveController {
   private completeUserTurns = 0
   private pendingEvents: TranscriptEvent[] = []
   private pendingImage: PendingImage | null = null
+  private imageRetrying = false
   private appendTail: Promise<void> = Promise.resolve()
   private persistenceFatal = false
   private journalUnavailable = false
@@ -185,6 +184,7 @@ export class GeminiLiveController {
     this.completeUserTurns = 0
     this.pendingEvents = []
     this.pendingImage = null
+    this.imageRetrying = false
     this.appendTail = Promise.resolve()
     this.persistenceFatal = false
     this.journalUnavailable = false
@@ -360,18 +360,7 @@ export class GeminiLiveController {
     if (this.journalUnavailable) throw new Error("Local image journal unavailable")
 
     try {
-      socket.send(JSON.stringify({
-        clientContent: {
-          turns: [{
-            role: "user",
-            parts: [
-              {inlineData: {data: image.data, mimeType: image.mimeType}},
-              {text: "Describe this image."},
-            ],
-          }],
-          turnComplete: true,
-        },
-      }))
+      this.sendImageTurn(socket, image.mimeType, image.data)
     } catch {
       throw new Error("Gemini image send failed")
     }
@@ -383,6 +372,61 @@ export class GeminiLiveController {
     this.turnActive = true
     await this.persistJournal()
     this.scheduleAppend()
+  }
+
+  private sendImageTurn(socket: SocketLike, mimeType: "image/jpeg" | "image/png", data: string): void {
+    socket.send(JSON.stringify({
+      clientContent: {
+        turns: [{
+          role: "user",
+          parts: [{inlineData: {data, mimeType}}, {text: "Describe this image."}],
+        }],
+        turnComplete: true,
+      },
+    }))
+  }
+
+  private async retryPendingImage(): Promise<void> {
+    const pending = this.pendingImage
+    const socket = this.socket
+    if (
+      !pending || pending.caption || pending.providerSent || this.imageRetrying || this.stopping ||
+      !this.ready || !socket || socket.readyState !== WS_OPEN
+    ) return
+    this.imageRetrying = true
+    let retryOnReplacement = false
+    try {
+      const response = await this.request(`/integration/mentra/session/${this.sessionId}/snapshot/replay`, {
+        user_id: this.config.userId,
+        soul_id: this.config.soulId,
+        image_id: pending.imageId,
+      })
+      if (!response.ok) throw new Error(`OpenAlma snapshot replay failed (${response.status})`)
+      const replay = (await response.json()) as {mime_type?: unknown; data?: unknown}
+      const mimeType = replay.mime_type
+      const data = replay.data
+      if (
+        (mimeType !== "image/jpeg" && mimeType !== "image/png") || typeof data !== "string" ||
+        !data
+      ) throw new Error("OpenAlma snapshot replay returned invalid image data")
+      if (this.pendingImage !== pending || this.stopping) return
+      if (this.socket !== socket || socket.readyState !== WS_OPEN) {
+        retryOnReplacement = true
+        return
+      }
+      this.sendImageTurn(socket, mimeType, data)
+      pending.providerSent = true
+      pending.captureAfterCurrent = this.turnActive || Boolean(this.inputTranscript || this.outputTranscript)
+      pending.generation = this.generation
+      pending.sessionId = this.sessionId
+      this.turnActive = true
+      await this.persistJournal()
+    } catch {
+      this.callbacks.onPersistenceError("Photo retry failed; retrying")
+    } finally {
+      this.imageRetrying = false
+      if (retryOnReplacement) void this.retryPendingImage()
+    }
   }
 
   private sendAudioToSocket(socket: SocketLike, base64Pcm: string): void {
@@ -404,10 +448,8 @@ export class GeminiLiveController {
     try {
       const stoppedMidTurn = this.turnActive
       if (this.inputTranscript.trim() || this.outputTranscript.trim()) {
-        try {
-          this.finalizeInterruptedTurn()
-        } catch (error) {
-          if (!(error instanceof ImageTurnInterruptedError)) throw error
+        this.finalizeInterruptedTurn()
+        if (this.pendingImage && !this.pendingImage.providerSent && !this.pendingImage.caption) {
           this.callbacks.onPersistenceError("Photo description was interrupted; the photo remains pending")
         }
         this.interruptionFinalized = false
@@ -536,6 +578,7 @@ export class GeminiLiveController {
             this.ready = true
             this.flushToolResponses()
             if (this.pendingEvents.length || this.pendingImage?.caption) this.scheduleAppend()
+            void this.retryPendingImage()
             trace("provider.setup_complete", {resumed: Boolean(handle)})
             finish()
           }
@@ -641,7 +684,6 @@ export class GeminiLiveController {
     const oldSocket = this.socket
     try {
       if (this.turnActive || this.inputTranscript.trim() || this.outputTranscript.trim()) {
-        // An interrupted photo is fatal; the catch below reports it instead of opening a replacement socket.
         this.finalizeInterruptedTurn()
         this.interruptionFinalized = false
         this.turnActive = false
@@ -737,6 +779,8 @@ export class GeminiLiveController {
       this.reconnectAttempted = false
       if (this.latestUsageTotal !== null) this.callbacks.onUsage(this.latestUsageTotal)
       this.callbacks.onTurnComplete(!hasToolCall)
+      // Barge-in marks the photo unsent; this boundary is the first safe same-socket retry point.
+      void this.retryPendingImage()
     }
   }
 
@@ -758,7 +802,15 @@ export class GeminiLiveController {
     )
     this.clearTurn()
     if (capturesImage) {
-      if (toolCallBoundary && !input && !output) return
+      if (toolCallBoundary) {
+        if (input) {
+          this.enqueueEvent("transcript", "user", input, "complete")
+          this.completeUserTurns += 1
+        }
+        if (output) this.enqueueEvent("transcript", "assistant", output, "complete")
+        if (input || output) this.scheduleAppend()
+        return
+      }
       if (!output) throw new Error("Gemini image turn completed without a usable caption")
       if (input) {
         this.enqueueEvent("transcript", "user", input, "complete")
@@ -929,7 +981,9 @@ export class GeminiLiveController {
     this.interruptionFinalized = true
     if (input || output) this.scheduleAppend()
     if (this.pendingImage?.providerSent && !this.pendingImage.caption && !this.pendingImage.captureAfterCurrent) {
-      throw new ImageTurnInterruptedError("Gemini image turn was interrupted")
+      this.pendingImage.providerSent = false
+      this.queueJournalWrite()
+      this.callbacks.onPersistenceError("Photo description was interrupted; retrying")
     }
     if (this.pendingImage?.providerSent && this.pendingImage.captureAfterCurrent) {
       this.pendingImage.captureAfterCurrent = false
@@ -1000,7 +1054,7 @@ export class GeminiLiveController {
       await this.finalizePendingImage()
     }
     await this.finalizePendingImage()
-    if (!this.pendingEvents.length && !this.pendingImage?.caption && !this.journalUnavailable) {
+    if (!this.pendingEvents.length && !this.pendingImage && !this.journalUnavailable) {
       this.callbacks.onPersistenceError(null)
     }
   }
