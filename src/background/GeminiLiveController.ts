@@ -722,7 +722,6 @@ export class GeminiLiveController {
   private async rotateForGoAway(): Promise<void> {
     if (!this.goAwayPending || this.reconnecting || this.stopping) return
     const deadlineAt = this.goAwayDeadlineAt
-    this.goAwayPending = false
     this.clearGoAway()
     if (!this.resumptionHandle) {
       this.reportError(new Error("Gemini requested rollover without a resumable handle"))
@@ -1384,58 +1383,57 @@ export class GeminiLiveController {
     if (this.reconnecting) return
     this.clearGoAway()
     this.reconnecting = true
-    trace("provider.socket.closed", {resumable: Boolean(this.resumptionHandle)})
-    this.socket = null
-    this.ready = false
-    if (this.reflecting) {
-      this.finishReflection(null)
-      this.reconnecting = false
-      return
-    }
-    const interrupted = this.turnActive || Boolean(this.inputTranscript.trim() || this.outputTranscript.trim())
     try {
-      if (interrupted) {
-        this.finalizeInterruptedTurn()
-      } else {
-        this.clearTurn()
+      trace("provider.socket.closed", {resumable: Boolean(this.resumptionHandle)})
+      this.socket = null
+      this.ready = false
+      if (this.reflecting) {
+        this.finishReflection(null)
+        return
       }
-    } catch (error) {
-      this.reconnecting = false
-      this.reportError(error instanceof Error ? error : new Error(String(error)))
-      return
-    }
-    this.interruptionFinalized = false
-    this.turnActive = false
-    if (!this.resumptionHandle && this.pendingImage?.providerSent && !this.pendingImage.caption) {
-      this.pendingImage.providerSent = false
-      this.pendingImage.captureAfterCurrent = false
-      this.queueJournalWrite()
-    }
-    if (interrupted) this.callbacks.onInterrupted()
-    if ((this.resumptionHandle || !this.hasCompletedProviderTurn) && !this.reconnectAttempted) {
-      this.reconnectAttempted = true
-      this.callbacks.onReconnecting(true)
-      const generation = this.generation
-      const sessionId = this.sessionId
+      const interrupted = this.turnActive || Boolean(this.inputTranscript.trim() || this.outputTranscript.trim())
       try {
-        const replacement = await this.connectReplacement(generation, sessionId)
-        if (replacement.readyState !== WS_OPEN) {
-          throw new Error("Gemini replacement socket closed after setup")
+        if (interrupted) {
+          this.finalizeInterruptedTurn()
+        } else {
+          this.clearTurn()
         }
-        this.callbacks.onReconnecting(false)
-        this.reconnecting = false
-        return
       } catch (error) {
-        this.callbacks.onReconnecting(false)
-        this.reconnecting = false
-        if (!this.stopPromise && generation === this.generation && sessionId === this.sessionId) {
-          this.reportError(error instanceof Error ? error : new Error(String(error)))
-        }
+        this.reportError(error instanceof Error ? error : new Error(String(error)))
         return
       }
+      this.interruptionFinalized = false
+      this.turnActive = false
+      if (!this.resumptionHandle && this.pendingImage?.providerSent && !this.pendingImage.caption) {
+        this.pendingImage.providerSent = false
+        this.pendingImage.captureAfterCurrent = false
+        this.queueJournalWrite()
+      }
+      if (interrupted) this.callbacks.onInterrupted()
+      if ((this.resumptionHandle || !this.hasCompletedProviderTurn) && !this.reconnectAttempted) {
+        this.reconnectAttempted = true
+        this.callbacks.onReconnecting(true)
+        const generation = this.generation
+        const sessionId = this.sessionId
+        try {
+          const replacement = await this.connectReplacement(generation, sessionId)
+          if (replacement.readyState !== WS_OPEN) {
+            throw new Error("Gemini replacement socket closed after setup")
+          }
+          this.callbacks.onReconnecting(false)
+          return
+        } catch (error) {
+          this.callbacks.onReconnecting(false)
+          if (!this.stopPromise && generation === this.generation && sessionId === this.sessionId) {
+            this.reportError(error instanceof Error ? error : new Error(String(error)))
+          }
+          return
+        }
+      }
+      this.reportError(new Error("Gemini connection closed"))
+    } finally {
+      this.reconnecting = false
     }
-    this.reconnecting = false
-    this.reportError(new Error("Gemini connection closed"))
   }
 
   private async connectReplacement(

@@ -1,8 +1,7 @@
 import {useEffect, useRef, useState} from "react"
 import {useRpc} from "@mentra/miniapp/ui"
 
-import type {Channels} from "../../shared/channels"
-import type {ImageRequest} from "../../shared/channels"
+import type {Channels, ImageRequest} from "../../shared/channels"
 import {PHOTO_RETRY_MESSAGE, type ConnectionState, type ManualAction, type ManualPhase, type SessionMode} from "../../shared/types"
 import {useChannel} from "../hooks/useChannel"
 
