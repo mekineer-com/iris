@@ -1058,7 +1058,7 @@ describe("GeminiLiveController", () => {
     await waitFor(
       () => h.requests
         .filter((request) => request.url.endsWith("/transcripts/append"))
-        .flatMap((request) => request.body.events).length === 4,
+        .flatMap((request) => request.body.events).length === 6,
     )
     const events = h.requests
       .filter((request) => request.url.endsWith("/transcripts/append"))
@@ -1068,6 +1068,8 @@ describe("GeminiLiveController", () => {
       ["assistant", "I remembered it.", "complete"],
       ["user", "ordinary follow-up", "complete"],
       ["assistant", "ordinary answer", "complete"],
+      ["user", "Transcript unavailable.", undefined],
+      ["assistant", "stale license", "complete"],
     ])
     expect(h.errors).toEqual(["Gemini completed a turn without both transcriptions"])
     await h.controller.stop()
@@ -1342,7 +1344,11 @@ describe("GeminiLiveController", () => {
     await start(h)
     h.sockets[0].message({serverContent: {inputTranscription: {text: "only one side"}, turnComplete: true}})
     expect(h.errors).toEqual(["Gemini completed a turn without both transcriptions"])
-    expect(h.requests.some((request) => request.url.endsWith("/transcripts/append"))).toBe(false)
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+    expect(h.requests.find((request) => request.url.endsWith("/transcripts/append"))?.body.events).toEqual([
+      expect.objectContaining({event_kind: "transcript", role: "user", content: "only one side"}),
+      expect.objectContaining({event_kind: "transcript_gap", role: "assistant", content: "Transcript unavailable."}),
+    ])
     await h.controller.stop()
   })
 

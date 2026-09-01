@@ -12,7 +12,7 @@ in `mentra-os/.git/info/exclude`.
 
 MentraOS `package.json` lists `miniapps/*` as workspaces. Keep OpenAlma out of that glob with a local parent line `!miniapps/openalma` (do not push that MentraOS edit upstream). Otherwise `bun install` here rewrites MentraOS `bun.lock` and links the in-tree SDK instead of npm `0.3.0-dev.1`.
 
-The MiniApp connects OpenAlma's authenticated Mentra bootstrap to Gemini Live native audio and sitting-scoped durable transcripts. Continuous mode uses provider VAD. Manual mode records one memory-only take, then waits for `Send` or `Redo`; `Done` never sends by itself. Temporary transcript-sync failure remains visible and retries without ending voice; contract rejection ends the sitting. Graceful Stop may play and persist one short first-person reflection after two completed user turns.
+The MiniApp connects OpenAlma's authenticated Mentra bootstrap to Gemini Live native audio and sitting-scoped durable transcripts. Continuous mode uses provider VAD. Manual mode records one memory-only take, then waits for `Send` or `Redo`; `Done` never sends by itself. Persistent Iris-local switches independently mute microphone capture or disable camera actions without ending the sitting. Temporary transcript-sync failure remains visible and retries without ending voice; a provider turn missing usable transcript text records a non-conversational gap marker before failing loud. Graceful Stop may play and persist one short first-person reflection after two completed user turns.
 
 Before changing the Gemini wire or diagnosing provider behavior, read
 [`GEMINI_LIVE.md`](GEMINI_LIVE.md). It pins Iris's model-specific contract,

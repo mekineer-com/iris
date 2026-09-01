@@ -32,7 +32,7 @@ export type GeminiCallbacks = {
 type TranscriptEvent = {
   event_id: string
   sequence: number
-  event_kind: "transcript" | "sitting_summary" | "image"
+  event_kind: "transcript" | "sitting_summary" | "image" | "transcript_gap"
   role: "user" | "assistant"
   content: string
   status?: "complete" | "interrupted"
@@ -870,7 +870,15 @@ export class GeminiLiveController {
         if (input || output) this.scheduleAppend()
         return
       }
-      if (!output) throw new Error("Gemini image turn completed without a usable caption")
+      if (!output) {
+        if (input) {
+          this.enqueueEvent("transcript", "user", input, "complete")
+          this.completeUserTurns += 1
+        }
+        this.enqueueEvent("transcript_gap", "assistant", "Transcript unavailable.")
+        this.scheduleAppend()
+        throw new Error("Gemini image turn completed without a usable caption")
+      }
       if (input) {
         this.enqueueEvent("transcript", "user", input, "complete")
         this.completeUserTurns += 1
@@ -882,9 +890,23 @@ export class GeminiLiveController {
       this.scheduleAppend()
       return
     }
-    if (!input && !output) throw new Error("Gemini completed a turn without transcription")
+    if (!input && !output) {
+      this.enqueueEvent("transcript_gap", "user", "Transcript unavailable.")
+      this.enqueueEvent("transcript_gap", "assistant", "Transcript unavailable.")
+      this.scheduleAppend()
+      throw new Error("Gemini completed a turn without transcription")
+    }
     const followsToolResult = !input && output && this.deliveredToolResultIds.size > 0
     if ((!input || !output) && !(input && toolCallBoundary) && !followsToolResult) {
+      if (input) {
+        this.enqueueEvent("transcript", "user", input, "complete")
+        this.completeUserTurns += 1
+      } else {
+        this.enqueueEvent("transcript_gap", "user", "Transcript unavailable.")
+      }
+      if (output) this.enqueueEvent("transcript", "assistant", output, "complete")
+      else this.enqueueEvent("transcript_gap", "assistant", "Transcript unavailable.")
+      this.scheduleAppend()
       throw new Error("Gemini completed a turn without both transcriptions")
     }
     if (input) {
@@ -1236,6 +1258,10 @@ export class GeminiLiveController {
           const parts = typeof event.media_ref === "string" ? event.media_ref.split("/") : []
           return event.role === "user" && event.status === undefined && event.content === "Shared a photo." &&
             parts.length === 3 && parts[0] === "mentra_media" && !parts.includes("..")
+        }
+        if (event.event_kind === "transcript_gap") {
+          return (event.role === "user" || event.role === "assistant") &&
+            event.status === undefined && event.media_ref === undefined && event.content === "Transcript unavailable."
         }
         return event.event_kind === "sitting_summary" && event.role === "assistant" &&
           event.status === undefined && event.media_ref === undefined
