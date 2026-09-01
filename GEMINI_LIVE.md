@@ -56,7 +56,7 @@ clears the handle. The handle is provider state, never transcript content.
 
 ### Deliberate image turn
 
-Iris durably snapshots the image in OpenAlma before sending:
+Iris durably snapshots the image in OpenAlma before sending; snapshot upload and replay each allow 120 seconds:
 
 ```json
 {

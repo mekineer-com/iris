@@ -476,6 +476,39 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("snapshot finishing after its pending photo was discarded does not resurrect it", async () => {
+    let release!: () => void
+    const snapshotGate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const storage = new FakeStorage()
+    storage.values.set("openalma:gemini-session-v1", JSON.stringify({
+      version: 1,
+      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+      resumption: null,
+      pendingTranscripts: [],
+      pendingImage: {
+        imageId: "image-1",
+        mediaRef: "mentra_media/test-phone/image-1.png",
+        providerSent: false,
+        captureAfterCurrent: false,
+        generation: 1,
+        sessionId: "old-sitting",
+      },
+    }))
+    const h = harness({storage, snapshotGate, replayStatuses: [503]})
+    await start(h)
+    await waitFor(() => h.photoRetryChanges.at(-1) === true)
+    const sending = h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    await waitFor(() => h.requests.filter((request) => request.url.endsWith("/snapshot")).length === 1)
+    await h.controller.discardImage()
+    release()
+    await sending
+
+    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(0)
+    await h.controller.stop()
+  })
+
   test("reconnect during journal write sends one photo", async () => {
     let release!: () => void
     const storage = new FakeStorage()
@@ -2082,9 +2115,13 @@ describe("GeminiLiveController", () => {
 
   test("heartbeat surfaces a background image-memory failure", async () => {
     const message = "Photo memory processing failed; the original remains saved."
-    const h = harness({heartbeatMs: 5, heartbeatBody: {ok: true, background_error: message}})
+    const heartbeatBody: {ok: boolean; background_error?: string} = {ok: true, background_error: message}
+    const h = harness({heartbeatMs: 5, heartbeatBody})
     await start(h)
     await waitFor(() => h.persistenceErrors.includes(message))
+    const seen = h.persistenceErrors.length
+    delete heartbeatBody.background_error
+    await waitFor(() => h.persistenceErrors.slice(seen).includes(null))
     await h.controller.stop()
   })
 

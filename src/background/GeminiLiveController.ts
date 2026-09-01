@@ -130,6 +130,7 @@ export class GeminiLiveController {
   private stopping = false
   private ended = true
   private reconnectAttempted = false
+  private backgroundImageErrorVisible = false
   private reconnecting = false
   private errorReported = false
   private inputTranscript = ""
@@ -315,6 +316,7 @@ export class GeminiLiveController {
 
     const generation = this.generation
     const sessionId = this.sessionId
+    const pendingBeforeUpload = this.pendingImage
     const response = await this.request(`/integration/mentra/session/${this.sessionId}/snapshot`, {
       user_id: this.config.userId,
       soul_id: this.config.soulId,
@@ -328,6 +330,7 @@ export class GeminiLiveController {
     ) {
       throw new Error("Photo send cancelled")
     }
+    if (this.pendingImage !== pendingBeforeUpload) return
     const result = (await response.json()) as {media_ref?: unknown}
     const mediaRef = typeof result.media_ref === "string" ? result.media_ref.trim() : ""
     if (!mediaRef.startsWith("mentra_media/") || mediaRef.includes("..")) {
@@ -421,7 +424,7 @@ export class GeminiLiveController {
         user_id: this.config.userId,
         soul_id: this.config.soulId,
         image_id: pending.imageId,
-      }).catch(() => null)
+      }, SNAPSHOT_TIMEOUT_MS).catch(() => null)
       if (!response || response.status >= 500) {
         this.callbacks.onPhotoRetryChange(true)
         this.callbacks.onPersistenceError(PHOTO_RETRY_MESSAGE)
@@ -1509,7 +1512,11 @@ export class GeminiLiveController {
         this.lastHeartbeatSuccessAt = Date.now()
         const body = await response.json().catch(() => null)
         if (typeof body?.background_error === "string" && body.background_error) {
+          this.backgroundImageErrorVisible = true
           this.callbacks.onPersistenceError(body.background_error)
+        } else if (this.backgroundImageErrorVisible) {
+          this.backgroundImageErrorVisible = false
+          this.callbacks.onPersistenceError(null)
         }
       }
     } catch (error) {
