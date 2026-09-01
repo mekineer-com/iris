@@ -284,7 +284,7 @@ describe("GeminiLiveController", () => {
       clientContent: {
         turns: [{role: "user", parts: [
           {inlineData: {data: "AQID", mimeType: "image/png"}},
-          {text: "Describe this image."},
+          {text: "Describe this image.  What do you want to remember about it?"},
         ]}],
         turnComplete: true,
       },

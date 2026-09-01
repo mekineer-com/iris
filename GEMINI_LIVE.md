@@ -65,7 +65,7 @@ Iris durably snapshots the image in OpenAlma before sending:
       "role": "user",
       "parts": [
         {"inlineData": {"data": "<base64>", "mimeType": "image/jpeg"}},
-        {"text": "Describe this image."}
+        {"text": "Describe this image.  What do you want to remember about it?"}
       ]
     }],
     "turnComplete": true

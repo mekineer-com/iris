@@ -400,7 +400,7 @@ export class GeminiLiveController {
       clientContent: {
         turns: [{
           role: "user",
-          parts: [{inlineData: {data, mimeType}}, {text: "Describe this image."}],
+          parts: [{inlineData: {data, mimeType}}, {text: "Describe this image.  What do you want to remember about it?"}],
         }],
         turnComplete: true,
       },
