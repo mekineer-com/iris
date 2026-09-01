@@ -9,6 +9,8 @@ export interface SessionSnapshot {
   mode: SessionMode
   connection: ConnectionState
   manualPhase: ManualPhase
+  microphoneEnabled: boolean
+  cameraEnabled: boolean
   photoRetryPending: boolean
   lastError: string | null
   usageTotalTokens: number | null

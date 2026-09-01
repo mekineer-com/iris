@@ -36,6 +36,8 @@ export type SessionControllerOptions = {
 const ACTIVE: ReadonlySet<ConnectionState> = new Set(["starting", "reconnecting", "listening", "speaking"])
 const MAX_MANUAL_AUDIO_BYTES = 16000 * 2 * 120
 const MANUAL_LIMIT_MESSAGE = "Manual recording reached 120-second limit"
+const MICROPHONE_ENABLED_KEY = "openalma.microphone-enabled"
+const CAMERA_ENABLED_KEY = "openalma.camera-enabled"
 
 function trace(event: string, detail: Record<string, unknown> = {}): void {
   if (process.env.NODE_ENV === "test") return
@@ -50,6 +52,9 @@ export class SessionController {
   private mode: SessionMode = "continuous"
   private connection: ConnectionState = "idle"
   private manualPhase: ManualPhase = "idle"
+  private microphoneEnabled = true
+  private cameraEnabled = true
+  private preferencesLoaded: Promise<void> = Promise.resolve()
   private photoRetryPending = false
   private manualAudio: string[] = []
   private manualAudioBytes = 0
@@ -108,6 +113,7 @@ export class SessionController {
     }
 
     this.send = ui.send
+    this.preferencesLoaded = this.loadPreferences()
     this.unsubs.push(ui.onOpen(() => this.pushSnapshot()))
     this.unsubs.push(
       ui.handle("openalma:start", async (payload) => {
@@ -149,6 +155,44 @@ export class SessionController {
       }),
     )
     this.unsubs.push(
+      ui.handle("openalma:set-capabilities", async (payload) => {
+        await this.preferencesLoaded
+        const next = payload as {
+          microphoneEnabled?: unknown
+          cameraEnabled?: unknown
+        } | null
+        if (
+          (next?.microphoneEnabled === undefined && next?.cameraEnabled === undefined) ||
+          (next.microphoneEnabled !== undefined && typeof next.microphoneEnabled !== "boolean") ||
+          (next.cameraEnabled !== undefined && typeof next.cameraEnabled !== "boolean")
+        ) {
+          throw new Error("Invalid capability setting")
+        }
+        if (next.microphoneEnabled !== undefined) {
+          await this.session.storage.set(
+            MICROPHONE_ENABLED_KEY,
+            next.microphoneEnabled ? "1" : "0",
+          )
+          this.microphoneEnabled = next.microphoneEnabled
+          if (!this.microphoneEnabled && this.micUnsub) this.stopMic()
+          else if (
+            this.microphoneEnabled &&
+            (this.connection === "listening" ||
+              this.connection === "speaking" ||
+              this.connection === "reconnecting")
+          ) {
+            this.subscribeMic()
+          }
+        }
+        if (next.cameraEnabled !== undefined) {
+          await this.session.storage.set(CAMERA_ENABLED_KEY, next.cameraEnabled ? "1" : "0")
+          this.cameraEnabled = next.cameraEnabled
+        }
+        this.pushSnapshot()
+        return {ok: true as const}
+      }),
+    )
+    this.unsubs.push(
       ui.handle("openalma:manual-action", (payload) => {
         const action = (payload as {action?: ManualAction} | null)?.action
         if (!action || !["talk", "done", "redo", "send"].includes(action)) {
@@ -160,6 +204,8 @@ export class SessionController {
     )
     this.unsubs.push(
       ui.handle("openalma:image", async (payload) => {
+        await this.preferencesLoaded
+        if (!this.cameraEnabled) throw new Error("Camera is disabled")
         if (this.connection !== "listening" && this.connection !== "speaking") {
           throw new Error("Start Iris before sending a photo")
         }
@@ -221,6 +267,8 @@ export class SessionController {
       mode: this.mode,
       connection: this.connection,
       manualPhase: this.manualPhase,
+      microphoneEnabled: this.microphoneEnabled,
+      cameraEnabled: this.cameraEnabled,
       photoRetryPending: this.photoRetryPending,
       lastError: this.lastError,
       usageTotalTokens: this.usageTotalTokens,
@@ -308,12 +356,15 @@ export class SessionController {
       trace("session.start_earcon.begin")
       await this.playEarcon("listen-start")
       trace("session.start_earcon.end")
+      await this.preferencesLoaded
       if (generation !== this.startGeneration) {
         await this.stopLiveController(false, controller)
         return
       }
-      this.subscribeMic()
-      trace("session.microphone.subscribed")
+      if (this.microphoneEnabled) {
+        this.subscribeMic()
+        trace("session.microphone.subscribed")
+      }
       if (generation !== this.startGeneration) {
         this.stopMic()
         await this.stopLiveController(false, controller)
@@ -443,6 +494,7 @@ export class SessionController {
 
   private subscribeMic(): void {
     this.stopMic()
+    this.sawMicFrame = false
     this.micUnsub = this.session.mic.onAudioChunk((chunk) => {
       this.handlePcmFrame(chunk)
     })
@@ -450,6 +502,7 @@ export class SessionController {
   }
 
   private stopMic(): void {
+    this.clearFirstPcmTimeout()
     if (this.micUnsub) {
       try {
         this.micUnsub()
@@ -612,6 +665,9 @@ export class SessionController {
   private handleManualAction(action: ManualAction): void {
     if (this.mode !== "manual") throw new Error("Manual controls require Manual mode")
     if (this.connection !== "listening") throw new Error("Manual controls require a ready session")
+    if ((action === "talk" || action === "redo") && !this.microphoneEnabled) {
+      throw new Error("Microphone is disabled")
+    }
     if (action === "talk") {
       if (this.manualPhase !== "idle") throw new Error("Manual recording is already active")
       this.clearManualAudio()
@@ -641,6 +697,16 @@ export class SessionController {
   private clearManualAudio(): void {
     this.manualAudio = []
     this.manualAudioBytes = 0
+  }
+
+  private async loadPreferences(): Promise<void> {
+    const [microphone, camera] = await Promise.all([
+      this.session.storage.get(MICROPHONE_ENABLED_KEY),
+      this.session.storage.get(CAMERA_ENABLED_KEY),
+    ])
+    this.microphoneEnabled = microphone !== "0"
+    this.cameraEnabled = camera !== "0"
+    this.pushSnapshot()
   }
 
   private resetManualState(): void {

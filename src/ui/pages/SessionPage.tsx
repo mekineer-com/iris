@@ -78,12 +78,14 @@ export default function SessionPage() {
   const startRpc = useRpc<Channels, "openalma:start">("openalma:start")
   const stopRpc = useRpc<Channels, "openalma:stop">("openalma:stop")
   const modeRpc = useRpc<Channels, "openalma:set-mode">("openalma:set-mode")
+  const capabilitiesRpc = useRpc<Channels, "openalma:set-capabilities">("openalma:set-capabilities")
   const manualRpc = useRpc<Channels, "openalma:manual-action">("openalma:manual-action")
   const imageRpc = useRpc<Channels, "openalma:image">("openalma:image")
   const pendingImageRpc = useRpc<Channels, "openalma:pending-image">("openalma:pending-image")
   const [startPending, setStartPending] = useState(false)
   const [stopPending, setStopPending] = useState(false)
   const [modePending, setModePending] = useState(false)
+  const [capabilitiesPending, setCapabilitiesPending] = useState(false)
   const [manualPending, setManualPending] = useState(false)
   const [previewImages, setPreviewImages] = useState(false)
   const [speakPhotoDescriptions, setSpeakPhotoDescriptions] = useState(false)
@@ -109,6 +111,8 @@ export default function SessionPage() {
   const mode = snapshot?.mode ?? "continuous"
   const manualPhase = snapshot?.manualPhase ?? "idle"
   const photoRetryPending = snapshot?.photoRetryPending ?? false
+  const microphoneEnabled = snapshot?.microphoneEnabled ?? true
+  const cameraEnabled = snapshot?.cameraEnabled ?? true
   const visible = visibleConnection(connection, startPending, stopPending)
   const starting = visible === "starting"
   const stopping = visible === "stopping"
@@ -172,6 +176,21 @@ export default function SessionPage() {
       setRpcError(error instanceof Error ? error.message : String(error))
     } finally {
       setManualPending(false)
+    }
+  }
+
+  const onCapability = async (
+    capability: "microphoneEnabled" | "cameraEnabled",
+    enabled: boolean,
+  ) => {
+    setRpcError(null)
+    setCapabilitiesPending(true)
+    try {
+      await capabilitiesRpc({[capability]: enabled})
+    } catch (error) {
+      setRpcError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setCapabilitiesPending(false)
     }
   }
 
@@ -271,6 +290,24 @@ export default function SessionPage() {
           <option value="manual">Manual</option>
         </select>
       </label>
+      <label className="preview-control">
+        <input
+          type="checkbox"
+          checked={microphoneEnabled}
+          disabled={capabilitiesPending || stopping}
+          onChange={(event) => void onCapability("microphoneEnabled", event.target.checked)}
+        />
+        Microphone enabled
+      </label>
+      <label className="preview-control">
+        <input
+          type="checkbox"
+          checked={cameraEnabled}
+          disabled={capabilitiesPending || stopping}
+          onChange={(event) => void onCapability("cameraEnabled", event.target.checked)}
+        />
+        Camera enabled
+      </label>
       <section className="controls" aria-label="Voice controls">
         <button
           type="button"
@@ -283,7 +320,7 @@ export default function SessionPage() {
         {mode === "manual" && voiceReady ? (
           <div className="manual-controls">
             {manualPhase === "idle" ? (
-              <button type="button" disabled={manualDisabled} onClick={() => void onManual("talk")}>
+              <button type="button" disabled={manualDisabled || !microphoneEnabled} onClick={() => void onManual("talk")}>
                 Talk
               </button>
             ) : null}
@@ -302,7 +339,7 @@ export default function SessionPage() {
                 <button type="button" disabled={manualDisabled} onClick={() => void onManual("send")}>
                   Send
                 </button>
-                <button type="button" disabled={manualDisabled} onClick={() => void onManual("redo")}>
+                <button type="button" disabled={manualDisabled || !microphoneEnabled} onClick={() => void onManual("redo")}>
                   Redo
                 </button>
               </>
@@ -330,7 +367,7 @@ export default function SessionPage() {
             type="file"
             accept="image/*"
             capture="environment"
-            disabled={!voiceReady || imagePending || stopping || photoRetryPending}
+            disabled={!cameraEnabled || !voiceReady || imagePending || stopping || photoRetryPending}
             onChange={(event) => onImagePicked(event.currentTarget)}
           />
         </label>
@@ -339,7 +376,7 @@ export default function SessionPage() {
           <input
             type="file"
             accept="image/*"
-            disabled={!voiceReady || imagePending || stopping || photoRetryPending}
+            disabled={!cameraEnabled || !voiceReady || imagePending || stopping || photoRetryPending}
             onChange={(event) => onImagePicked(event.currentTarget)}
           />
         </label>
@@ -356,7 +393,7 @@ export default function SessionPage() {
       ) : null}
       {pendingPhoto && !photoRetryPending ? (
         <div className="image-review">
-          <button type="button" disabled={imagePending || !voiceReady} onClick={() => void submitPhoto(pendingPhoto)}>
+          <button type="button" disabled={!cameraEnabled || imagePending || !voiceReady} onClick={() => void submitPhoto(pendingPhoto)}>
             {imagePending ? "Sending..." : imageStatus ? "Retry" : "Send"}
           </button>
           <button type="button" disabled={imagePending} onClick={() => discardPhoto()}>Retake</button>

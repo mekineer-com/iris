@@ -13,6 +13,10 @@ export interface Channels {
   "openalma:start": Rpc<{mode: SessionMode}, {ok: true}>
   "openalma:stop": Rpc<Record<string, never>, {ok: true}>
   "openalma:set-mode": Rpc<{mode: SessionMode}, {ok: true}>
+  "openalma:set-capabilities": Rpc<{
+    microphoneEnabled?: boolean
+    cameraEnabled?: boolean
+  }, {ok: true}>
   "openalma:manual-action": Rpc<{action: ManualAction}, {ok: true}>
   "openalma:image": Rpc<ImageRequest, {ok: true}>
   "openalma:pending-image": Rpc<{action: "retry" | "discard"}, {ok: true}>

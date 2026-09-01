@@ -9,6 +9,8 @@ type Snapshot = {
   mode: string
   connection: string
   manualPhase: string
+  microphoneEnabled: boolean
+  cameraEnabled: boolean
   photoRetryPending: boolean
   lastError: string | null
   usageTotalTokens: number | null
@@ -141,6 +143,17 @@ class FakeSession {
   abortGate: Promise<void> | null = null
   playGate: Promise<void> | null = null
   createErrorOnce = false
+  stored = new Map<string, string>()
+
+  storage = {
+    get: async (key: string) => this.stored.get(key) ?? null,
+    set: async (key: string, value: string) => {
+      this.stored.set(key, value)
+    },
+    delete: async (key: string) => {
+      this.stored.delete(key)
+    },
+  }
 
   ui = {
     send: (channel: string, payload: Snapshot) => {
@@ -220,9 +233,11 @@ function setup(
     earconTimeoutMs?: number
     responseWatchdogMs?: number
     startGate?: Promise<void>
+    stored?: Record<string, string>
   } = {},
 ) {
   const session = new FakeSession()
+  for (const [key, value] of Object.entries(options.stored ?? {})) session.stored.set(key, value)
   let live!: FakeLive
   const controller = new SessionController(session as never, {
     watchdogMs: options.watchdogMs ?? 5000,
@@ -514,6 +529,8 @@ describe("SessionController", () => {
       mode: "continuous",
       connection: "idle",
       manualPhase: "idle",
+      microphoneEnabled: true,
+      cameraEnabled: true,
       photoRetryPending: false,
       lastError: null,
       usageTotalTokens: null,
@@ -540,6 +557,33 @@ describe("SessionController", () => {
     harness.live.persistence(null)
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", lastError: null})
     await harness.session.handlers["openalma:stop"]({})
+  })
+
+  test("persists independent microphone and camera controls during a sitting", async () => {
+    const harness = setup({
+      stored: {
+        "openalma.microphone-enabled": "0",
+        "openalma.camera-enabled": "0",
+      },
+    })
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(harness.session.micSubs).toBe(0)
+    await expect(harness.session.handlers["openalma:image"]({})).rejects.toThrow("Camera is disabled")
+
+    await harness.session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+    harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})
+    expect(harness.live.sent).toEqual([silentPcm()])
+    await harness.session.handlers["openalma:set-capabilities"]({microphoneEnabled: false})
+    expect(harness.session.micHandler).toBeNull()
+
+    await harness.session.handlers["openalma:set-capabilities"]({cameraEnabled: true})
+    const image = {imageId: "image-1", mimeType: "image/png", data: "AQID"}
+    await harness.session.handlers["openalma:image"](image)
+    expect(harness.live.images).toEqual([image])
+    expect(lastSnapshot(harness.session)).toMatchObject({
+      microphoneEnabled: false,
+      cameraEnabled: true,
+    })
   })
 
   test("Manual records, reviews, redoes, and sends only the replacement", async () => {
