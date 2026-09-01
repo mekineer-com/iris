@@ -93,6 +93,8 @@ send; it must not be treated as silent context injection.
 
 - `clientContent` with inline image and `turnComplete: true` reaches Gemini and
   produces an image description.
+- Continuous mode uses `END_SENSITIVITY_LOW`; Gemini's default high sensitivity
+  falsely split a field utterance while Iris remained in listening state.
 - The description transcript can be bound to the durable image and used as its
   caption.
 - Session resumption works when Gemini has supplied a current non-empty handle.
