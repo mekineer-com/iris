@@ -333,8 +333,7 @@ export class GeminiLiveController {
     })
     if (!response.ok) throw new Error(`OpenAlma snapshot failed (${response.status})`)
     if (
-      this.stopping || generation !== this.generation || sessionId !== this.sessionId ||
-      this.socket !== socket || socket.readyState !== WS_OPEN
+      this.stopping || generation !== this.generation || sessionId !== this.sessionId
     ) {
       throw new Error("Photo send cancelled")
     }
@@ -363,8 +362,14 @@ export class GeminiLiveController {
     await this.persistJournal()
     if (this.journalUnavailable) throw new Error("Local image journal unavailable")
 
+    const activeSocket = this.socket
+    if (!this.ready || !activeSocket || activeSocket.readyState !== WS_OPEN) {
+      this.callbacks.onPhotoRetryChange(true)
+      this.callbacks.onPersistenceError(PHOTO_RETRY_MESSAGE)
+      return
+    }
     try {
-      this.sendImageTurn(socket, image.mimeType, image.data)
+      this.sendImageTurn(activeSocket, image.mimeType, image.data)
     } catch {
       throw new Error("Gemini image send failed")
     }

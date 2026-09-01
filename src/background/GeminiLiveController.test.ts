@@ -453,6 +453,28 @@ describe("GeminiLiveController", () => {
     expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(0)
   })
 
+  test("snapshot finishing after reconnect sends the photo on the replacement", async () => {
+    let release!: () => void
+    const snapshotGate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const h = harness({storage: new FakeStorage(), snapshotGate})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    const sending = h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot")))
+    h.sockets[0].close()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    h.sockets[1].message({setupComplete: {}})
+    release()
+    await sending
+
+    expect(h.sockets[1].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
   test("retains image finalization until the caption transcript is acknowledged", async () => {
     let releaseImage!: () => void
     let releaseCaption!: () => void
