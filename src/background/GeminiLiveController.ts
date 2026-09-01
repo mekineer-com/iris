@@ -94,6 +94,7 @@ export type GeminiLiveControllerOptions = {
 
 const WS_OPEN = 1
 const REQUEST_TIMEOUT_MS = 10_000
+const SNAPSHOT_TIMEOUT_MS = 120_000
 const RECALL_TIMEOUT_MS = 30_000
 const REFLECTION_TIMEOUT_MS = 8_000
 const RECONNECT_SETUP_ATTEMPTS = 6
@@ -320,7 +321,7 @@ export class GeminiLiveController {
       image_id: image.imageId,
       mime_type: image.mimeType,
       data: image.data,
-    })
+    }, SNAPSHOT_TIMEOUT_MS)
     if (!response.ok) throw new Error(`OpenAlma snapshot failed (${response.status})`)
     if (
       this.stopping || generation !== this.generation || sessionId !== this.sessionId
@@ -1376,6 +1377,11 @@ export class GeminiLiveController {
     }
     this.interruptionFinalized = false
     this.turnActive = false
+    if (!this.resumptionHandle && this.pendingImage?.providerSent && !this.pendingImage.caption) {
+      this.pendingImage.providerSent = false
+      this.pendingImage.captureAfterCurrent = false
+      this.queueJournalWrite()
+    }
     if (interrupted) this.callbacks.onInterrupted()
     if ((this.resumptionHandle || !this.hasCompletedProviderTurn) && !this.reconnectAttempted) {
       this.reconnectAttempted = true

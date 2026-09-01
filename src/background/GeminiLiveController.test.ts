@@ -1726,6 +1726,21 @@ describe("GeminiLiveController", () => {
     await active.controller.stop()
   })
 
+  test("cold reconnect replays a photo sent during an unfinished turn", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "unfinished"}}})
+    await h.controller.sendImage({imageId: "image-cold", mimeType: "image/png", data: "AQID"})
+    h.sockets[0].close()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    h.sockets[1].message({setupComplete: {}})
+    await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).clientContent))
+
+    expect(h.sockets[1].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
+    await h.controller.stop()
+  })
+
   test("does not loop when the replacement closes before a completed turn", async () => {
     const h = harness()
     await start(h)

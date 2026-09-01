@@ -75,8 +75,8 @@ Iris durably snapshots the image in OpenAlma before sending:
 
 Per the API reference, `clientContent` is appended to conversation history and
 interrupts current model generation. `turnComplete: true` asks Gemini to begin
-its response. Iris therefore waits for its existing turn boundary before this
-send; it must not be treated as silent context injection.
+its response. Iris sends the photo immediately; if another turn was active, it
+keeps that turn from becoming the photo caption. This is not silent context injection.
 
 ### Completion and connection rotation
 
