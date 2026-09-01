@@ -315,8 +315,7 @@ export class GeminiLiveController {
       throw new Error("Another photo is still pending")
     }
     if (this.pendingImage && this.pendingImage.imageId !== image.imageId) {
-      this.pendingImage = null
-      await this.persistJournal()
+      await this.discardImage()
       if (this.journalUnavailable) throw new Error("Local image journal unavailable")
     }
     if (this.pendingImage?.providerSent) return
@@ -378,16 +377,21 @@ export class GeminiLiveController {
   }
 
   async retryImage(): Promise<void> {
-    if (!this.pendingImage || this.pendingImage.caption || this.pendingImage.providerSent) {
+    if (this.pendingImage?.caption) {
+      await this.finalizePendingImage()
+      return
+    }
+    if (!this.pendingImage || this.pendingImage.providerSent) {
       throw new Error("No photo is waiting to retry")
     }
     await this.retryPendingImage()
   }
 
   async discardImage(): Promise<void> {
-    if (!this.pendingImage) return
-    this.pendingImage = null
-    await this.persistJournal()
+    if (this.pendingImage) {
+      this.pendingImage = null
+      await this.persistJournal()
+    }
     this.callbacks.onPhotoRetryChange(false)
     this.callbacks.onPersistenceError(null)
   }
@@ -756,9 +760,12 @@ export class GeminiLiveController {
     if (content.modelTurn !== undefined || content.inputTranscription !== undefined || content.outputTranscription !== undefined) {
       this.turnActive = true
     }
+    const input = this.transcriptText(content.inputTranscription, "input")
+    const output = this.transcriptText(content.outputTranscription, "output")
     const muteImageAudio = Boolean(
       this.pendingImage?.providerSent && !this.pendingImage.caption &&
-      !this.pendingImage.captureAfterCurrent && this.pendingImage.speakDescription !== true,
+      !this.pendingImage.captureAfterCurrent && this.pendingImage.speakDescription !== true &&
+      !this.inputTranscript && !input,
     )
     for (const part of interrupted ? [] : (parts ?? [])) {
       const inline = part?.inlineData
@@ -776,8 +783,6 @@ export class GeminiLiveController {
       this.providerAudioChunks += 1
     }
 
-    const input = this.transcriptText(content.inputTranscription, "input")
-    const output = this.transcriptText(content.outputTranscription, "output")
     if (input) trace("provider.input_transcription", {text: input})
     if (output) trace("provider.output_transcription", {text: output})
     if (this.reflecting) {
@@ -1118,16 +1123,20 @@ export class GeminiLiveController {
         caption: pending.caption,
       })
     } catch {
-      this.callbacks.onPersistenceError("Photo finalization failed; retrying")
+      this.callbacks.onPhotoRetryChange(true)
+      this.callbacks.onPersistenceError(PHOTO_RETRY_MESSAGE)
       return
     }
     if (response.status >= 500) {
-      this.callbacks.onPersistenceError("Photo finalization failed; retrying")
+      this.callbacks.onPhotoRetryChange(true)
+      this.callbacks.onPersistenceError(PHOTO_RETRY_MESSAGE)
       return
     }
     if (!response.ok) throw new Error(`OpenAlma snapshot finalization failed (${response.status})`)
     this.pendingImage = null
     await this.persistJournal()
+    this.callbacks.onPhotoRetryChange(false)
+    this.callbacks.onPersistenceError(null)
   }
 
   private queueJournalWrite(): void {

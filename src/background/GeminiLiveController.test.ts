@@ -232,6 +232,7 @@ function harness(
     errors,
     persistenceErrors,
     photoRetryChanges,
+    finalizeStatuses,
     reconnecting,
     usage,
     get durationWarnings() {
@@ -400,6 +401,43 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("replacing an unsent retry clears its projected actions", async () => {
+    const storage = new FakeStorage()
+    storage.values.set("openalma:gemini-session-v1", JSON.stringify({
+      version: 1,
+      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+      resumption: null,
+      pendingTranscripts: [],
+      pendingImage: {
+        imageId: "image-1",
+        mediaRef: "mentra_media/test-phone/image-1.png",
+        providerSent: false,
+        captureAfterCurrent: false,
+        generation: 1,
+        sessionId: "old-sitting",
+      },
+    }))
+    const h = harness({storage, replayStatuses: [503]})
+    await start(h)
+    await waitFor(() => h.photoRetryChanges.at(-1) === true)
+
+    await h.controller.sendImage({imageId: "image-2", mimeType: "image/png", data: "AQID"})
+
+    expect(h.photoRetryChanges.at(-1)).toBe(false)
+    await h.controller.stop()
+  })
+
+  test("discard clears stale projected actions without a journal row", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+
+    await h.controller.discardImage()
+
+    expect(h.photoRetryChanges.at(-1)).toBe(false)
+    expect(h.persistenceErrors.at(-1)).toBeNull()
+    await h.controller.stop()
+  })
+
   test("Stop during snapshot never sends the stale image turn", async () => {
     let release!: () => void
     const snapshotGate = new Promise<void>((resolve) => {
@@ -443,6 +481,7 @@ describe("GeminiLiveController", () => {
     await start(h)
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
     h.sockets[0].message({serverContent: {
+      modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
       inputTranscription: {text: "What do you see?"},
       outputTranscription: {text: "I see a fictional blue square."},
       turnComplete: true,
@@ -452,7 +491,30 @@ describe("GeminiLiveController", () => {
     expect(h.requests.find((request) => request.url.endsWith("/snapshot/finalize"))?.body.caption).toBe(
       "I see a fictional blue square.",
     )
+    expect(h.audio).toEqual(["AAAAAA=="])
     expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("failed finalization exposes a working Retry", async () => {
+    const h = harness({storage: new FakeStorage(), finalizeStatuses: Array(100).fill(503)})
+    await start(h)
+    await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    h.sockets[0].message({serverContent: {
+      outputTranscription: {text: "A fictional blue square."},
+      turnComplete: true,
+    }})
+    await waitFor(() => h.photoRetryChanges.at(-1) === true)
+    h.finalizeStatuses.splice(0, h.finalizeStatuses.length, 200)
+    const attemptsBeforeRetry = h.requests.filter((request) => request.url.endsWith("/snapshot/finalize")).length
+
+    await h.controller.retryImage()
+
+    expect(h.requests.filter((request) => request.url.endsWith("/snapshot/finalize"))).toHaveLength(
+      attemptsBeforeRetry + 1,
+    )
+    expect(h.photoRetryChanges.at(-1)).toBe(false)
+    expect(h.persistenceErrors.at(-1)).toBeNull()
     await h.controller.stop()
   })
 
