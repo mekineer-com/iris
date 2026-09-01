@@ -82,6 +82,7 @@ function harness(
     setupTimeoutMs?: number
     heartbeatStatus?: number
     heartbeatThrows?: boolean
+    heartbeatBody?: unknown
     startGate?: Promise<void>
     startStatus?: number
     startBody?: unknown
@@ -158,7 +159,7 @@ function harness(
     }
     if (url.endsWith("/heartbeat")) {
       if (options.heartbeatThrows) throw new Error("fictional network miss")
-      return Response.json({ok: true}, {status: options.heartbeatStatus ?? 200})
+      return Response.json(options.heartbeatBody ?? {ok: true}, {status: options.heartbeatStatus ?? 200})
     }
     if (url.endsWith("/recall")) {
       if (options.recallGate) await options.recallGate
@@ -472,6 +473,29 @@ describe("GeminiLiveController", () => {
 
     expect(h.sockets[1].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
     expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("reconnect during journal write sends one photo", async () => {
+    let release!: () => void
+    const storage = new FakeStorage()
+    storage.setGate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const h = harness({storage})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+    const sending = h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    await waitFor(() => storage.setCalls > 0)
+    h.sockets[0].close()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    h.sockets[1].message({setupComplete: {}})
+    await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).clientContent))
+    release()
+    await sending
+
+    expect(h.sockets[1].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
     await h.controller.stop()
   })
 
@@ -2038,6 +2062,14 @@ describe("GeminiLiveController", () => {
     await start(h)
     await waitFor(() => h.errors.length === 1)
     expect(h.errors).toEqual(["OpenAlma heartbeat failed (404)"])
+    await h.controller.stop()
+  })
+
+  test("heartbeat surfaces a background image-memory failure", async () => {
+    const message = "Photo memory processing failed; the original remains saved."
+    const h = harness({heartbeatMs: 5, heartbeatBody: {ok: true, background_error: message}})
+    await start(h)
+    await waitFor(() => h.persistenceErrors.includes(message))
     await h.controller.stop()
   })
 

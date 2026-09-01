@@ -84,7 +84,8 @@ send; it must not be treated as silent context injection.
 - `serverContent.generationComplete: true` means generation has finished; it is
   not a replacement for `turnComplete` in Iris transcript finalization.
 - `goAway.timeLeft` announces a provider disconnect deadline. Iris rotates
-  before that deadline using the latest resumption handle.
+  before that deadline using the latest resumption handle. Without a handle,
+  Iris ends the sitting rather than inventing continuity.
 - A WebSocket close event has `code`, `reason`, and `wasClean`. Preserve those
   in diagnostics; a generic "Gemini connection closed" is not enough evidence
   to classify a provider rejection, lease expiry, or network loss.
@@ -93,9 +94,9 @@ send; it must not be treated as silent context injection.
 
 - `clientContent` with inline image and `turnComplete: true` reaches Gemini and
   produces an image description.
-- Continuous mode uses `END_SENSITIVITY_LOW` as a field trial after an utterance
-  was truncated while Iris remained in listening state. The cause is not yet
-  proven; native PCM or WebSocket delivery loss remains possible.
+- Continuous mode currently uses `END_SENSITIVITY_LOW` after an utterance was
+  truncated while Iris remained in listening state. The cause remains unproven;
+  native PCM or WebSocket delivery loss remain alternative explanations.
 - The description transcript can be bound to the durable image and used as its
   caption.
 - Session resumption works when Gemini has supplied a current non-empty handle.

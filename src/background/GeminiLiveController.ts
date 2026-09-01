@@ -351,6 +351,7 @@ export class GeminiLiveController {
     this.pendingImage = pending
     await this.persistJournal()
     if (this.journalUnavailable) throw new Error("Local image journal unavailable")
+    if (pending.providerSent) return
 
     const activeSocket = this.socket
     if (!this.ready || !activeSocket || activeSocket.readyState !== WS_OPEN) {
@@ -441,7 +442,7 @@ export class GeminiLiveController {
         this.reportError(new Error("OpenAlma snapshot replay returned invalid image data"))
         return
       }
-      if (this.pendingImage !== pending || this.stopping) return
+      if (this.pendingImage !== pending || pending.providerSent || this.stopping) return
       if (this.socket !== socket || socket.readyState !== WS_OPEN) {
         retryOnReplacement = true
         return
@@ -1500,6 +1501,10 @@ export class GeminiLiveController {
         this.expireMissedHeartbeat()
       } else {
         this.lastHeartbeatSuccessAt = Date.now()
+        const body = await response.json().catch(() => null)
+        if (typeof body?.background_error === "string" && body.background_error) {
+          this.callbacks.onPersistenceError(body.background_error)
+        }
       }
     } catch (error) {
       trace("provider.heartbeat.missed", {
