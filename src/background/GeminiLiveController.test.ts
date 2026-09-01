@@ -339,6 +339,30 @@ describe("GeminiLiveController", () => {
     }
   })
 
+  test("a silent photo does not mute the answer already in progress", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    h.sockets[0].message({serverContent: {
+      inputTranscription: {text: "Current question."},
+      outputTranscription: {text: "Current answer."},
+    }})
+    await h.controller.sendImage({imageId: "image-queued", mimeType: "image/png", data: "AQID"})
+    h.sockets[0].message({serverContent: {
+      modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
+      outputTranscription: {text: "Current answer finished."},
+      turnComplete: true,
+    }})
+    h.sockets[0].message({serverContent: {
+      modelTurn: {parts: [{inlineData: {data: "AQEBAQ=="}}]},
+      outputTranscription: {text: "A fictional blue square."},
+      turnComplete: true,
+    }})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
+
+    expect(h.audio).toEqual(["AAAAAA=="])
+    await h.controller.stop()
+  })
+
   test("does not send Gemini when durable snapshot fails", async () => {
     const h = harness({storage: new FakeStorage(), snapshotStatus: 503})
     await start(h)
