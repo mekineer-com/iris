@@ -1658,6 +1658,28 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("cold reconnects once only before the first completed provider turn", async () => {
+    const idle = harness()
+    await start(idle)
+    idle.sockets[0].close()
+    await waitFor(() => idle.sockets.length === 2)
+    idle.sockets[1].open()
+    expect(JSON.parse(idle.sockets[1].sent[0])).toEqual({setup: {sessionResumption: {}}})
+    idle.sockets[1].message({setupComplete: {}})
+    await waitFor(() => idle.reconnecting.at(-1) === false)
+    expect(idle.errors).toEqual([])
+    await idle.controller.stop()
+
+    const active = harness()
+    await start(active)
+    completeTurn(active)
+    active.sockets[0].close()
+    await waitFor(() => active.errors.length === 1)
+    expect(active.sockets).toHaveLength(1)
+    expect(active.errors).toEqual(["Gemini connection closed"])
+    await active.controller.stop()
+  })
+
   test("does not loop when the replacement closes before a completed turn", async () => {
     const h = harness()
     await start(h)
@@ -1710,8 +1732,12 @@ describe("GeminiLiveController", () => {
     h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
     h.sockets[0].message({sessionResumptionUpdate: {resumable: false}})
     h.sockets[0].close()
-    await waitFor(() => h.errors.length === 1)
-    expect(h.sockets).toHaveLength(1)
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    expect(JSON.parse(h.sockets[1].sent[0])).toEqual({setup: {sessionResumption: {}}})
+    h.sockets[1].message({setupComplete: {}})
+    await waitFor(() => h.reconnecting.at(-1) === false)
+    expect(h.errors).toEqual([])
     await h.controller.stop()
   })
 

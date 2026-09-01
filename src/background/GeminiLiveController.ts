@@ -135,6 +135,7 @@ export class GeminiLiveController {
   private outputTranscript = ""
   private interruptionFinalized = false
   private turnActive = false
+  private hasCompletedProviderTurn = false
   private completeUserTurns = 0
   private pendingEvents: TranscriptEvent[] = []
   private pendingImage: PendingImage | null = null
@@ -183,6 +184,7 @@ export class GeminiLiveController {
     this.outputTranscript = ""
     this.interruptionFinalized = false
     this.turnActive = false
+    this.hasCompletedProviderTurn = false
     this.completeUserTurns = 0
     this.pendingEvents = []
     this.pendingImage = null
@@ -816,6 +818,7 @@ export class GeminiLiveController {
       this.callbacks.onInterrupted()
     }
     if (content.turnComplete === true) {
+      this.hasCompletedProviderTurn = true
       trace("provider.turn_complete", {
         hasToolCall,
         interrupted: this.interruptionFinalized,
@@ -1378,7 +1381,7 @@ export class GeminiLiveController {
     this.interruptionFinalized = false
     this.turnActive = false
     if (interrupted) this.callbacks.onInterrupted()
-    if (this.resumptionHandle && !this.reconnectAttempted) {
+    if ((this.resumptionHandle || !this.hasCompletedProviderTurn) && !this.reconnectAttempted) {
       this.reconnectAttempted = true
       this.callbacks.onReconnecting(true)
       const generation = this.generation

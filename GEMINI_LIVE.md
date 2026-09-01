@@ -96,6 +96,11 @@ send; it must not be treated as silent context injection.
 - The description transcript can be bound to the durable image and used as its
   caption.
 - Session resumption works when Gemini has supplied a current non-empty handle.
+- Gemini 2.5 may close an otherwise healthy pre-first-turn socket after about
+  30 seconds with code `1006`, reason `timeout`, before issuing a resumption
+  handle. Iris cold-reconnects once in that state because no completed provider
+  turn can be lost. Once any provider turn completes, recovery still requires
+  a handle.
 - `clientContent` with `turnComplete: false` was silent but did not reliably
   become usable visual context on a later natural turn.
 - SILENT tool-response `inlineData` remained connected but did not give the
