@@ -642,7 +642,12 @@ export class GeminiLiveController {
         if (ready) socket.close()
         else finish(error)
       })
-      socket.addEventListener("close", () => {
+      socket.addEventListener("close", (event) => {
+        trace("provider.socket.close_event", {
+          code: Number.isSafeInteger(event?.code) ? event.code : null,
+          reason: typeof event?.reason === "string" ? event.reason : "",
+          wasClean: event?.wasClean === true,
+        })
         if (!settled) finish(new Error("Gemini socket closed during setup"))
         if (ready && !this.stopping && this.socket === socket) void this.handleUnexpectedClose()
       })
