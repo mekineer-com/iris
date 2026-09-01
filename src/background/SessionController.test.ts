@@ -569,6 +569,9 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     expect(harness.session.micSubs).toBe(0)
     await expect(harness.session.handlers["openalma:image"]({})).rejects.toThrow("Camera is disabled")
+    await expect(harness.session.handlers["openalma:pending-image"]({action: "retry"})).rejects.toThrow(
+      "Camera is disabled",
+    )
 
     await harness.session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
     harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})

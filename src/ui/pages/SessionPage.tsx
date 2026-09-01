@@ -404,7 +404,7 @@ export default function SessionPage() {
         <div>
           <p role="status">{PHOTO_RETRY_MESSAGE}</p>
           <div className="image-review">
-            <button type="button" disabled={imagePending} onClick={() => void handleStoredPhoto("retry")}>Retry</button>
+            <button type="button" disabled={!cameraEnabled || imagePending} onClick={() => void handleStoredPhoto("retry")}>Retry</button>
             <button type="button" disabled={imagePending} onClick={() => void handleStoredPhoto("discard")}>Discard</button>
           </div>
         </div>
