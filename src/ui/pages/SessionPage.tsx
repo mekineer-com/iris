@@ -42,13 +42,17 @@ export function visibleConnection(
   return connection
 }
 
-const MAX_IMAGE_BYTES = 1024 * 1024
+const LARGE_IMAGE_BYTES = 1024 * 1024
+const LARGE_IMAGE_WARNING_KEY = "openalma.dismiss-large-image-warning"
 
 export function validateImageFile(file: Pick<File, "size" | "type">): "image/jpeg" | "image/png" {
   if (file.type !== "image/jpeg" && file.type !== "image/png") throw new Error("Choose a JPEG or PNG image")
-  if (file.size <= 0 || file.size > MAX_IMAGE_BYTES) throw new Error("Photo must be between 1 byte and 1 MB")
+  if (file.size <= 0) throw new Error("Photo is empty")
   return file.type
 }
+
+export const shouldWarnLargeImage = (size: number, warningDismissed: boolean) =>
+  size > LARGE_IMAGE_BYTES && !warningDismissed
 
 export async function imageRequest(
   file: File,
@@ -83,6 +87,9 @@ export default function SessionPage() {
   const [manualPending, setManualPending] = useState(false)
   const [previewImages, setPreviewImages] = useState(false)
   const [speakPhotoDescriptions, setSpeakPhotoDescriptions] = useState(false)
+  const [largeImageWarningDismissed, setLargeImageWarningDismissed] = useState(
+    () => localStorage.getItem(LARGE_IMAGE_WARNING_KEY) === "1",
+  )
   const [pendingPhoto, setPendingPhoto] = useState<PendingPhoto | null>(null)
   const [imagePending, setImagePending] = useState(false)
   const [imageStatus, setImageStatus] = useState<string | null>(null)
@@ -201,13 +208,19 @@ export default function SessionPage() {
       return
     }
     discardPhoto()
+    const warnLarge = shouldWarnLargeImage(file.size, largeImageWarningDismissed)
     const photo = {
       file,
       imageId: newImageId(),
-      previewUrl: previewImages ? URL.createObjectURL(file) : null,
+      previewUrl: previewImages || warnLarge ? URL.createObjectURL(file) : null,
     }
     setPendingPhoto(photo)
-    if (!previewImages) void submitPhoto(photo)
+    if (!previewImages && !warnLarge) void submitPhoto(photo)
+  }
+
+  const dismissLargeImageWarning = () => {
+    localStorage.setItem(LARGE_IMAGE_WARNING_KEY, "1")
+    setLargeImageWarningDismissed(true)
   }
 
   const handleStoredPhoto = async (action: "retry" | "discard") => {
@@ -332,6 +345,15 @@ export default function SessionPage() {
         </label>
       </div>
       {pendingPhoto?.previewUrl ? <img className="image-preview" src={pendingPhoto.previewUrl} alt="Selected photo preview" /> : null}
+      {pendingPhoto && shouldWarnLargeImage(pendingPhoto.file.size, largeImageWarningDismissed) ? (
+        <div role="alert">
+          <p>This photo is over 1 MB and may take longer or cost more to process.</p>
+          <label>
+            <input type="checkbox" onChange={(event) => event.target.checked && dismissLargeImageWarning()} />
+            Don't warn again
+          </label>
+        </div>
+      ) : null}
       {pendingPhoto && !photoRetryPending ? (
         <div className="image-review">
           <button type="button" disabled={imagePending || !voiceReady} onClick={() => void submitPhoto(pendingPhoto)}>

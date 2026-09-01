@@ -299,16 +299,6 @@ export class GeminiLiveController {
 
   async sendImage(image: ImageRequest): Promise<void> {
     if (!this.storage) throw new Error("Local image journal unavailable")
-    if (!/^[A-Za-z0-9._-]{1,128}$/.test(image.imageId)) throw new Error("Invalid image id")
-    if (image.mimeType !== "image/jpeg" && image.mimeType !== "image/png") {
-      throw new Error("Only JPEG and PNG images are supported")
-    }
-    if (
-      !image.data || image.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data) ||
-      approxBase64ByteLength(image.data) > 1024 * 1024
-    ) {
-      throw new Error("Photo must be between 1 byte and 1 MB")
-    }
     const socket = this.socket
     if (!this.ready || this.stopping || !socket || socket.readyState !== WS_OPEN) {
       throw new Error("Gemini socket is not ready")
