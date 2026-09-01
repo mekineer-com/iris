@@ -49,6 +49,7 @@ type PendingImage = {
   imageSequence?: number
   caption?: string
   assistantSequence?: number
+  speakDescription?: boolean
 }
 
 type StorageLike = {
@@ -351,6 +352,7 @@ export class GeminiLiveController {
       sessionId: this.sessionId,
     }
     if (pending.mediaRef !== mediaRef) throw new Error("OpenAlma snapshot media reference changed")
+    pending.speakDescription = image.speakDescription === true
     pending.captureAfterCurrent = this.turnActive || Boolean(
       this.inputTranscript || this.outputTranscript || this.pendingToolCalls.size || this.deliveredToolResultIds.size,
     )
@@ -754,6 +756,10 @@ export class GeminiLiveController {
     if (content.modelTurn !== undefined || content.inputTranscription !== undefined || content.outputTranscription !== undefined) {
       this.turnActive = true
     }
+    const muteImageAudio = Boolean(
+      this.pendingImage?.providerSent && !this.pendingImage.caption &&
+      !this.pendingImage.captureAfterCurrent && this.pendingImage.speakDescription !== true,
+    )
     for (const part of interrupted ? [] : (parts ?? [])) {
       const inline = part?.inlineData
       if (inline === undefined) continue
@@ -766,7 +772,7 @@ export class GeminiLiveController {
       ) {
         throw new Error("Gemini returned malformed audio")
       }
-      this.callbacks.onAudio(inline.data)
+      if (!muteImageAudio) this.callbacks.onAudio(inline.data)
       this.providerAudioChunks += 1
     }
 
@@ -1231,7 +1237,8 @@ export class GeminiLiveController {
       Number.isSafeInteger(image.generation) && typeof image.sessionId === "string" &&
       (image.imageSequence === undefined || Number.isSafeInteger(image.imageSequence)) &&
       (image.caption === undefined || (typeof image.caption === "string" && image.caption.length > 0)) &&
-      (image.assistantSequence === undefined || Number.isSafeInteger(image.assistantSequence))
+      (image.assistantSequence === undefined || Number.isSafeInteger(image.assistantSequence)) &&
+      (image.speakDescription === undefined || typeof image.speakDescription === "boolean")
   }
 
   private async reconcileJournal(): Promise<void> {

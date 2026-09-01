@@ -50,14 +50,18 @@ export function validateImageFile(file: Pick<File, "size" | "type">): "image/jpe
   return file.type
 }
 
-export async function imageRequest(file: File, imageId: string): Promise<ImageRequest> {
+export async function imageRequest(
+  file: File,
+  imageId: string,
+  speakDescription: boolean,
+): Promise<ImageRequest> {
   const mimeType = validateImageFile(file)
   const bytes = new Uint8Array(await file.arrayBuffer())
   let binary = ""
   for (let offset = 0; offset < bytes.length; offset += 0x8000) {
     binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
   }
-  return {imageId, mimeType, data: btoa(binary)}
+  return {imageId, mimeType, data: btoa(binary), speakDescription}
 }
 
 export const newImageId = (now = Date.now(), random = Math.random()) =>
@@ -78,6 +82,7 @@ export default function SessionPage() {
   const [modePending, setModePending] = useState(false)
   const [manualPending, setManualPending] = useState(false)
   const [previewImages, setPreviewImages] = useState(false)
+  const [speakPhotoDescriptions, setSpeakPhotoDescriptions] = useState(false)
   const [pendingPhoto, setPendingPhoto] = useState<PendingPhoto | null>(null)
   const [imagePending, setImagePending] = useState(false)
   const [imageStatus, setImageStatus] = useState<string | null>(null)
@@ -169,7 +174,7 @@ export default function SessionPage() {
     setImageStatus(null)
     setImagePending(true)
     try {
-      await imageRpc(await imageRequest(photo.file, photo.imageId))
+      await imageRpc(await imageRequest(photo.file, photo.imageId, speakPhotoDescriptions))
       if (owner !== imageOwner.current) return
       discardPhoto()
       setImageStatus("Photo sent")
@@ -296,6 +301,14 @@ export default function SessionPage() {
       <label className="preview-control">
         <input type="checkbox" checked={previewImages} onChange={(event) => setPreviewImages(event.target.checked)} />
         Preview before send
+      </label>
+      <label className="preview-control">
+        <input
+          type="checkbox"
+          checked={speakPhotoDescriptions}
+          onChange={(event) => setSpeakPhotoDescriptions(event.target.checked)}
+        />
+        Speak photo descriptions
       </label>
       <div className="image-actions">
         <label className="image-picker">

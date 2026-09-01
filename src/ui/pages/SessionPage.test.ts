@@ -25,8 +25,17 @@ describe("SessionPage state projection", () => {
   })
 
   test("encodes one validated file for the image RPC", async () => {
-    const payload = await imageRequest(new File([new Uint8Array([1, 2, 3])], "photo.png", {type: "image/png"}), "image-1")
-    expect(payload).toEqual({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    const payload = await imageRequest(
+      new File([new Uint8Array([1, 2, 3])], "photo.png", {type: "image/png"}),
+      "image-1",
+      false,
+    )
+    expect(payload).toEqual({
+      imageId: "image-1",
+      mimeType: "image/png",
+      data: "AQID",
+      speakDescription: false,
+    })
   })
 
   test("creates an image id without secure-context crypto", () => {

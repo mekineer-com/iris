@@ -5,6 +5,7 @@ export type ImageRequest = {
   imageId: string
   mimeType: "image/jpeg" | "image/png"
   data: string
+  speakDescription?: boolean
 }
 
 export interface Channels {

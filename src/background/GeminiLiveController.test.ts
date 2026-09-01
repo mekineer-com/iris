@@ -317,6 +317,28 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("mutes photo descriptions by default and allows explicit playback", async () => {
+    for (const speakDescription of [false, true]) {
+      const h = harness({storage: new FakeStorage()})
+      await start(h)
+      await h.controller.sendImage({
+        imageId: `image-${speakDescription}`,
+        mimeType: "image/png",
+        data: "AQID",
+        speakDescription,
+      })
+      h.sockets[0].message({serverContent: {
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
+        outputTranscription: {text: "A fictional blue square."},
+        turnComplete: true,
+      }})
+      await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
+
+      expect(h.audio).toEqual(speakDescription ? ["AAAAAA=="] : [])
+      await h.controller.stop()
+    }
+  })
+
   test("does not send Gemini when durable snapshot fails", async () => {
     const h = harness({storage: new FakeStorage(), snapshotStatus: 503})
     await start(h)
