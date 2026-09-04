@@ -7,7 +7,7 @@ describe("miniapp manifest", () => {
 
   test("locks identity, entry, permissions, and hardware", () => {
     expect(manifest.packageName).toBe("com.openalma.mentra")
-    expect(manifest.version).toBe("0.1.0")
+    expect(manifest.version).toBe("0.1.1")
     expect(manifest.port).toBe(3141)
     expect(manifest.minHostVersion).toBe("2.13.0")
     expect(manifest.sdkVersion).toBe("0.3.0")
