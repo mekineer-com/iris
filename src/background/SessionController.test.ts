@@ -23,6 +23,8 @@ const CONFIG: OpenAlmaConfig = {
   userId: "Test User",
   soulId: "Test Soul",
   deviceSessionId: "test-phone",
+  packageName: "com.openalma.mentra",
+  version: "0.1.0",
 }
 
 function silentPcm(): string {
@@ -536,6 +538,8 @@ describe("SessionController", () => {
       usageTotalTokens: null,
       durationWarning: false,
     })
+    harness.controller.reportInstallationError()
+    expect(lastSnapshot(harness.session)?.lastError).toContain("reopen Iris to retry")
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     harness.live.persistenceOnStop = "Transcript sync failed; pending turns remain saved on this device"
     harness.live.fail("provider failed")

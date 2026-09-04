@@ -10,6 +10,8 @@ const CONFIG: OpenAlmaConfig = {
   userId: "Test User",
   soulId: "Test Soul",
   deviceSessionId: "test-phone",
+  packageName: "com.openalma.mentra",
+  version: "0.1.0",
 }
 
 class FakeSocket {

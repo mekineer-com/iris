@@ -494,6 +494,12 @@ export class SessionController {
     this.pushSnapshot()
   }
 
+  reportInstallationError(): void {
+    if (this.connection !== "idle") return
+    this.lastError = "Iris installation status could not be reported; reopen Iris to retry"
+    this.pushSnapshot()
+  }
+
   private subscribeMic(): void {
     this.stopMic()
     this.sawMicFrame = false

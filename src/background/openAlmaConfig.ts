@@ -1,9 +1,13 @@
+import manifest from "../../miniapp.json"
+
 export type OpenAlmaConfig = {
   baseUrl: string
   bearer: string
   userId: string
   soulId: string
   deviceSessionId: string
+  packageName: string
+  version: string
 }
 
 function required(name: string, value: string | undefined): string {
@@ -36,5 +40,7 @@ export function readOpenAlmaConfig(): OpenAlmaConfig {
     userId: required("MENTRA_PUBLIC_OPENALMA_USER_ID", process.env.MENTRA_PUBLIC_OPENALMA_USER_ID),
     soulId: required("MENTRA_PUBLIC_OPENALMA_SOUL_ID", process.env.MENTRA_PUBLIC_OPENALMA_SOUL_ID),
     deviceSessionId,
+    packageName: manifest.packageName,
+    version: manifest.version,
   }
 }
