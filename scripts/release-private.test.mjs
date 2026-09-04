@@ -1,6 +1,15 @@
 import {describe, expect, test} from "bun:test"
+import {mkdtempSync, readFileSync} from "node:fs"
+import {tmpdir} from "node:os"
+import {join} from "node:path"
 
-import {assertPrivateReleaseConfig, findReleaseUri, releaseArgs} from "./release-private.mjs"
+import {
+  assertPrivateReleaseConfig,
+  findReleaseUri,
+  installationMatches,
+  releaseArgs,
+  writeReleaseStatus,
+} from "./release-private.mjs"
 
 describe("private release URI", () => {
   test("binds the CLI directly to the fixed WireGuard address and port", () => {
@@ -31,5 +40,40 @@ describe("private release URI", () => {
     expect(() => assertPrivateReleaseConfig("10.77.0.1", {...env, MENTRA_PUBLIC_OPENALMA_BEARER: ""}, interfaces, ["rdp"])).toThrow(
       "MENTRA_PUBLIC_OPENALMA_BEARER",
     )
+  })
+
+  test("accepts only a fresh report for the exact release", () => {
+    const target = {packageName: "com.openalma.mentra", version: "0.1.0", startedAt: 100}
+    expect(
+      installationMatches(
+        {
+          installed_package: "com.openalma.mentra",
+          installed_version: "0.1.0",
+          installed_seen_at: 101,
+        },
+        target,
+      ),
+    ).toBe(true)
+    expect(
+      installationMatches(
+        {installed_package: target.packageName, installed_version: target.version, installed_seen_at: 100},
+        target,
+      ),
+    ).toBe(false)
+    expect(
+      installationMatches(
+        {installed_package: target.packageName, installed_version: "0.0.9", installed_seen_at: 101},
+        target,
+      ),
+    ).toBe(false)
+  })
+
+  test("writes installer status atomically", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "iris-release-test-")), "status.json")
+    writeReleaseStatus(path, {package_name: "com.openalma.mentra", version: "0.1.0"})
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      package_name: "com.openalma.mentra",
+      version: "0.1.0",
+    })
   })
 })
