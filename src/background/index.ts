@@ -7,6 +7,7 @@ import {readOpenAlmaConfig} from "./openAlmaConfig"
 registerMiniapp((session) => {
   const controller = new SessionController(session)
   controller.start()
+  if (process.env.NODE_ENV !== "production") return
   try {
     const config = readOpenAlmaConfig()
     void reportInstallation(config).catch((error) => {

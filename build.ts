@@ -37,6 +37,7 @@ const distDir = "./dist"
 await rm(distDir, {recursive: true, force: true})
 
 const define: Record<string, string> = {}
+define["process.env.NODE_ENV"] = JSON.stringify(process.env.NODE_ENV ?? "development")
 for (const [k, v] of Object.entries(process.env)) {
   if (k.startsWith("MENTRA_PUBLIC_") && typeof v === "string") {
     define[`process.env.${k}`] = JSON.stringify(v)
