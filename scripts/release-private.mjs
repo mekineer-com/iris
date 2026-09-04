@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import {spawn} from "node:child_process"
+import {execFileSync, spawn} from "node:child_process"
+import {networkInterfaces} from "node:os"
 import {dirname, join, resolve} from "node:path"
 import {fileURLToPath} from "node:url"
 
@@ -10,22 +11,37 @@ import {loadEnvLocal} from "./load-env-local.mjs"
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..")
 
-export function rewriteReleaseUri(uri, host) {
-  const release = new URL(uri)
-  const source = new URL(release.searchParams.get("url"))
-  source.hostname = host
-  release.searchParams.set("url", source.href.replace(/\/$/, ""))
-  return release.href
-}
-
 export function findReleaseUri(output) {
   return output.match(/miniapp:\/\/release\?[^\s]+/)?.[0] ?? null
+}
+
+const requiredBuildEnv = [
+  "MENTRA_PUBLIC_OPENALMA_BASE_URL",
+  "MENTRA_PUBLIC_OPENALMA_BEARER",
+  "MENTRA_PUBLIC_OPENALMA_USER_ID",
+  "MENTRA_PUBLIC_OPENALMA_SOUL_ID",
+  "MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID",
+]
+
+export function assertPrivateReleaseConfig(host, env, interfaces, wireguardNames) {
+  const onWireGuard = wireguardNames.some((name) =>
+    (interfaces[name] ?? []).some((address) => address.family === "IPv4" && address.address === host),
+  )
+  if (!onWireGuard) throw new Error(`MENTRA_RELEASE_HOST ${host} is not a local WireGuard address`)
+  const missing = requiredBuildEnv.filter((name) => !env[name]?.trim())
+  if (missing.length) throw new Error(`Missing required build settings: ${missing.join(", ")}`)
+}
+
+export function releaseArgs(host) {
+  return ["release", "--host", host, "--port", "6789"]
 }
 
 export function run() {
   loadEnvLocal(root)
   const host = process.env.MENTRA_RELEASE_HOST ?? "10.77.0.1"
-  const miniapp = spawn(join(root, "node_modules", ".bin", "mentra-miniapp"), ["release"], {
+  const links = JSON.parse(execFileSync("ip", ["-j", "link", "show", "type", "wireguard"], {encoding: "utf8"}))
+  assertPrivateReleaseConfig(host, process.env, networkInterfaces(), links.map((link) => link.ifname))
+  const miniapp = spawn(join(root, "node_modules", ".bin", "mentra-miniapp"), releaseArgs(host), {
     cwd: root,
     env: process.env,
     stdio: ["inherit", "pipe", "inherit"],
@@ -42,7 +58,7 @@ export function run() {
     if (!original) return
     emitted = true
 
-    const uri = rewriteReleaseUri(original, host)
+    const uri = original
     const release = new URL(uri)
     const version = release.searchParams.get("version")
     const qrPath = join(root, "build", `openalma-${version}-wireguard-qr.png`)

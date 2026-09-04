@@ -1,0 +1,88 @@
+diff --git a/src/index.ts b/src/index.ts
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -15,7 +15,7 @@
+   console.log('Usage: mentra-miniapp <command>\n');
+   console.log('Commands:');
+   console.log('  dev                              Start dev server with hot reload and QR code');
+-  console.log('  release                          Build, pack, and serve a QR to install on a phone');
++  console.log('  release [--host HOST] [--port PORT]  Build, pack, and serve a QR to install on a phone');
+   console.log('  pack                             Production-build and package miniapp into build/<pkg>-<version>.zip (--no-build to skip build)');
+   console.log('  manifest                         Edit miniapp.json interactively');
+   console.log('  permission list                  List declared permissions');
+@@ -28,12 +28,21 @@
+   console.log('  schema regenerate                Regenerate the published schema file (CLI internal)');
+ }
+ 
++function option(name: string): string | undefined {
++  const index = process.argv.indexOf(name);
++  return index >= 0 ? process.argv[index + 1] : undefined;
++}
++
+ switch (subcommand) {
+   case 'dev':
+     await dev();
+     break;
+   case 'release':
+-    await release({noCache: process.argv.includes('--no-cache')});
++    await release({
++      noCache: process.argv.includes('--no-cache'),
++      host: option('--host'),
++      port: option('--port') === undefined ? undefined : Number(option('--port')),
++    });
+     break;
+   case 'pack':
+     // Build with NODE_ENV=production before zipping, so `pack` never ships
+diff --git a/src/release.ts b/src/release.ts
+--- a/src/release.ts
++++ b/src/release.ts
+@@ -39,6 +39,8 @@
+ 
+ interface ReleaseOptions {
+   noCache?: boolean
++  host?: string
++  port?: number
+ }
+ 
+ export async function release(opts: ReleaseOptions = {}): Promise<void> {
+@@ -86,26 +88,34 @@
+     console.log(`✓ Packed ${packageName}@${version} (${sizeKb} KB) in ${((Date.now() - packStart) / 1000).toFixed(1)}s`)
+   }
+ 
+-  // ---- 3. Find a free port and load the bundle into memory ------------
++  // ---- 3. Select the listener and load the bundle into memory ----------
+   const zipBuffer = readFileSync(cachedZipPath)
+   const iconPath = resolve(cwd, 'icon.png')
+   const iconBuffer = existsSync(iconPath) ? readFileSync(iconPath) : null
+   const manifestBuffer = readFileSync(manifestPath)
+ 
+-  const port = await pickPort(DEFAULT_PORT_START, PORT_SCAN_LIMIT)
+-  const lanIp = getLanIp()
+-  if (!lanIp) {
++  if (opts.port !== undefined && (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535)) {
++    console.error('Error: --port must be an integer between 1 and 65535')
++    process.exit(1)
++  }
++  if (opts.host !== undefined && !opts.host.trim()) {
++    console.error('Error: --host must not be empty')
++    process.exit(1)
++  }
++  const port = opts.port ?? await pickPort(DEFAULT_PORT_START, PORT_SCAN_LIMIT)
++  const advertisedHost = opts.host ?? getLanIp()
++  if (!advertisedHost) {
+     console.error('Error: could not detect LAN IP. Connect to a Wi-Fi network and re-run.')
+     process.exit(1)
+   }
+ 
+-  const baseUrl = `http://${lanIp}:${port}`
++  const baseUrl = `http://${advertisedHost}:${port}`
+ 
+   let installCount = 0
+ 
+   // ---- 4. Serve --------------------------------------------------------
+   const server = Bun.serve({
+-    hostname: '0.0.0.0',
++    hostname: opts.host ?? '0.0.0.0',
+     port,
+     fetch(req) {
+       const url = new URL(req.url)
