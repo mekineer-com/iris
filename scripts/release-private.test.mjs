@@ -7,11 +7,30 @@ import {
   assertPrivateReleaseConfig,
   findReleaseUri,
   installationMatches,
+  readInstallationStatus,
   releaseArgs,
   writeReleaseStatus,
 } from "./release-private.mjs"
 
 describe("private release URI", () => {
+  test("completion poll authenticates by device, independent of the selected soul", async () => {
+    const original = globalThis.fetch
+    try {
+      globalThis.fetch = async (url, options) => {
+        expect(new URL(url).search).toBe("?device_session_id=fictional-phone")
+        expect(options.headers.Authorization).toBe("Bearer fictional-generated-key")
+        return Response.json({installed_package: "com.openalma.mentra", installed_version: "0.1.0", installed_seen_at: 101})
+      }
+      const status = await readInstallationStatus({
+        MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID: "fictional-phone",
+        MENTRA_PUBLIC_OPENALMA_BEARER: "fictional-generated-key",
+        MENTRA_PUBLIC_OPENALMA_SOUL_ID: "Changed Soul",
+      })
+      expect(installationMatches(status, {packageName: "com.openalma.mentra", version: "0.1.0", startedAt: 100})).toBe(true)
+    } finally {
+      globalThis.fetch = original
+    }
+  })
   test("binds the CLI directly to the fixed WireGuard address and port", () => {
     const uri =
       "miniapp://release?url=http%3A%2F%2F10.77.0.1%3A6789&package=com.openalma.mentra&version=0.1.0&name=OpenAlma"

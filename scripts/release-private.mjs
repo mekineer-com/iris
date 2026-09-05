@@ -29,7 +29,7 @@ export function assertPrivateReleaseConfig(host, env, interfaces, wireguardNames
   const onWireGuard = wireguardNames.some((name) =>
     (interfaces[name] ?? []).some((address) => address.family === "IPv4" && address.address === host),
   )
-  if (!onWireGuard) throw new Error(`MENTRA_RELEASE_HOST ${host} is not a local WireGuard address`)
+  if (!onWireGuard) throw new Error(`Iris base URL host ${host} is not a local WireGuard address`)
   const missing = requiredBuildEnv.filter((name) => !env[name]?.trim())
   if (missing.length) throw new Error(`Missing required build settings: ${missing.join(", ")}`)
 }
@@ -44,6 +44,15 @@ export function installationMatches(status, target) {
     status?.installed_version === target.version &&
     Number(status?.installed_seen_at) > target.startedAt
   )
+}
+
+export async function readInstallationStatus(env) {
+  const query = new URLSearchParams({device_session_id: env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID})
+  const response = await fetch(`http://127.0.0.1:8099/integration/mentra/status?${query}`, {
+    headers: {Authorization: `Bearer ${env.MENTRA_PUBLIC_OPENALMA_BEARER}`},
+    signal: AbortSignal.timeout(1000),
+  })
+  return response.ok ? await response.json() : null
 }
 
 export function writeReleaseStatus(path, value) {
@@ -62,7 +71,7 @@ export function writeReleaseStatus(path, value) {
 
 export function run() {
   loadEnvLocal(root)
-  const host = process.env.MENTRA_RELEASE_HOST ?? "10.77.0.1"
+  const host = new URL(process.env.MENTRA_PUBLIC_OPENALMA_BASE_URL).hostname
   const links = JSON.parse(execFileSync("ip", ["-j", "link", "show", "type", "wireguard"], {encoding: "utf8"}))
   assertPrivateReleaseConfig(host, process.env, networkInterfaces(), links.map((link) => link.ifname))
   const miniapp = spawn(join(root, "node_modules", ".bin", "mentra-miniapp"), releaseArgs(host), {
@@ -107,17 +116,9 @@ export function run() {
       shutdown()
       return
     }
-    const query = new URLSearchParams({
-      user_id: process.env.MENTRA_PUBLIC_OPENALMA_USER_ID,
-      soul_id: process.env.MENTRA_PUBLIC_OPENALMA_SOUL_ID,
-      device_session_id: process.env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID,
-    })
     installationPoll = setInterval(async () => {
       try {
-        const response = await fetch(`http://127.0.0.1:8099/integration/mentra/status?${query}`, {
-          signal: AbortSignal.timeout(1000),
-        })
-        const status = response.ok ? await response.json() : null
+        const status = await readInstallationStatus(process.env)
         if (installationMatches(status, {packageName, version, startedAt})) shutdown()
       } catch {
         // The installer stays available and cancellable while mcp is unreachable.
