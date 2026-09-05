@@ -350,6 +350,9 @@ export class SessionController {
 
     try {
       if (!this.soulId) throw new Error("Choose a soul before starting Iris")
+      if (!this.soulLoading && !this.soulConfirmed && !this.recoverySoulId) {
+        throw new Error("Select or create this soul before starting Iris")
+      }
       this.recoverySoulId = this.soulId
       if (!this.liveController) {
         this.liveController = this.createLiveController({...this.currentConfig(), soulId: this.soulId}, {
@@ -788,6 +791,9 @@ export class SessionController {
         throw new Error("Soul discovery returned an invalid response")
       }
       this.souls = result.souls
+      if (!this.recoverySoulId && this.soulConfirmed && !this.souls.includes(this.soulId)) {
+        this.soulConfirmed = false
+      }
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error)
     }

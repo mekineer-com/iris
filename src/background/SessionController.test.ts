@@ -246,6 +246,7 @@ function setup(
 ) {
   const session = new FakeSession()
   for (const [key, value] of Object.entries(options.stored ?? {})) session.stored.set(key, value)
+  if (!session.stored.has("openalma.soul-id")) session.stored.set("openalma.soul-id", CONFIG.soulId)
   let live!: FakeLive
   const configs: OpenAlmaConfig[] = []
   const controller = new SessionController(session as never, {
@@ -255,7 +256,7 @@ function setup(
     config: CONFIG,
     fetchFn: options.fetchFn ?? (async (url, init) => {
       if (String(url).includes("?user_id=")) {
-        return new Response(JSON.stringify({souls: []}), {headers: {"Content-Type": "application/json"}})
+        return new Response(JSON.stringify({souls: [CONFIG.soulId]}), {headers: {"Content-Type": "application/json"}})
       }
       const body = JSON.parse(String(init?.body))
       return new Response(JSON.stringify({soul_id: body.soul_id, created: !body.use_existing}), {
@@ -344,6 +345,23 @@ describe("SessionController", () => {
 
     await expect(harness.session.handlers["openalma:set-soul"]({soulId: "New Soul", useExisting: false})).rejects.toThrow(
       "Choose another name",
+    )
+  })
+
+  test("keeps an unavailable saved soul visible but requires an explicit new selection", async () => {
+    const harness = setup({
+      stored: {"openalma.soul-id": "Unavailable Soul"},
+      fetchFn: (async () => new Response(JSON.stringify({souls: ["Available Soul"]}))) as typeof fetch,
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(lastSnapshot(harness.session)).toMatchObject({
+      soulId: "Unavailable Soul",
+      souls: ["Available Soul"],
+      soulConfirmed: false,
+    })
+    await expect(harness.session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow(
+      "Select or create this soul",
     )
   })
 
