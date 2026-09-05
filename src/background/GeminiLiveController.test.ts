@@ -1745,7 +1745,28 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
-  test("cold reconnects once only before the first completed provider turn", async () => {
+  test("can reconnect repeatedly while silent after successful setup", async () => {
+    for (const resumable of [false, true]) {
+      const h = harness()
+      await start(h)
+      if (resumable) h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
+      try {
+        for (let index = 0; index < 2; index++) {
+          h.sockets[index].close()
+          await waitFor(() => h.sockets.length === index + 2 || h.errors.length > 0)
+          expect(h.errors).toEqual([])
+          h.sockets[index + 1].open()
+          h.sockets[index + 1].message({setupComplete: {}})
+          await waitFor(() => h.reconnecting.length === (index + 1) * 2)
+        }
+        expect(h.sockets).toHaveLength(3)
+      } finally {
+        await h.controller.stop()
+      }
+    }
+  })
+
+  test("cold reconnect is allowed only before the first completed provider turn", async () => {
     const idle = harness()
     await start(idle)
     idle.sockets[0].close()

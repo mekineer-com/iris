@@ -1420,6 +1420,7 @@ export class GeminiLiveController {
           if (replacement.readyState !== WS_OPEN) {
             throw new Error("Gemini replacement socket closed after setup")
           }
+          this.reconnectAttempted = false
           this.callbacks.onReconnecting(false)
           return
         } catch (error) {
