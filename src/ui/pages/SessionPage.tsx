@@ -108,6 +108,10 @@ export default function SessionPage() {
 
   useEffect(() => {
     setSoulName(snapshot?.soulId ?? "")
+    imageOwner.current += 1
+    setPendingPhoto(null)
+    setImagePending(false)
+    setImageStatus(null)
   }, [snapshot?.soulId])
 
   const discardPhoto = () => {
@@ -155,6 +159,7 @@ export default function SessionPage() {
     setStartPending(true)
     try {
       if (!soulReady && !await selectSoul(soulName.trim(), false)) return
+      if (owner !== startOwner.current) return
       await startRpc({mode})
     } catch (error) {
       if (owner === startOwner.current) {
@@ -230,7 +235,9 @@ export default function SessionPage() {
     setImageStatus(null)
     setImagePending(true)
     try {
-      await imageRpc(await imageRequest(photo.file, photo.imageId, speakPhotoDescriptions))
+      const request = await imageRequest(photo.file, photo.imageId, speakPhotoDescriptions)
+      if (owner !== imageOwner.current) return
+      await imageRpc(request)
       if (owner !== imageOwner.current) return
       discardPhoto()
       setImageStatus("Photo sent")

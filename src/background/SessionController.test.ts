@@ -286,6 +286,51 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
 }
 
 describe("SessionController", () => {
+  test("direct Start waits for discovery and never starts an unavailable saved soul", async () => {
+    let release!: (response: Response) => void
+    const lookup = new Promise<Response>((resolve) => { release = resolve })
+    const h = setup({stored: {"openalma.soul-id": "Missing Soul"}, fetchFn: (() => lookup) as typeof fetch})
+    const starting = h.session.handlers["openalma:start"]({mode: "continuous"})
+    const rejected = Promise.resolve(starting).catch((error: Error) => error.message)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(h.configs).toEqual([])
+    release(new Response(JSON.stringify({souls: [CONFIG.soulId]})))
+    expect(await rejected).toContain("Select or create")
+    expect(h.configs).toEqual([])
+    expect(lastSnapshot(h.session)?.soulId).toBe("Missing Soul")
+  })
+
+  test("immediate Start uses the saved soul and Stop cancels a delayed lookup", async () => {
+    for (const cancel of [false, true]) {
+      let release!: (response: Response) => void
+      const lookup = new Promise<Response>((resolve) => { release = resolve })
+      const h = setup({stored: {"openalma.soul-id": "Saved Soul"}, fetchFn: (() => lookup) as typeof fetch})
+      const starting = h.session.handlers["openalma:start"]({mode: "continuous"})
+      expect(h.configs).toEqual([])
+      if (cancel) await h.session.handlers["openalma:stop"]({})
+      release(new Response(JSON.stringify({souls: ["Saved Soul"]})))
+      await starting
+      expect(h.configs.map((config) => config.soulId)).toEqual(cancel ? [] : ["Saved Soul"])
+      await h.session.handlers["openalma:stop"]({})
+    }
+  })
+
+  test("pending selection excludes Start and concurrent selections", async () => {
+    let release!: (response: Response) => void
+    const selecting = new Promise<Response>((resolve) => { release = resolve })
+    const h = setup({fetchFn: ((url: string) => url.includes("?user_id=")
+      ? Promise.resolve(new Response(JSON.stringify({souls: [CONFIG.soulId]})))
+      : selecting) as typeof fetch})
+    const selection = h.session.handlers["openalma:set-soul"]({soulId: "Next Soul", useExisting: false})
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await expect(h.session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow("selection to finish")
+    await expect(h.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: false})).rejects.toThrow("Finish or recover")
+    release(new Response(JSON.stringify({soul_id: "Next Soul", created: true})))
+    await selection
+    expect(h.configs).toEqual([])
+    expect(lastSnapshot(h.session)).toMatchObject({soulId: "Next Soul", soulLocked: false})
+  })
+
   test("discovers, explicitly reuses, and persists a soul without exposing the bearer to UI", async () => {
     const requests: Array<{url: string; init?: RequestInit}> = []
     const harness = setup({
@@ -333,6 +378,28 @@ describe("SessionController", () => {
       soulConfirmed: true,
       soulLocked: false,
     })
+  })
+
+  test("Stop keeps pending recovery locked until the original soul's journal clears", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    await expect(h.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true})).rejects.toThrow("Finish or recover")
+    const journal = JSON.stringify({version: 1,
+      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+      resumption: {handle: "private-original-handle", updatedAt: Date.now()},
+      pendingTranscripts: [{content: "Fictional pending transcript"}],
+      pendingImage: {imageId: "fictional-photo"},
+    })
+    h.session.stored.set("openalma:gemini-session-v1", journal)
+    await h.session.handlers["openalma:stop"]({})
+    expect(lastSnapshot(h.session)).toMatchObject({connection: "idle", soulLocked: true})
+    await expect(h.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true})).rejects.toThrow("Finish or recover")
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(h.configs.map((config) => config.soulId)).toEqual([CONFIG.soulId, CONFIG.soulId])
+    h.session.stored.delete("openalma:gemini-session-v1")
+    await h.session.handlers["openalma:stop"]({})
+    await h.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true})
+    expect(lastSnapshot(h.session)).toMatchObject({soulId: "Other Soul", soulLocked: false})
   })
 
   test("does not bypass a sanitized collision", async () => {
@@ -591,7 +658,7 @@ describe("SessionController", () => {
     const options: {startGate?: Promise<void>} = {startGate: gate}
     const harness = setup(options)
     const staleStart = harness.session.handlers["openalma:start"]({mode: "continuous"})
-    await Promise.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 0))
     await harness.session.handlers["openalma:stop"]({})
     const staleLive = harness.live
     options.startGate = undefined
@@ -652,7 +719,7 @@ describe("SessionController", () => {
       souls: [],
       soulLoading: true,
       soulConfirmed: false,
-      soulLocked: false,
+      soulLocked: true,
       manualPhase: "idle",
       microphoneEnabled: true,
       cameraEnabled: true,

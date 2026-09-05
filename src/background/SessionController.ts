@@ -57,6 +57,7 @@ export class SessionController {
   private souls: string[] = []
   private soulLoading = true
   private soulConfirmed = false
+  private soulSelecting = false
   private recoverySoulId: string | null = null
   private manualPhase: ManualPhase = "idle"
   private microphoneEnabled = true
@@ -145,28 +146,35 @@ export class SessionController {
         if (this.soulLocked()) throw new Error("Finish or recover this sitting before changing souls")
         const soulId = value.soulId.trim()
         if (!soulId) throw new Error("Enter a soul name")
-        const config = this.currentConfig()
-        const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
-          method: "POST",
-          headers: {Authorization: `Bearer ${config.bearer}`, "Content-Type": "application/json"},
-          body: JSON.stringify({user_id: config.userId, soul_id: soulId, use_existing: value.useExisting}),
-        })
-        if (response.status === 409 && !value.useExisting) {
-          const detail = await response.json().catch(() => null) as {detail?: {reason?: unknown; message?: unknown}} | null
-          if (detail?.detail?.reason === "existing_exact") return {soulId, confirmationRequired: true as const}
-          if (typeof detail?.detail?.message === "string") throw new Error(detail.detail.message)
-        }
-        if (!response.ok) throw new Error(`Soul selection failed (${response.status})`)
-        const result = await response.json() as Partial<{soul_id: string; created: boolean}>
-        if (result.soul_id !== soulId || typeof result.created !== "boolean") {
-          throw new Error("Soul selection returned an invalid response")
-        }
-        await this.session.storage.set(SOUL_ID_KEY, soulId)
-        this.soulId = soulId
-        this.soulConfirmed = true
-        if (!this.souls.includes(soulId)) this.souls = [...this.souls, soulId]
+        this.soulSelecting = true
         this.pushSnapshot()
-        return {soulId, created: result.created}
+        try {
+          const config = this.currentConfig()
+          const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
+            method: "POST",
+            headers: {Authorization: `Bearer ${config.bearer}`, "Content-Type": "application/json"},
+            body: JSON.stringify({user_id: config.userId, soul_id: soulId, use_existing: value.useExisting}),
+          })
+          if (response.status === 409 && !value.useExisting) {
+            const detail = await response.json().catch(() => null) as {detail?: {reason?: unknown; message?: unknown}} | null
+            if (detail?.detail?.reason === "existing_exact") return {soulId, confirmationRequired: true as const}
+            if (typeof detail?.detail?.message === "string") throw new Error(detail.detail.message)
+          }
+          if (!response.ok) throw new Error(`Soul selection failed (${response.status})`)
+          const result = await response.json() as Partial<{soul_id: string; created: boolean}>
+          if (result.soul_id !== soulId || typeof result.created !== "boolean") {
+            throw new Error("Soul selection returned an invalid response")
+          }
+          await this.session.storage.set(SOUL_ID_KEY, soulId)
+          this.soulId = soulId
+          this.soulConfirmed = true
+          if (!this.souls.includes(soulId)) this.souls = [...this.souls, soulId]
+          this.pushSnapshot()
+          return {soulId, created: result.created}
+        } finally {
+          this.soulSelecting = false
+          this.pushSnapshot()
+        }
       }),
     )
     this.unsubs.push(
@@ -332,6 +340,7 @@ export class SessionController {
   }
 
   private async startSession(mode: SessionMode): Promise<void> {
+    if (this.soulSelecting) throw new Error("Wait for soul selection to finish")
     if (this.startInFlight || ACTIVE.has(this.connection) || this.connection === "stopping") {
       return
     }
@@ -349,8 +358,10 @@ export class SessionController {
     this.pushSnapshot()
 
     try {
+      await this.preferencesLoaded
+      if (generation !== this.startGeneration) return
       if (!this.soulId) throw new Error("Choose a soul before starting Iris")
-      if (!this.soulLoading && !this.soulConfirmed && !this.recoverySoulId) {
+      if (!this.soulConfirmed && !this.recoverySoulId) {
         throw new Error("Select or create this soul before starting Iris")
       }
       this.recoverySoulId = this.soulId
@@ -806,11 +817,16 @@ export class SessionController {
   }
 
   private soulLocked(): boolean {
-    return this.connection !== "idle" || this.recoverySoulId !== null
+    return this.soulLoading || this.soulSelecting || ACTIVE.has(this.connection) ||
+      this.connection === "stopping" || this.recoverySoulId !== null
   }
 
   private async refreshRecoveryLock(): Promise<void> {
-    this.recoverySoulId = journalSoulId(await this.session.storage.get(JOURNAL_KEY), this.currentConfig())
+    try {
+      this.recoverySoulId = journalSoulId(await this.session.storage.get(JOURNAL_KEY), this.currentConfig())
+    } catch {
+      this.lastError = "Local recovery state unavailable; reopen Iris to retry"
+    }
   }
 
   private resetManualState(): void {

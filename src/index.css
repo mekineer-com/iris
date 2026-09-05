@@ -135,7 +135,7 @@ input {
 }
 
 select,
-input,
+.soul-control input,
 button {
   min-height: 3rem;
   border: 1px solid rgb(24 49 39 / 28%);
@@ -143,14 +143,10 @@ button {
 }
 
 select,
-input {
+.soul-control input {
   padding: 0 0.8rem;
   background: rgb(255 255 255 / 62%);
   color: inherit;
-}
-
-.soul-control {
-  margin: 1.5rem 0;
 }
 
 .soul-control > p {
@@ -217,7 +213,7 @@ button:disabled {
   }
 
   select,
-  input,
+  .soul-control input,
   .soul-suggestions button {
     background: rgb(0 0 0 / 20%);
   }
