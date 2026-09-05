@@ -330,13 +330,13 @@ export default function SessionPage() {
         </label>
         <p>Selected soul: {snapshot?.soulId || "Choose a soul"}</p>
         {!soulLocked && snapshot?.souls.length ? (
-          <div className="soul-suggestions" aria-label="Existing souls">
+          <select aria-label="Existing souls" value="" disabled={soulPending}
+            onChange={(event) => { if (event.target.value) void selectSoul(event.target.value, true) }}>
+            <option value="">Select existing soul</option>
             {snapshot.souls.map((soul) => (
-              <button key={soul} type="button" disabled={soulPending} onClick={() => void selectSoul(soul, true)}>
-                {soul}
-              </button>
+              <option key={soul} value={soul}>{soul}</option>
             ))}
-          </div>
+          </select>
         ) : null}
         {confirmationSoul ? (
           <div role="alert">

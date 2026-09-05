@@ -153,18 +153,6 @@ select,
   margin: 0.35rem 0;
 }
 
-.soul-suggestions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-}
-
-.soul-suggestions button {
-  min-height: 2.25rem;
-  color: var(--ink);
-  background: rgb(255 255 255 / 62%);
-}
-
 .controls,
 .manual-controls {
   display: grid;
@@ -213,8 +201,7 @@ button:disabled {
   }
 
   select,
-  .soul-control input,
-  .soul-suggestions button {
+  .soul-control input {
     background: rgb(0 0 0 / 20%);
   }
 

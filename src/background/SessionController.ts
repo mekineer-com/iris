@@ -806,6 +806,7 @@ export class SessionController {
         this.soulConfirmed = false
       }
     } catch (error) {
+      this.soulConfirmed = Boolean(this.recoverySoulId)
       this.lastError = error instanceof Error ? error.message : String(error)
     }
     this.soulLoading = false

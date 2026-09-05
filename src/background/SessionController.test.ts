@@ -432,6 +432,14 @@ describe("SessionController", () => {
     )
   })
 
+  test("failed discovery does not confirm a saved soul", async () => {
+    const harness = setup({fetchFn: (async () => new Response("unavailable", {status: 503})) as typeof fetch})
+    await expect(harness.session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow(
+      "Select or create this soul",
+    )
+    expect(lastSnapshot(harness.session).soulConfirmed).toBe(false)
+  })
+
   test("keeps a recovered journal soul locked and binds each new sitting to its selected soul", async () => {
     const journal = JSON.stringify({
       version: 1,
