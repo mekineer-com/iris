@@ -1,7 +1,7 @@
 import {useEffect, useRef, useState} from "react"
 import {useRpc} from "@mentra/miniapp/ui"
 
-import type {Channels, ImageRequest} from "../../shared/channels"
+import type {Channels, ImageRequest, SelectSoulResult} from "../../shared/channels"
 import {PHOTO_RETRY_MESSAGE, type ConnectionState, type ManualAction, type ManualPhase, type SessionMode} from "../../shared/types"
 import {useChannel} from "../hooks/useChannel"
 
@@ -76,6 +76,7 @@ export default function SessionPage() {
   const snapshot = useChannel("openalma:update")
   const startRpc = useRpc<Channels, "openalma:start">("openalma:start")
   const stopRpc = useRpc<Channels, "openalma:stop">("openalma:stop")
+  const soulRpc = useRpc<Channels, "openalma:set-soul">("openalma:set-soul")
   const modeRpc = useRpc<Channels, "openalma:set-mode">("openalma:set-mode")
   const capabilitiesRpc = useRpc<Channels, "openalma:set-capabilities">("openalma:set-capabilities")
   const manualRpc = useRpc<Channels, "openalma:manual-action">("openalma:manual-action")
@@ -83,6 +84,9 @@ export default function SessionPage() {
   const pendingImageRpc = useRpc<Channels, "openalma:pending-image">("openalma:pending-image")
   const [startPending, setStartPending] = useState(false)
   const [stopPending, setStopPending] = useState(false)
+  const [soulName, setSoulName] = useState("")
+  const [soulPending, setSoulPending] = useState(false)
+  const [confirmationSoul, setConfirmationSoul] = useState<string | null>(null)
   const [modePending, setModePending] = useState(false)
   const [capabilitiesPending, setCapabilitiesPending] = useState(false)
   const [manualPending, setManualPending] = useState(false)
@@ -102,6 +106,10 @@ export default function SessionPage() {
     if (pendingPhoto?.previewUrl) URL.revokeObjectURL(pendingPhoto.previewUrl)
   }, [pendingPhoto])
 
+  useEffect(() => {
+    setSoulName(snapshot?.soulId ?? "")
+  }, [snapshot?.soulId])
+
   const discardPhoto = () => {
     setPendingPhoto(null)
   }
@@ -118,12 +126,35 @@ export default function SessionPage() {
   const reconnecting = visible === "reconnecting"
   const active = starting || reconnecting || visible === "listening" || visible === "speaking"
   const modeDisabled = active || stopping || startPending || stopPending || modePending
+  const soulLocked = snapshot?.soulLocked ?? true
+  const soulReady = snapshot?.soulConfirmed && soulName.trim() === snapshot.soulId
+
+  const selectSoul = async (soulId: string, useExisting: boolean): Promise<boolean> => {
+    setRpcError(null)
+    setSoulPending(true)
+    try {
+      const result = await soulRpc({soulId, useExisting}) as SelectSoulResult
+      if ("confirmationRequired" in result) {
+        setConfirmationSoul(result.soulId)
+        return false
+      }
+      setSoulName(result.soulId)
+      setConfirmationSoul(null)
+      return true
+    } catch (error) {
+      setRpcError(error instanceof Error ? error.message : String(error))
+      return false
+    } finally {
+      setSoulPending(false)
+    }
+  }
 
   const onStart = async () => {
     const owner = ++startOwner.current
     setRpcError(null)
     setStartPending(true)
     try {
+      if (!soulReady && !await selectSoul(soulName.trim(), false)) return
       await startRpc({mode})
     } catch (error) {
       if (owner === startOwner.current) {
@@ -263,7 +294,7 @@ export default function SessionPage() {
         : visible === "error"
           ? "Retry"
           : "Start"
-  const sittingDisabled = stopping || stopPending || modePending || (!active && startPending)
+  const sittingDisabled = stopping || stopPending || modePending || soulPending || snapshot?.soulLoading !== false || (!active && startPending)
   const showSpinner = starting || reconnecting || stopping
   const manualDisabled = manualPending || visible === "speaking"
   const voiceReady = visible === "listening" || visible === "speaking"
@@ -278,6 +309,38 @@ export default function SessionPage() {
         {showSpinner ? <span className="spinner" aria-hidden="true" /> : null}
         {statusText(visible, mode, manualPhase)}
       </p>
+      <section className="soul-control" aria-label="Soul selection">
+        <label className="mode-control">
+          <span>Soul</span>
+          <input
+            value={soulName}
+            disabled={soulLocked || soulPending}
+            onChange={(event) => {
+              setSoulName(event.target.value)
+              setConfirmationSoul(null)
+            }}
+          />
+        </label>
+        <p>Selected soul: {snapshot?.soulId || "Choose a soul"}</p>
+        {!soulLocked && snapshot?.souls.length ? (
+          <div className="soul-suggestions" aria-label="Existing souls">
+            {snapshot.souls.map((soul) => (
+              <button key={soul} type="button" disabled={soulPending} onClick={() => void selectSoul(soul, true)}>
+                {soul}
+              </button>
+            ))}
+          </div>
+        ) : null}
+        {confirmationSoul ? (
+          <div role="alert">
+            <p>{confirmationSoul} already exists. Use its existing database?</p>
+            <button type="button" disabled={soulPending} onClick={() => void selectSoul(confirmationSoul, true)}>
+              Use existing soul
+            </button>
+          </div>
+        ) : null}
+        {soulLocked ? <p>Finish this sitting before changing souls.</p> : null}
+      </section>
       <label className="mode-control">
         <span>Speech mode</span>
         <select

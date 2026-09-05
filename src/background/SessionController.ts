@@ -11,7 +11,7 @@ import type {
   SessionSnapshot,
 } from "../shared/types"
 import {approxBase64ByteLength, normalizePcm16Audio} from "./audioHelpers"
-import {GeminiLiveController} from "./GeminiLiveController"
+import {GeminiLiveController, JOURNAL_KEY, journalSoulId} from "./GeminiLiveController"
 import type {GeminiCallbacks} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {readOpenAlmaConfig} from "./openAlmaConfig"
@@ -30,6 +30,7 @@ export type SessionControllerOptions = {
   earconTimeoutMs?: number
   responseWatchdogMs?: number
   config?: OpenAlmaConfig
+  fetchFn?: typeof fetch
   createLiveController?: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
 }
 
@@ -38,6 +39,7 @@ const MAX_MANUAL_AUDIO_BYTES = 16000 * 2 * 120
 const MANUAL_LIMIT_MESSAGE = "Manual recording reached 120-second limit"
 const MICROPHONE_ENABLED_KEY = "openalma.microphone-enabled"
 const CAMERA_ENABLED_KEY = "openalma.camera-enabled"
+const SOUL_ID_KEY = "openalma.soul-id"
 
 function trace(event: string, detail: Record<string, unknown> = {}): void {
   if (process.env.NODE_ENV === "test") return
@@ -51,6 +53,11 @@ export class SessionController {
 
   private mode: SessionMode = "continuous"
   private connection: ConnectionState = "idle"
+  private soulId = ""
+  private souls: string[] = []
+  private soulLoading = true
+  private soulConfirmed = false
+  private recoverySoulId: string | null = null
   private manualPhase: ManualPhase = "idle"
   private microphoneEnabled = true
   private cameraEnabled = true
@@ -81,6 +88,7 @@ export class SessionController {
   private readonly earconTimeoutMs: number
   private readonly responseWatchdogMs: number
   private readonly config?: OpenAlmaConfig
+  private readonly fetchFn: typeof fetch
   private readonly createLiveController: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
   private liveController: GeminiLiveController | null
 
@@ -93,6 +101,8 @@ export class SessionController {
     this.earconTimeoutMs = options.earconTimeoutMs ?? 2000
     this.responseWatchdogMs = options.responseWatchdogMs ?? 60_000
     this.config = options.config
+    this.soulId = options.config?.soulId ?? ""
+    this.fetchFn = options.fetchFn ?? fetch
     this.createLiveController =
       options.createLiveController ??
       ((config, callbacks) => new GeminiLiveController(config, callbacks, {storage: this.session.storage}))
@@ -123,6 +133,40 @@ export class SessionController {
           throw new Error(this.lastError || "start failed")
         }
         return {ok: true as const}
+      }),
+    )
+    this.unsubs.push(
+      ui.handle("openalma:set-soul", async (payload) => {
+        await this.preferencesLoaded
+        const value = payload as {soulId?: unknown; useExisting?: unknown} | null
+        if (typeof value?.soulId !== "string" || typeof value?.useExisting !== "boolean") {
+          throw new Error("Invalid soul selection")
+        }
+        if (this.soulLocked()) throw new Error("Finish or recover this sitting before changing souls")
+        const soulId = value.soulId.trim()
+        if (!soulId) throw new Error("Enter a soul name")
+        const config = this.currentConfig()
+        const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
+          method: "POST",
+          headers: {Authorization: `Bearer ${config.bearer}`, "Content-Type": "application/json"},
+          body: JSON.stringify({user_id: config.userId, soul_id: soulId, use_existing: value.useExisting}),
+        })
+        if (response.status === 409 && !value.useExisting) {
+          const detail = await response.json().catch(() => null) as {detail?: {reason?: unknown; message?: unknown}} | null
+          if (detail?.detail?.reason === "existing_exact") return {soulId, confirmationRequired: true as const}
+          if (typeof detail?.detail?.message === "string") throw new Error(detail.detail.message)
+        }
+        if (!response.ok) throw new Error(`Soul selection failed (${response.status})`)
+        const result = await response.json() as Partial<{soul_id: string; created: boolean}>
+        if (result.soul_id !== soulId || typeof result.created !== "boolean") {
+          throw new Error("Soul selection returned an invalid response")
+        }
+        await this.session.storage.set(SOUL_ID_KEY, soulId)
+        this.soulId = soulId
+        this.soulConfirmed = true
+        if (!this.souls.includes(soulId)) this.souls = [...this.souls, soulId]
+        this.pushSnapshot()
+        return {soulId, created: result.created}
       }),
     )
     this.unsubs.push(
@@ -268,6 +312,11 @@ export class SessionController {
     return {
       mode: this.mode,
       connection: this.connection,
+      soulId: this.soulId,
+      souls: this.souls,
+      soulLoading: this.soulLoading,
+      soulConfirmed: this.soulConfirmed,
+      soulLocked: this.soulLocked(),
       manualPhase: this.manualPhase,
       microphoneEnabled: this.microphoneEnabled,
       cameraEnabled: this.cameraEnabled,
@@ -300,8 +349,10 @@ export class SessionController {
     this.pushSnapshot()
 
     try {
+      if (!this.soulId) throw new Error("Choose a soul before starting Iris")
+      this.recoverySoulId = this.soulId
       if (!this.liveController) {
-        this.liveController = this.createLiveController(this.config ?? readOpenAlmaConfig(), {
+        this.liveController = this.createLiveController({...this.currentConfig(), soulId: this.soulId}, {
           onAudio: (pcm) => this.onGeminiAudio(pcm),
           onTurnComplete: (finalResponse) => {
             if (this.connection === "starting") this.startupTurnComplete = true
@@ -471,6 +522,8 @@ export class SessionController {
       this.pendingSpeechWrites.clear()
     }
     if (generation !== this.startGeneration) return
+
+    await this.refreshRecoveryLock()
 
     if (this.teardownKind === "stop") {
       try {
@@ -708,13 +761,50 @@ export class SessionController {
   }
 
   private async loadPreferences(): Promise<void> {
-    const [microphone, camera] = await Promise.all([
+    const config = this.currentConfig()
+    const [microphone, camera, storedSoul, journal] = await Promise.all([
       this.session.storage.get(MICROPHONE_ENABLED_KEY),
       this.session.storage.get(CAMERA_ENABLED_KEY),
+      this.session.storage.get(SOUL_ID_KEY),
+      this.session.storage.get(JOURNAL_KEY),
     ])
     this.microphoneEnabled = microphone !== "0"
     this.cameraEnabled = camera !== "0"
+    this.soulId = storedSoul?.trim() || config.soulId
+    this.soulConfirmed = Boolean(storedSoul?.trim())
+    this.recoverySoulId = journalSoulId(journal, config)
+    if (this.recoverySoulId) {
+      this.soulId = this.recoverySoulId
+      this.soulConfirmed = true
+    }
+    try {
+      const response = await this.fetchFn(
+        `${config.baseUrl}/integration/mentra/souls?user_id=${encodeURIComponent(config.userId)}`,
+        {headers: {Authorization: `Bearer ${config.bearer}`}},
+      )
+      if (!response.ok) throw new Error(`Soul discovery failed (${response.status})`)
+      const result = await response.json() as Partial<{souls: unknown}>
+      if (!Array.isArray(result.souls) || result.souls.some((soul) => typeof soul !== "string")) {
+        throw new Error("Soul discovery returned an invalid response")
+      }
+      this.souls = result.souls
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error)
+    }
+    this.soulLoading = false
     this.pushSnapshot()
+  }
+
+  private currentConfig(): OpenAlmaConfig {
+    return this.config ?? readOpenAlmaConfig()
+  }
+
+  private soulLocked(): boolean {
+    return this.connection !== "idle" || this.recoverySoulId !== null
+  }
+
+  private async refreshRecoveryLock(): Promise<void> {
+    this.recoverySoulId = journalSoulId(await this.session.storage.get(JOURNAL_KEY), this.currentConfig())
   }
 
   private resetManualState(): void {

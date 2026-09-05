@@ -8,6 +8,11 @@ import {SessionController} from "./SessionController"
 type Snapshot = {
   mode: string
   connection: string
+  soulId: string
+  souls: string[]
+  soulLoading: boolean
+  soulConfirmed: boolean
+  soulLocked: boolean
   manualPhase: string
   microphoneEnabled: boolean
   cameraEnabled: boolean
@@ -236,17 +241,29 @@ function setup(
     responseWatchdogMs?: number
     startGate?: Promise<void>
     stored?: Record<string, string>
+    fetchFn?: typeof fetch
   } = {},
 ) {
   const session = new FakeSession()
   for (const [key, value] of Object.entries(options.stored ?? {})) session.stored.set(key, value)
   let live!: FakeLive
+  const configs: OpenAlmaConfig[] = []
   const controller = new SessionController(session as never, {
     watchdogMs: options.watchdogMs ?? 5000,
     earconTimeoutMs: options.earconTimeoutMs,
     responseWatchdogMs: options.responseWatchdogMs,
     config: CONFIG,
-    createLiveController: (_config, callbacks) => {
+    fetchFn: options.fetchFn ?? (async (url, init) => {
+      if (String(url).includes("?user_id=")) {
+        return new Response(JSON.stringify({souls: []}), {headers: {"Content-Type": "application/json"}})
+      }
+      const body = JSON.parse(String(init?.body))
+      return new Response(JSON.stringify({soul_id: body.soul_id, created: !body.use_existing}), {
+        headers: {"Content-Type": "application/json"},
+      })
+    }) as typeof fetch,
+    createLiveController: (config, callbacks) => {
+      configs.push(config)
       live = new FakeLive(callbacks)
       live.startGate = options.startGate ?? null
       return live as unknown as GeminiLiveController
@@ -259,6 +276,7 @@ function setup(
     get live() {
       return live
     },
+    configs,
   }
 }
 
@@ -267,6 +285,88 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
 }
 
 describe("SessionController", () => {
+  test("discovers, explicitly reuses, and persists a soul without exposing the bearer to UI", async () => {
+    const requests: Array<{url: string; init?: RequestInit}> = []
+    const harness = setup({
+      fetchFn: (async (url: string, init?: RequestInit) => {
+        requests.push({url, init})
+        if (url.includes("?user_id=")) {
+          return new Response(JSON.stringify({souls: ["Existing Soul"]}), {headers: {"Content-Type": "application/json"}})
+        }
+        const body = JSON.parse(String(init?.body))
+        if (!body.use_existing) {
+          return new Response(JSON.stringify({detail: {reason: "existing_exact", message: "Soul exists"}}), {status: 409})
+        }
+        return new Response(JSON.stringify({soul_id: body.soul_id, created: false}), {
+          headers: {"Content-Type": "application/json"},
+        })
+      }) as typeof fetch,
+    })
+
+    await expect(harness.session.handlers["openalma:set-soul"]({soulId: "Existing Soul", useExisting: false})).resolves.toEqual({
+      soulId: "Existing Soul",
+      confirmationRequired: true,
+    })
+    await expect(harness.session.handlers["openalma:set-soul"]({soulId: "Existing Soul", useExisting: true})).resolves.toEqual({
+      soulId: "Existing Soul",
+      created: false,
+    })
+
+    expect(requests[0]).toEqual({
+      url: "http://127.0.0.1:9999/integration/mentra/souls?user_id=Test%20User",
+      init: {headers: {Authorization: "Bearer fictional"}},
+    })
+    expect(JSON.parse(String(requests.at(-1)?.init?.body))).toEqual({
+      user_id: "Test User",
+      soul_id: "Existing Soul",
+      use_existing: true,
+    })
+    expect(requests.at(-1)?.init?.headers).toEqual({
+      Authorization: "Bearer fictional",
+      "Content-Type": "application/json",
+    })
+    expect(harness.session.stored.get("openalma.soul-id")).toBe("Existing Soul")
+    expect(lastSnapshot(harness.session)).toMatchObject({
+      soulId: "Existing Soul",
+      souls: ["Existing Soul"],
+      soulConfirmed: true,
+      soulLocked: false,
+    })
+  })
+
+  test("does not bypass a sanitized collision", async () => {
+    const harness = setup({
+      fetchFn: (async (url: string) => {
+        if (url.includes("?user_id=")) return new Response(JSON.stringify({souls: []}))
+        return new Response(JSON.stringify({detail: {reason: "sanitized_collision", message: "Choose another name"}}), {status: 409})
+      }) as typeof fetch,
+    })
+
+    await expect(harness.session.handlers["openalma:set-soul"]({soulId: "New Soul", useExisting: false})).rejects.toThrow(
+      "Choose another name",
+    )
+  })
+
+  test("keeps a recovered journal soul locked and binds each new sitting to its selected soul", async () => {
+    const journal = JSON.stringify({
+      version: 1,
+      scope: {userId: "Test User", soulId: "Recovery Soul", deviceSessionId: "test-phone"},
+    })
+    const locked = setup({stored: {"openalma:gemini-session-v1": journal}})
+    await expect(locked.session.handlers["openalma:set-soul"]({soulId: "New Soul", useExisting: false})).rejects.toThrow(
+      "Finish or recover",
+    )
+    expect(lastSnapshot(locked.session)).toMatchObject({soulId: "Recovery Soul", soulLocked: true})
+
+    const harness = setup()
+    await harness.session.handlers["openalma:set-soul"]({soulId: "First Soul", useExisting: false})
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    await harness.session.handlers["openalma:stop"]({})
+    await harness.session.handlers["openalma:set-soul"]({soulId: "Second Soul", useExisting: false})
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(harness.configs.map((config) => config.soulId)).toEqual(["First Soul", "Second Soul"])
+  })
+
   test("routes images only while a sitting is active", async () => {
     const harness = setup()
     await expect(harness.session.handlers["openalma:image"]({})).rejects.toThrow("Start Iris")
@@ -530,6 +630,11 @@ describe("SessionController", () => {
     expect(harness.session.snapshots[0]).toEqual({
       mode: "continuous",
       connection: "idle",
+      soulId: "Test Soul",
+      souls: [],
+      soulLoading: true,
+      soulConfirmed: false,
+      soulLocked: false,
       manualPhase: "idle",
       microphoneEnabled: true,
       cameraEnabled: true,

@@ -8,6 +8,11 @@ export const PHOTO_RETRY_MESSAGE = "This photo didn't make it through. Retry or 
 export interface SessionSnapshot {
   mode: SessionMode
   connection: ConnectionState
+  soulId: string
+  souls: string[]
+  soulLoading: boolean
+  soulConfirmed: boolean
+  soulLocked: boolean
   manualPhase: ManualPhase
   microphoneEnabled: boolean
   cameraEnabled: boolean

@@ -61,7 +61,8 @@ h1 {
   to { transform: rotate(360deg); }
 }
 
-.mode-control {
+.mode-control,
+.soul-control {
   display: grid;
   gap: 0.35rem;
   margin: 1.5rem 0;
@@ -128,21 +129,44 @@ h1 {
 }
 
 button,
-select {
+select,
+input {
   font: inherit;
 }
 
 select,
+input,
 button {
   min-height: 3rem;
   border: 1px solid rgb(24 49 39 / 28%);
   border-radius: 0.65rem;
 }
 
-select {
+select,
+input {
   padding: 0 0.8rem;
   background: rgb(255 255 255 / 62%);
   color: inherit;
+}
+
+.soul-control {
+  margin: 1.5rem 0;
+}
+
+.soul-control > p {
+  margin: 0.35rem 0;
+}
+
+.soul-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.soul-suggestions button {
+  min-height: 2.25rem;
+  color: var(--ink);
+  background: rgb(255 255 255 / 62%);
 }
 
 .controls,
@@ -192,7 +216,9 @@ button:disabled {
       linear-gradient(145deg, #1d3329, var(--paper));
   }
 
-  select {
+  select,
+  input,
+  .soul-suggestions button {
     background: rgb(0 0 0 / 20%);
   }
 

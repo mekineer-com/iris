@@ -8,10 +8,15 @@ export type ImageRequest = {
   speakDescription?: boolean
 }
 
+export type SelectSoulResult =
+  | {soulId: string; created: boolean}
+  | {soulId: string; confirmationRequired: true}
+
 export interface Channels {
   "openalma:update": SessionSnapshot
   "openalma:start": Rpc<{mode: SessionMode}, {ok: true}>
   "openalma:stop": Rpc<Record<string, never>, {ok: true}>
+  "openalma:set-soul": Rpc<{soulId: string; useExisting: boolean}, SelectSoulResult>
   "openalma:set-mode": Rpc<{mode: SessionMode}, {ok: true}>
   "openalma:set-capabilities": Rpc<{
     microphoneEnabled?: boolean

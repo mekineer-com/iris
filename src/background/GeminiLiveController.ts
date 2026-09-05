@@ -99,10 +99,27 @@ const RECALL_TIMEOUT_MS = 30_000
 const REFLECTION_TIMEOUT_MS = 8_000
 const RECONNECT_SETUP_ATTEMPTS = 6
 const GO_AWAY_MARGIN_MS = 2_000
-const JOURNAL_KEY = "openalma:gemini-session-v1"
+export const JOURNAL_KEY = "openalma:gemini-session-v1"
 const RESUMPTION_MAX_AGE_MS = 30 * 60 * 1000
 export const SITTING_REFLECTION_PROMPT =
   "Reflect briefly in first person on the emotional tone, subtext, or meaningful shift in this sitting that the literal transcript may not preserve. Do not recap the conversation. Respond with one or two natural sentences, or exactly NO_SUMMARY if nothing worthwhile would be added."
+
+export function journalSoulId(raw: string | null, config: Pick<OpenAlmaConfig, "userId" | "deviceSessionId">): string | null {
+  try {
+    const journal = JSON.parse(raw ?? "") as Partial<SessionJournal>
+    const scope = journal.scope
+    if (
+      journal.version !== 1 ||
+      scope?.userId !== config.userId ||
+      scope.deviceSessionId !== config.deviceSessionId ||
+      typeof scope.soulId !== "string" ||
+      !scope.soulId.trim()
+    ) return null
+    return scope.soulId
+  } catch {
+    return null
+  }
+}
 
 class TokenRefreshError extends Error {
   constructor(message: string, readonly retryable: boolean) {
