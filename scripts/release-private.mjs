@@ -35,7 +35,7 @@ export function assertPrivateReleaseConfig(host, env, interfaces, wireguardNames
 }
 
 export function releaseArgs(host) {
-  return ["release", "--host", host, "--port", "6789"]
+  return ["release", "--host", host, "--port", "6789", "--no-cache"]
 }
 
 export function installationMatches(status, target) {

@@ -36,7 +36,7 @@ describe("private release URI", () => {
       "miniapp://release?url=http%3A%2F%2F10.77.0.1%3A6789&package=com.openalma.mentra&version=0.1.0&name=OpenAlma"
     const release = new URL(findReleaseUri(`before\n${uri}\nafter`))
 
-    expect(releaseArgs("10.77.0.1")).toEqual(["release", "--host", "10.77.0.1", "--port", "6789"])
+    expect(releaseArgs("10.77.0.1")).toEqual(["release", "--host", "10.77.0.1", "--port", "6789", "--no-cache"])
     expect(release.searchParams.get("url")).toBe("http://10.77.0.1:6789")
     expect(release.searchParams.get("package")).toBe("com.openalma.mentra")
     expect(release.searchParams.get("version")).toBe("0.1.0")
