@@ -116,6 +116,11 @@ export function journalSoulId(raw: string | null, config: Pick<OpenAlmaConfig, "
       typeof scope.soulId !== "string" ||
       !scope.soulId.trim()
     ) return null
+    if (
+      !journal.pendingTranscripts?.length && !journal.pendingImage &&
+      !(journal.resumption?.handle?.trim() && Number.isFinite(journal.resumption.updatedAt) &&
+        Date.now() - journal.resumption.updatedAt <= RESUMPTION_MAX_AGE_MS)
+    ) return null
     return scope.soulId
   } catch {
     return null

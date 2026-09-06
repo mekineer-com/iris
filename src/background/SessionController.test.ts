@@ -444,6 +444,7 @@ describe("SessionController", () => {
     const journal = JSON.stringify({
       version: 1,
       scope: {userId: "Test User", soulId: "Recovery Soul", deviceSessionId: "test-phone"},
+      resumption: {handle: "fictional-handle", updatedAt: Date.now()},
     })
     const locked = setup({stored: {"openalma:gemini-session-v1": journal}})
     await expect(locked.session.handlers["openalma:set-soul"]({soulId: "New Soul", useExisting: false})).rejects.toThrow(
@@ -458,6 +459,18 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:set-soul"]({soulId: "Second Soul", useExisting: false})
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     expect(harness.configs.map((config) => config.soulId)).toEqual(["First Soul", "Second Soul"])
+  })
+
+  test("empty or expired recovery does not pin a soul", async () => {
+    for (const resumption of [null, {handle: "expired", updatedAt: Date.now() - 31 * 60 * 1000}]) {
+      const journal = JSON.stringify({version: 1,
+        scope: {userId: CONFIG.userId, soulId: "Old Soul", deviceSessionId: CONFIG.deviceSessionId},
+        pendingTranscripts: [], pendingImage: null, resumption,
+      })
+      const h = setup({stored: {"openalma:gemini-session-v1": journal}})
+      await h.session.handlers["openalma:set-soul"]({soulId: "New Soul", useExisting: false})
+      expect(lastSnapshot(h.session)).toMatchObject({soulId: "New Soul", soulLocked: false})
+    }
   })
 
   test("routes images only while a sitting is active", async () => {
