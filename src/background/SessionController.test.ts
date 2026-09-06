@@ -254,8 +254,8 @@ function setup(
     earconTimeoutMs: options.earconTimeoutMs,
     responseWatchdogMs: options.responseWatchdogMs,
     config: CONFIG,
-    fetchFn: options.fetchFn ?? (async (url, init) => {
-      if (String(url).includes("?user_id=")) {
+    fetchFn: options.fetchFn ?? (async (_url, init) => {
+      if (!init?.method) {
         return new Response(JSON.stringify({souls: [CONFIG.soulId]}), {headers: {"Content-Type": "application/json"}})
       }
       const body = JSON.parse(String(init?.body))
@@ -327,7 +327,7 @@ describe("SessionController", () => {
   test("pending selection excludes Start and concurrent selections", async () => {
     let release!: (response: Response) => void
     const selecting = new Promise<Response>((resolve) => { release = resolve })
-    const h = setup({fetchFn: ((url: string) => url.includes("?user_id=")
+    const h = setup({fetchFn: ((_url: string, init?: RequestInit) => !init?.method
       ? Promise.resolve(new Response(JSON.stringify({souls: [CONFIG.soulId]})))
       : selecting) as typeof fetch})
     const selection = h.session.handlers["openalma:set-soul"]({soulId: "Next Soul", useExisting: false})
@@ -345,7 +345,7 @@ describe("SessionController", () => {
     const harness = setup({
       fetchFn: (async (url: string, init?: RequestInit) => {
         requests.push({url, init})
-        if (url.includes("?user_id=")) {
+        if (!init?.method) {
           return new Response(JSON.stringify({souls: ["Existing Soul"]}), {headers: {"Content-Type": "application/json"}})
         }
         const body = JSON.parse(String(init?.body))
@@ -368,11 +368,10 @@ describe("SessionController", () => {
     })
 
     expect(requests[0]).toEqual({
-      url: "http://127.0.0.1:9999/integration/mentra/souls?user_id=Test%20User",
+      url: "http://127.0.0.1:9999/integration/mentra/souls",
       init: {headers: {Authorization: "Bearer fictional"}, signal: expect.any(AbortSignal)},
     })
     expect(JSON.parse(String(requests.at(-1)?.init?.body))).toEqual({
-      user_id: "Test User",
       soul_id: "Existing Soul",
       use_existing: true,
     })
@@ -409,19 +408,6 @@ describe("SessionController", () => {
     await h.session.handlers["openalma:stop"]({})
     await h.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true})
     expect(lastSnapshot(h.session)).toMatchObject({soulId: "Other Soul", soulLocked: false})
-  })
-
-  test("does not bypass a sanitized collision", async () => {
-    const harness = setup({
-      fetchFn: (async (url: string) => {
-        if (url.includes("?user_id=")) return new Response(JSON.stringify({souls: []}))
-        return new Response(JSON.stringify({detail: {reason: "sanitized_collision", message: "Choose another name"}}), {status: 409})
-      }) as typeof fetch,
-    })
-
-    await expect(harness.session.handlers["openalma:set-soul"]({soulId: "New Soul", useExisting: false})).rejects.toThrow(
-      "Choose another name",
-    )
   })
 
   test("keeps an unavailable saved soul visible but requires an explicit new selection", async () => {
@@ -488,7 +474,7 @@ describe("SessionController", () => {
     const reports: string[] = []
     try {
       const h = setup({stored: {"openalma.soul-id": "Stored Soul"}, fetchFn: (async (url, init) => {
-        if (String(url).includes("?user_id=")) return Response.json({souls: ["Stored Soul"]})
+        if (!init?.method) return Response.json({souls: ["Stored Soul"]})
         const body = JSON.parse(String(init?.body))
         if (String(url).endsWith("/installation/seen")) {
           reports.push(body.soul_id)

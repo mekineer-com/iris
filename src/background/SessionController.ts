@@ -155,7 +155,7 @@ export class SessionController {
             method: "POST",
             signal: AbortSignal.timeout(10_000),
             headers: {Authorization: `Bearer ${config.bearer}`, "Content-Type": "application/json"},
-            body: JSON.stringify({user_id: config.userId, soul_id: soulId, use_existing: value.useExisting}),
+            body: JSON.stringify({soul_id: soulId, use_existing: value.useExisting}),
           })
           if (response.status === 409) {
             const detail = await response.json().catch(() => null) as {detail?: {reason?: unknown; message?: unknown}} | null
@@ -164,15 +164,16 @@ export class SessionController {
           }
           if (!response.ok) throw new Error(`Soul selection failed (${response.status})`)
           const result = await response.json() as Partial<{soul_id: string; created: boolean}>
-          if (result.soul_id !== soulId || typeof result.created !== "boolean") {
+          if (typeof result.soul_id !== "string" || !result.soul_id || typeof result.created !== "boolean") {
             throw new Error("Soul selection returned an invalid response")
           }
-          await this.session.storage.set(SOUL_ID_KEY, soulId)
-          this.soulId = soulId
+          const selectedSoul = result.soul_id
+          await this.session.storage.set(SOUL_ID_KEY, selectedSoul)
+          this.soulId = selectedSoul
           this.soulConfirmed = true
-          if (!this.souls.includes(soulId)) this.souls = [...this.souls, soulId]
+          if (!this.souls.includes(selectedSoul)) this.souls = [...this.souls, selectedSoul]
           await this.reportSelectedSoul()
-          return {soulId, created: result.created}
+          return {soulId: selectedSoul, created: result.created}
         } finally {
           this.soulSelecting = false
           this.pushSnapshot()
@@ -801,10 +802,9 @@ export class SessionController {
       this.soulId = storedSoul?.trim() || config.soulId
       this.recoverySoulId = journalSoulId(journal, config)
       if (this.recoverySoulId) this.soulId = this.recoverySoulId
-      const response = await this.fetchFn(
-        `${config.baseUrl}/integration/mentra/souls?user_id=${encodeURIComponent(config.userId)}`,
-        {headers: {Authorization: `Bearer ${config.bearer}`}, signal: AbortSignal.timeout(10_000)},
-      )
+      const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
+        headers: {Authorization: `Bearer ${config.bearer}`}, signal: AbortSignal.timeout(10_000),
+      })
       if (!response.ok) throw new Error(`Soul discovery failed (${response.status})`)
       const result = await response.json() as Partial<{souls: unknown}>
       if (!Array.isArray(result.souls) || result.souls.some((soul) => typeof soul !== "string")) {
