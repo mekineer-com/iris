@@ -269,6 +269,23 @@ function completeTurn(h: ReturnType<typeof harness>, input = "hello", output = "
 }
 
 describe("GeminiLiveController", () => {
+  test("rejects recovery belonging to another soul without sending its contents", async () => {
+    const storage = new FakeStorage()
+    storage.values.set("openalma:gemini-session-v1", JSON.stringify({
+      version: 1,
+      scope: {userId: CONFIG.userId, soulId: "Other Fictional Soul", deviceSessionId: CONFIG.deviceSessionId},
+      resumption: {handle: "other-soul-handle", updatedAt: Date.now()},
+      pendingTranscripts: [],
+      pendingImage: {imageId: "other-photo", mediaRef: "mentra_media/test-phone/other-photo.png",
+        providerSent: false, captureAfterCurrent: false, generation: 1, sessionId: "old-sitting"},
+    }))
+    const h = harness({storage})
+    await start(h)
+    expect(h.requests.some((r) => r.url.endsWith("/snapshot/replay"))).toBe(false)
+    expect(h.sockets[0].sent.join(" ")).not.toContain("other-soul-handle")
+    expect(h.persistenceErrors.some((error) => error?.includes("discarded"))).toBe(true)
+    await h.controller.stop()
+  })
   test("snapshots, sends, journals, acknowledges, then finalizes one image", async () => {
     const storage = new FakeStorage()
     const h = harness({storage})

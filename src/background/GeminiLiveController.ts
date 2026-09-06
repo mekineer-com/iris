@@ -1236,6 +1236,7 @@ export class GeminiLiveController {
       !this.validPendingEvents(journal.pendingTranscripts) ||
       !this.validPendingImage(journal.pendingImage)
     ) {
+      this.callbacks.onPersistenceError("Saved recovery data did not match this session or was invalid and was discarded.")
       await this.deleteJournal()
       return
     }

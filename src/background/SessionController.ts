@@ -153,6 +153,7 @@ export class SessionController {
           const config = this.currentConfig()
           const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
             method: "POST",
+            signal: AbortSignal.timeout(10_000),
             headers: {Authorization: `Bearer ${config.bearer}`, "Content-Type": "application/json"},
             body: JSON.stringify({user_id: config.userId, soul_id: soulId, use_existing: value.useExisting}),
           })
@@ -785,22 +786,24 @@ export class SessionController {
   }
 
   private async loadPreferences(): Promise<void> {
-    const config = this.currentConfig()
-    const [microphone, camera, storedSoul, journal] = await Promise.all([
-      this.session.storage.get(MICROPHONE_ENABLED_KEY),
-      this.session.storage.get(CAMERA_ENABLED_KEY),
-      this.session.storage.get(SOUL_ID_KEY),
-      this.session.storage.get(JOURNAL_KEY),
-    ])
-    this.microphoneEnabled = microphone !== "0"
-    this.cameraEnabled = camera !== "0"
-    this.soulId = storedSoul?.trim() || config.soulId
-    this.recoverySoulId = journalSoulId(journal, config)
-    if (this.recoverySoulId) this.soulId = this.recoverySoulId
+    let storedSoul: string | null = null
     try {
+      const config = this.currentConfig()
+      const [microphone, camera, savedSoul, journal] = await Promise.all([
+        this.session.storage.get(MICROPHONE_ENABLED_KEY),
+        this.session.storage.get(CAMERA_ENABLED_KEY),
+        this.session.storage.get(SOUL_ID_KEY),
+        this.session.storage.get(JOURNAL_KEY),
+      ])
+      storedSoul = savedSoul
+      this.microphoneEnabled = microphone !== "0"
+      this.cameraEnabled = camera !== "0"
+      this.soulId = storedSoul?.trim() || config.soulId
+      this.recoverySoulId = journalSoulId(journal, config)
+      if (this.recoverySoulId) this.soulId = this.recoverySoulId
       const response = await this.fetchFn(
         `${config.baseUrl}/integration/mentra/souls?user_id=${encodeURIComponent(config.userId)}`,
-        {headers: {Authorization: `Bearer ${config.bearer}`}},
+        {headers: {Authorization: `Bearer ${config.bearer}`}, signal: AbortSignal.timeout(10_000)},
       )
       if (!response.ok) throw new Error(`Soul discovery failed (${response.status})`)
       const result = await response.json() as Partial<{souls: unknown}>
@@ -813,8 +816,8 @@ export class SessionController {
     }
     this.soulConfirmed = Boolean(this.recoverySoulId || (storedSoul?.trim() && this.souls.includes(this.soulId)))
     this.soulLoading = false
-    await this.reportSelectedSoul()
     this.pushSnapshot()
+    await this.reportSelectedSoul()
   }
 
   private currentConfig(): OpenAlmaConfig {

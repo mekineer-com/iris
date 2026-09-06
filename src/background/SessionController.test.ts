@@ -315,6 +315,15 @@ describe("SessionController", () => {
     }
   })
 
+  test("failed discovery releases loading and shows its error", async () => {
+    const h = setup({fetchFn: (async (_url, init) => {
+      expect(init?.signal).toBeInstanceOf(AbortSignal)
+      throw new Error("Discovery timed out")
+    }) as typeof fetch})
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(lastSnapshot(h.session)).toMatchObject({soulLoading: false, lastError: "Discovery timed out"})
+  })
+
   test("pending selection excludes Start and concurrent selections", async () => {
     let release!: (response: Response) => void
     const selecting = new Promise<Response>((resolve) => { release = resolve })
@@ -360,7 +369,7 @@ describe("SessionController", () => {
 
     expect(requests[0]).toEqual({
       url: "http://127.0.0.1:9999/integration/mentra/souls?user_id=Test%20User",
-      init: {headers: {Authorization: "Bearer fictional"}},
+      init: {headers: {Authorization: "Bearer fictional"}, signal: expect.any(AbortSignal)},
     })
     expect(JSON.parse(String(requests.at(-1)?.init?.body))).toEqual({
       user_id: "Test User",
