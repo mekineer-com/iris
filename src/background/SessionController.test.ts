@@ -473,6 +473,27 @@ describe("SessionController", () => {
     }
   })
 
+  test("installation reports the stored and then selected soul", async () => {
+    const previous = process.env.NODE_ENV
+    process.env.NODE_ENV = "production"
+    const reports: string[] = []
+    try {
+      const h = setup({stored: {"openalma.soul-id": "Stored Soul"}, fetchFn: (async (url, init) => {
+        if (String(url).includes("?user_id=")) return Response.json({souls: ["Stored Soul"]})
+        const body = JSON.parse(String(init?.body))
+        if (String(url).endsWith("/installation/seen")) {
+          reports.push(body.soul_id)
+          return Response.json({ok: true})
+        }
+        return Response.json({soul_id: body.soul_id, created: true})
+      }) as typeof fetch})
+      await h.session.handlers["openalma:set-soul"]({soulId: "Selected Soul", useExisting: false})
+      expect(reports).toEqual(["Stored Soul", "Selected Soul"])
+    } finally {
+      process.env.NODE_ENV = previous
+    }
+  })
+
   test("routes images only while a sitting is active", async () => {
     const harness = setup()
     await expect(harness.session.handlers["openalma:image"]({})).rejects.toThrow("Start Iris")

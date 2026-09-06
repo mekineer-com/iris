@@ -6,6 +6,7 @@ export async function reportInstallation(
 ): Promise<void> {
   const response = await fetchFn(`${config.baseUrl}/integration/mentra/installation/seen`, {
     method: "POST",
+    signal: AbortSignal.timeout(10_000),
     headers: {
       Authorization: `Bearer ${config.bearer}`,
       "Content-Type": "application/json",

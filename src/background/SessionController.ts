@@ -15,6 +15,7 @@ import {GeminiLiveController, JOURNAL_KEY, journalSoulId} from "./GeminiLiveCont
 import type {GeminiCallbacks} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {readOpenAlmaConfig} from "./openAlmaConfig"
+import {reportInstallation} from "./installation"
 
 type Send = <C extends keyof Channels & string>(channel: C, payload: Channels[C]) => void
 
@@ -169,6 +170,7 @@ export class SessionController {
           this.soulId = soulId
           this.soulConfirmed = true
           if (!this.souls.includes(soulId)) this.souls = [...this.souls, soulId]
+          await this.reportSelectedSoul()
           return {soulId, created: result.created}
         } finally {
           this.soulSelecting = false
@@ -565,6 +567,16 @@ export class SessionController {
     this.pushSnapshot()
   }
 
+  private async reportSelectedSoul(): Promise<void> {
+    if (process.env.NODE_ENV !== "production") return
+    try {
+      await reportInstallation({...this.currentConfig(), soulId: this.soulId}, this.fetchFn)
+    } catch (error) {
+      console.error("[OpenAlma] installation report failed:", error)
+      this.reportInstallationError()
+    }
+  }
+
   private subscribeMic(): void {
     this.stopMic()
     this.sawMicFrame = false
@@ -801,6 +813,7 @@ export class SessionController {
     }
     this.soulConfirmed = Boolean(this.recoverySoulId || (storedSoul?.trim() && this.souls.includes(this.soulId)))
     this.soulLoading = false
+    await this.reportSelectedSoul()
     this.pushSnapshot()
   }
 
