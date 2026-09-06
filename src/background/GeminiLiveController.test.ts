@@ -633,10 +633,11 @@ describe("GeminiLiveController", () => {
       }))
       const h = harness({storage, replayStatuses: [status], replayBodies: body ? [body] : []})
       await start(h)
+      await h.controller.retryImage()
       await waitFor(() => h.errors.length === 1)
 
       expect(h.errors).toEqual([message])
-      expect(h.persistenceErrors).not.toContain(PHOTO_RETRY_MESSAGE)
+      expect(h.persistenceErrors.at(-1)).toBeNull()
       expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
       await h.controller.stop()
     }
@@ -660,11 +661,21 @@ describe("GeminiLiveController", () => {
     }))
     const h = harness({storage, replayStatuses: [503, 200]})
     await start(h)
+    expect(h.requests.some((request) => request.url.endsWith("/snapshot/replay"))).toBe(false)
+    await h.controller.retryImage()
     await waitFor(() => h.persistenceErrors.at(-1) === PHOTO_RETRY_MESSAGE)
     expect(h.photoRetryChanges.at(-1)).toBe(true)
-    h.sockets[0].message({serverContent: {turnComplete: true}})
+    h.sockets[0].message({serverContent: {
+      inputTranscription: {text: "A fictional question."},
+      outputTranscription: {text: "A fictional complete turn."}, turnComplete: true,
+    }})
     await new Promise((resolve) => setTimeout(resolve, 20))
     expect(h.requests.filter((request) => request.url.endsWith("/snapshot/replay"))).toHaveLength(1)
+    expect(h.errors).toEqual([])
+    h.sockets[0].readyState = 0
+    await expect(h.controller.retryImage()).rejects.toThrow("Wait for Gemini")
+    expect(h.photoRetryChanges.at(-1)).toBe(true)
+    h.sockets[0].readyState = 1
     const recovered = harness({storage})
     await start(recovered)
     expect(recovered.photoRetryChanges.at(-1)).toBe(true)
@@ -809,6 +820,7 @@ describe("GeminiLiveController", () => {
     }))
     const h = harness({storage, replayGates: [replayGate]})
     await start(h)
+    const retry = h.controller.retryImage()
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/replay")))
     h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
     h.sockets[0].close()
@@ -816,6 +828,7 @@ describe("GeminiLiveController", () => {
     h.sockets[1].open()
     h.sockets[1].message({setupComplete: {}})
     releaseReplay()
+    await retry
     await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).clientContent))
     h.sockets[1].message({serverContent: {
       outputTranscription: {text: "A fictional blue square."},

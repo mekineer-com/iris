@@ -401,19 +401,17 @@ export class GeminiLiveController {
   }
 
   async retryImage(): Promise<void> {
-    if (this.pendingImage) {
-      this.pendingImage.retryRequested = false
-      this.callbacks.onPhotoRetryChange(false)
-      await this.persistJournal()
+    if (this.stopping || this.imageRetrying || !this.ready || this.socket?.readyState !== WS_OPEN) {
+      throw new Error("Wait for Gemini to reconnect before retrying the photo")
     }
     if (this.pendingImage?.caption) {
-      await this.finalizePendingImage()
+      await this.finalizePendingImage(true)
       return
     }
     if (!this.pendingImage || this.pendingImage.providerSent) {
       throw new Error("No photo is waiting to retry")
     }
-    await this.retryPendingImage()
+    await this.retryPendingImage(true)
   }
 
   async discardImage(): Promise<void> {
@@ -437,16 +435,18 @@ export class GeminiLiveController {
     }))
   }
 
-  private async retryPendingImage(): Promise<void> {
+  private async retryPendingImage(userRequested = false): Promise<void> {
     const pending = this.pendingImage
     const socket = this.socket
     if (
-      !pending || pending.retryRequested || pending.caption || pending.providerSent || this.imageRetrying || this.stopping ||
+      !pending || (pending.retryRequested && !userRequested) || pending.caption || pending.providerSent || this.imageRetrying || this.stopping ||
       !this.ready || !socket || socket.readyState !== WS_OPEN
     ) return
     this.imageRetrying = true
     let retryOnReplacement = false
     try {
+      pending.retryRequested = false
+      this.callbacks.onPhotoRetryChange(false)
       const response = await this.request(`/integration/mentra/session/${this.sessionId}/snapshot/replay`, {
         user_id: this.config.userId,
         soul_id: this.config.soulId,
@@ -1173,9 +1173,9 @@ export class GeminiLiveController {
     await this.persistJournal()
   }
 
-  private async finalizePendingImage(): Promise<void> {
+  private async finalizePendingImage(userRequested = false): Promise<void> {
     const pending = this.pendingImage
-    if (!pending?.caption || pending.retryRequested || !pending.assistantSequence) return
+    if (!pending?.caption || (pending.retryRequested && !userRequested) || !pending.assistantSequence) return
     if (this.pendingEvents.some((event) => event.sequence <= pending.assistantSequence!)) return
     let response: Response
     try {
@@ -1339,6 +1339,7 @@ export class GeminiLiveController {
       this.pendingImage.captureAfterCurrent = false
       this.pendingImage.generation = this.generation
       this.pendingImage.sessionId = this.sessionId
+      await this.requestPhotoRetry(this.pendingImage)
     }
     await this.persistJournal()
   }

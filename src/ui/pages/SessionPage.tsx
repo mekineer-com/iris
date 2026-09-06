@@ -469,11 +469,11 @@ export default function SessionPage() {
         </div>
       ) : null}
       {imageStatus ? <p role="status">{imageStatus}</p> : null}
-      {photoRetryPending && voiceReady ? (
+      {photoRetryPending ? (
         <div>
           <p role="status">{PHOTO_RETRY_MESSAGE}</p>
           <div className="image-review">
-            <button type="button" disabled={imagePending} onClick={() => void handleStoredPhoto("retry")}>Retry</button>
+            <button type="button" disabled={imagePending || !voiceReady} onClick={() => void handleStoredPhoto("retry")}>Retry</button>
             <button type="button" disabled={imagePending} onClick={() => void handleStoredPhoto("discard")}>Discard</button>
           </div>
         </div>
