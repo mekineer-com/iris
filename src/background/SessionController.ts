@@ -155,9 +155,9 @@ export class SessionController {
             headers: {Authorization: `Bearer ${config.bearer}`, "Content-Type": "application/json"},
             body: JSON.stringify({user_id: config.userId, soul_id: soulId, use_existing: value.useExisting}),
           })
-          if (response.status === 409 && !value.useExisting) {
+          if (response.status === 409) {
             const detail = await response.json().catch(() => null) as {detail?: {reason?: unknown; message?: unknown}} | null
-            if (detail?.detail?.reason === "existing_exact") return {soulId, confirmationRequired: true as const}
+            if (detail?.detail?.reason === "existing_exact" && !value.useExisting) return {soulId, confirmationRequired: true as const}
             if (typeof detail?.detail?.message === "string") throw new Error(detail.detail.message)
           }
           if (!response.ok) throw new Error(`Soul selection failed (${response.status})`)
@@ -169,7 +169,6 @@ export class SessionController {
           this.soulId = soulId
           this.soulConfirmed = true
           if (!this.souls.includes(soulId)) this.souls = [...this.souls, soulId]
-          this.pushSnapshot()
           return {soulId, created: result.created}
         } finally {
           this.soulSelecting = false
@@ -785,12 +784,8 @@ export class SessionController {
     this.microphoneEnabled = microphone !== "0"
     this.cameraEnabled = camera !== "0"
     this.soulId = storedSoul?.trim() || config.soulId
-    this.soulConfirmed = Boolean(storedSoul?.trim())
     this.recoverySoulId = journalSoulId(journal, config)
-    if (this.recoverySoulId) {
-      this.soulId = this.recoverySoulId
-      this.soulConfirmed = true
-    }
+    if (this.recoverySoulId) this.soulId = this.recoverySoulId
     try {
       const response = await this.fetchFn(
         `${config.baseUrl}/integration/mentra/souls?user_id=${encodeURIComponent(config.userId)}`,
@@ -802,13 +797,10 @@ export class SessionController {
         throw new Error("Soul discovery returned an invalid response")
       }
       this.souls = result.souls
-      if (!this.recoverySoulId && this.soulConfirmed && !this.souls.includes(this.soulId)) {
-        this.soulConfirmed = false
-      }
     } catch (error) {
-      this.soulConfirmed = Boolean(this.recoverySoulId)
       this.lastError = error instanceof Error ? error.message : String(error)
     }
+    this.soulConfirmed = Boolean(this.recoverySoulId || (storedSoul?.trim() && this.souls.includes(this.soulId)))
     this.soulLoading = false
     this.pushSnapshot()
   }
