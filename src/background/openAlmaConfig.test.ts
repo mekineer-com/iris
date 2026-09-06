@@ -52,6 +52,15 @@ describe("readOpenAlmaConfig", () => {
     }
   })
 
+  test("decodes exact user and soul names from dotenv-safe values", () => {
+    process.env.MENTRA_PUBLIC_OPENALMA_BASE_URL = "http://10.77.0.1"
+    process.env.MENTRA_PUBLIC_OPENALMA_BEARER = "fictional"
+    process.env.MENTRA_PUBLIC_OPENALMA_USER_ID = "Marcos%20%24HOME"
+    process.env.MENTRA_PUBLIC_OPENALMA_SOUL_ID = "%C3%89cho%20%22Bright%22"
+    process.env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID = "test-phone"
+    expect(readOpenAlmaConfig()).toMatchObject({userId: "Marcos $HOME", soulId: 'Écho "Bright"'})
+  })
+
   test("fails before transport work when required configuration is missing", () => {
     for (const key of KEYS) delete process.env[key]
     expect(() => readOpenAlmaConfig()).toThrow("MENTRA_PUBLIC_OPENALMA_BASE_URL is not configured")

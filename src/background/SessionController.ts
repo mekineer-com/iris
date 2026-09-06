@@ -164,7 +164,7 @@ export class SessionController {
           }
           if (!response.ok) throw new Error(`Soul selection failed (${response.status})`)
           const result = await response.json() as Partial<{soul_id: string; created: boolean}>
-          if (typeof result.soul_id !== "string" || !result.soul_id || typeof result.created !== "boolean") {
+          if (result.soul_id !== soulId || typeof result.created !== "boolean") {
             throw new Error("Soul selection returned an invalid response")
           }
           const selectedSoul = result.soul_id

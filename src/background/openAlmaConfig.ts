@@ -16,6 +16,10 @@ function required(name: string, value: string | undefined): string {
   return normalized
 }
 
+function identity(name: string, value: string | undefined): string {
+  return decodeURIComponent(required(name, value))
+}
+
 export function readOpenAlmaConfig(): OpenAlmaConfig {
   const rawBaseUrl = required("MENTRA_PUBLIC_OPENALMA_BASE_URL", process.env.MENTRA_PUBLIC_OPENALMA_BASE_URL)
   if (!/^https?:\/\//.test(rawBaseUrl)) {
@@ -37,8 +41,8 @@ export function readOpenAlmaConfig(): OpenAlmaConfig {
   return {
     baseUrl: rawBaseUrl.replace(/\/+$/, ""),
     bearer: required("MENTRA_PUBLIC_OPENALMA_BEARER", process.env.MENTRA_PUBLIC_OPENALMA_BEARER),
-    userId: required("MENTRA_PUBLIC_OPENALMA_USER_ID", process.env.MENTRA_PUBLIC_OPENALMA_USER_ID),
-    soulId: required("MENTRA_PUBLIC_OPENALMA_SOUL_ID", process.env.MENTRA_PUBLIC_OPENALMA_SOUL_ID),
+    userId: identity("MENTRA_PUBLIC_OPENALMA_USER_ID", process.env.MENTRA_PUBLIC_OPENALMA_USER_ID),
+    soulId: identity("MENTRA_PUBLIC_OPENALMA_SOUL_ID", process.env.MENTRA_PUBLIC_OPENALMA_SOUL_ID),
     deviceSessionId,
     packageName: manifest.packageName,
     version: manifest.version,

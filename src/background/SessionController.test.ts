@@ -388,6 +388,16 @@ describe("SessionController", () => {
     })
   })
 
+  test("rejects a different soul returned by the server", async () => {
+    const harness = setup({fetchFn: (async (_url: string, init?: RequestInit) => !init?.method
+      ? Response.json({souls: [CONFIG.soulId]})
+      : Response.json({soul_id: "Other Soul", created: true})) as typeof fetch})
+    await expect(harness.session.handlers["openalma:set-soul"]({soulId: "Requested Soul", useExisting: false})).rejects.toThrow(
+      "invalid response",
+    )
+    expect(harness.session.stored.get("openalma.soul-id")).toBe(CONFIG.soulId)
+  })
+
   test("Stop keeps pending recovery locked until the original soul's journal clears", async () => {
     const h = setup()
     await h.session.handlers["openalma:start"]({mode: "continuous"})
