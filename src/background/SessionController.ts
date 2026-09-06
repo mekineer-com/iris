@@ -186,7 +186,6 @@ export class SessionController {
       ui.handle("openalma:pending-image", async (payload) => {
         const action = (payload as {action?: string} | null)?.action
         await this.preferencesLoaded
-        if (action === "retry" && !this.cameraEnabled) throw new Error("Camera is disabled")
         if (!this.liveController) throw new Error("Gemini controller is not available")
         if (action === "retry") await this.liveController.retryImage()
         else if (action === "discard") await this.liveController.discardImage()

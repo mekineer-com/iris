@@ -662,6 +662,14 @@ describe("GeminiLiveController", () => {
     await start(h)
     await waitFor(() => h.persistenceErrors.at(-1) === PHOTO_RETRY_MESSAGE)
     expect(h.photoRetryChanges.at(-1)).toBe(true)
+    h.sockets[0].message({serverContent: {turnComplete: true}})
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(h.requests.filter((request) => request.url.endsWith("/snapshot/replay"))).toHaveLength(1)
+    const recovered = harness({storage})
+    await start(recovered)
+    expect(recovered.photoRetryChanges.at(-1)).toBe(true)
+    expect(recovered.requests.some((request) => request.url.endsWith("/snapshot/replay"))).toBe(false)
+    await recovered.controller.stop()
     h.sockets[0].message({toolCall: {
       functionCalls: [{id: "before-retry", name: "recall_memory", args: {query: "fictional context"}}],
     }})

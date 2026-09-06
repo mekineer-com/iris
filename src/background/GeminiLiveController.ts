@@ -50,6 +50,7 @@ type PendingImage = {
   caption?: string
   assistantSequence?: number
   speakDescription?: boolean
+  retryRequested?: boolean
 }
 
 type StorageLike = {
@@ -376,8 +377,7 @@ export class GeminiLiveController {
 
     const activeSocket = this.socket
     if (!this.ready || !activeSocket || activeSocket.readyState !== WS_OPEN) {
-      this.callbacks.onPhotoRetryChange(true)
-      this.callbacks.onPersistenceError(PHOTO_RETRY_MESSAGE)
+      await this.requestPhotoRetry(pending)
       return
     }
     try {
@@ -396,6 +396,11 @@ export class GeminiLiveController {
   }
 
   async retryImage(): Promise<void> {
+    if (this.pendingImage) {
+      this.pendingImage.retryRequested = false
+      this.callbacks.onPhotoRetryChange(false)
+      await this.persistJournal()
+    }
     if (this.pendingImage?.caption) {
       await this.finalizePendingImage()
       return
@@ -431,7 +436,7 @@ export class GeminiLiveController {
     const pending = this.pendingImage
     const socket = this.socket
     if (
-      !pending || pending.caption || pending.providerSent || this.imageRetrying || this.stopping ||
+      !pending || pending.retryRequested || pending.caption || pending.providerSent || this.imageRetrying || this.stopping ||
       !this.ready || !socket || socket.readyState !== WS_OPEN
     ) return
     this.imageRetrying = true
@@ -443,8 +448,7 @@ export class GeminiLiveController {
         image_id: pending.imageId,
       }, SNAPSHOT_TIMEOUT_MS).catch(() => null)
       if (!response || response.status >= 500) {
-        this.callbacks.onPhotoRetryChange(true)
-        this.callbacks.onPersistenceError(PHOTO_RETRY_MESSAGE)
+        await this.requestPhotoRetry(pending)
         return
       }
       if (!response.ok) {
@@ -1156,9 +1160,17 @@ export class GeminiLiveController {
     }
   }
 
+  private async requestPhotoRetry(pending: PendingImage): Promise<void> {
+    if (this.pendingImage !== pending) return
+    pending.retryRequested = true
+    this.callbacks.onPhotoRetryChange(true)
+    this.callbacks.onPersistenceError(PHOTO_RETRY_MESSAGE)
+    await this.persistJournal()
+  }
+
   private async finalizePendingImage(): Promise<void> {
     const pending = this.pendingImage
-    if (!pending?.caption || !pending.assistantSequence) return
+    if (!pending?.caption || pending.retryRequested || !pending.assistantSequence) return
     if (this.pendingEvents.some((event) => event.sequence <= pending.assistantSequence!)) return
     let response: Response
     try {
@@ -1169,13 +1181,11 @@ export class GeminiLiveController {
         caption: pending.caption,
       })
     } catch {
-      this.callbacks.onPhotoRetryChange(true)
-      this.callbacks.onPersistenceError(PHOTO_RETRY_MESSAGE)
+      await this.requestPhotoRetry(pending)
       return
     }
     if (response.status >= 500) {
-      this.callbacks.onPhotoRetryChange(true)
-      this.callbacks.onPersistenceError(PHOTO_RETRY_MESSAGE)
+      await this.requestPhotoRetry(pending)
       return
     }
     if (!response.ok) throw new Error(`OpenAlma snapshot finalization failed (${response.status})`)
@@ -1226,6 +1236,10 @@ export class GeminiLiveController {
     }
     this.pendingEvents = journal.pendingTranscripts.map((event) => ({...event}))
     this.pendingImage = journal.pendingImage ? {...journal.pendingImage} : null
+    if (this.pendingImage?.retryRequested) {
+      this.callbacks.onPhotoRetryChange(true)
+      this.callbacks.onPersistenceError(PHOTO_RETRY_MESSAGE)
+    }
     const resumption = journal.resumption
     if (
       resumption &&
@@ -1297,6 +1311,7 @@ export class GeminiLiveController {
       (image.imageSequence === undefined || Number.isSafeInteger(image.imageSequence)) &&
       (image.caption === undefined || (typeof image.caption === "string" && image.caption.length > 0)) &&
       (image.assistantSequence === undefined || Number.isSafeInteger(image.assistantSequence)) &&
+      (image.retryRequested === undefined || typeof image.retryRequested === "boolean") &&
       (image.speakDescription === undefined || typeof image.speakDescription === "boolean")
   }
 
