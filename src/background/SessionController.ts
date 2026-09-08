@@ -16,6 +16,7 @@ import type {GeminiCallbacks} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {readOpenAlmaConfig} from "./openAlmaConfig"
 import {reportInstallation} from "./installation"
+import {timeoutSignal} from "./timeoutSignal"
 
 type Send = <C extends keyof Channels & string>(channel: C, payload: Channels[C]) => void
 
@@ -59,6 +60,7 @@ export class SessionController {
   private soulLoading = true
   private soulConfirmed = false
   private soulSelecting = false
+  private memuAvailable: boolean | null = null
   private recoverySoulId: string | null = null
   private manualPhase: ManualPhase = "idle"
   private microphoneEnabled = true
@@ -153,7 +155,7 @@ export class SessionController {
           const config = this.currentConfig()
           const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
             method: "POST",
-            signal: AbortSignal.timeout(10_000),
+            signal: timeoutSignal(10_000),
             headers: {Authorization: `Bearer ${config.bearer}`, "Content-Type": "application/json"},
             body: JSON.stringify({soul_id: soulId, use_existing: value.useExisting}),
           })
@@ -327,6 +329,7 @@ export class SessionController {
       soulLoading: this.soulLoading,
       soulConfirmed: this.soulConfirmed,
       soulLocked: this.soulLocked(),
+      memuAvailable: this.memuAvailable,
       manualPhase: this.manualPhase,
       microphoneEnabled: this.microphoneEnabled,
       cameraEnabled: this.cameraEnabled,
@@ -565,7 +568,7 @@ export class SessionController {
 
   reportInstallationError(): void {
     if (this.connection !== "idle") return
-    this.lastError = "Iris installation status could not be reported; reopen Iris to retry"
+    this.memuAvailable = false
     this.pushSnapshot()
   }
 
@@ -803,7 +806,7 @@ export class SessionController {
       this.recoverySoulId = journalSoulId(journal, config)
       if (this.recoverySoulId) this.soulId = this.recoverySoulId
       const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
-        headers: {Authorization: `Bearer ${config.bearer}`}, signal: AbortSignal.timeout(10_000),
+        headers: {Authorization: `Bearer ${config.bearer}`}, signal: timeoutSignal(10_000),
       })
       if (!response.ok) throw new Error(`Soul discovery failed (${response.status})`)
       const result = await response.json() as Partial<{souls: unknown}>
@@ -811,7 +814,9 @@ export class SessionController {
         throw new Error("Soul discovery returned an invalid response")
       }
       this.souls = result.souls
+      this.memuAvailable = true
     } catch (error) {
+      this.memuAvailable = false
       this.lastError = error instanceof Error ? error.message : String(error)
     }
     this.soulConfirmed = Boolean(this.recoverySoulId || (storedSoul?.trim() && this.souls.includes(this.soulId)))

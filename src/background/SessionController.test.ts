@@ -13,6 +13,7 @@ type Snapshot = {
   soulLoading: boolean
   soulConfirmed: boolean
   soulLocked: boolean
+  memuAvailable: boolean | null
   manualPhase: string
   microphoneEnabled: boolean
   cameraEnabled: boolean
@@ -767,6 +768,7 @@ describe("SessionController", () => {
       soulLoading: true,
       soulConfirmed: false,
       soulLocked: true,
+      memuAvailable: null,
       manualPhase: "idle",
       microphoneEnabled: true,
       cameraEnabled: true,
@@ -776,7 +778,7 @@ describe("SessionController", () => {
       durationWarning: false,
     })
     harness.controller.reportInstallationError()
-    expect(lastSnapshot(harness.session)?.lastError).toContain("reopen Iris to retry")
+    expect(lastSnapshot(harness.session)).toMatchObject({memuAvailable: false, lastError: null})
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     harness.live.persistenceOnStop = "Transcript sync failed; pending turns remain saved on this device"
     harness.live.fail("provider failed")

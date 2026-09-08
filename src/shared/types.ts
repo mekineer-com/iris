@@ -13,6 +13,7 @@ export interface SessionSnapshot {
   soulLoading: boolean
   soulConfirmed: boolean
   soulLocked: boolean
+  memuAvailable: boolean | null
   manualPhase: ManualPhase
   microphoneEnabled: boolean
   cameraEnabled: boolean

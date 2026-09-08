@@ -4,6 +4,7 @@ import {useRpc} from "@mentra/miniapp/ui"
 import type {Channels, ImageRequest, SelectSoulResult} from "../../shared/channels"
 import {PHOTO_RETRY_MESSAGE, type ConnectionState, type ManualAction, type ManualPhase, type SessionMode} from "../../shared/types"
 import {useChannel} from "../hooks/useChannel"
+import memuIcon from "../memu-icon.png"
 
 function unreachable(value: never): never {
   throw new Error(`Unhandled session state: ${value}`)
@@ -85,7 +86,11 @@ export default function SessionPage() {
   const [startPending, setStartPending] = useState(false)
   const [stopPending, setStopPending] = useState(false)
   const [soulName, setSoulName] = useState("")
+  const [soulDirty, setSoulDirty] = useState(true)
   const [soulPending, setSoulPending] = useState(false)
+  const [soulMenuOpen, setSoulMenuOpen] = useState(false)
+  const [pendingNewSoul, setPendingNewSoul] = useState<string | null>(null)
+  const [showNewSoulInfo, setShowNewSoulInfo] = useState(false)
   const [confirmationSoul, setConfirmationSoul] = useState<string | null>(null)
   const [modePending, setModePending] = useState(false)
   const [capabilitiesPending, setCapabilitiesPending] = useState(false)
@@ -108,11 +113,14 @@ export default function SessionPage() {
 
   useEffect(() => {
     setSoulName(snapshot?.soulId ?? "")
+    setSoulDirty(!(snapshot?.soulConfirmed ?? false))
+    setPendingNewSoul(null)
+    setShowNewSoulInfo(false)
     imageOwner.current += 1
     setPendingPhoto(null)
     setImagePending(false)
     setImageStatus(null)
-  }, [snapshot?.soulId])
+  }, [snapshot?.soulId, snapshot?.soulConfirmed])
 
   const discardPhoto = () => {
     setPendingPhoto(null)
@@ -131,7 +139,8 @@ export default function SessionPage() {
   const active = starting || reconnecting || visible === "listening" || visible === "speaking"
   const modeDisabled = active || stopping || startPending || stopPending || modePending
   const soulLocked = snapshot?.soulLocked ?? true
-  const soulReady = snapshot?.soulConfirmed && soulName.trim() === snapshot.soulId
+  const soulReady = !soulDirty && snapshot?.soulConfirmed && soulName.trim() === snapshot.soulId
+  const knownSoul = snapshot?.souls.includes(soulName.trim()) ?? false
 
   const selectSoul = async (soulId: string, useExisting: boolean): Promise<boolean> => {
     setRpcError(null)
@@ -143,6 +152,8 @@ export default function SessionPage() {
         return false
       }
       setSoulName(result.soulId)
+      setSoulDirty(false)
+      setPendingNewSoul(null)
       setConfirmationSoul(null)
       return true
     } catch (error) {
@@ -153,12 +164,27 @@ export default function SessionPage() {
     }
   }
 
+  const submitSoul = async (): Promise<void> => {
+    const soulId = soulName.trim()
+    if (knownSoul) {
+      setPendingNewSoul(null)
+      await selectSoul(soulId, true)
+    } else {
+      setRpcError(null)
+      setSoulDirty(false)
+      setPendingNewSoul(soulId)
+      setShowNewSoulInfo(false)
+    }
+  }
+
   const onStart = async () => {
     const owner = ++startOwner.current
     setRpcError(null)
     setStartPending(true)
     try {
-      if (!soulReady && !await selectSoul(soulName.trim(), false)) return
+      if (!soulReady) {
+        if (pendingNewSoul !== soulName.trim() || !await selectSoul(soulName.trim(), false)) return
+      }
       if (owner !== startOwner.current) return
       await startRpc({mode})
     } catch (error) {
@@ -301,7 +327,9 @@ export default function SessionPage() {
         : visible === "error"
           ? "Retry"
           : "Start"
-  const sittingDisabled = stopping || stopPending || modePending || soulPending || snapshot?.soulLoading !== false || (!active && startPending)
+  const soulSubmitted = soulReady || pendingNewSoul === soulName.trim()
+  const sittingDisabled = stopping || stopPending || modePending || soulPending || snapshot?.soulLoading !== false ||
+    (!active && (startPending || !soulSubmitted))
   const showSpinner = starting || reconnecting || stopping
   const manualDisabled = manualPending || visible === "speaking"
   const voiceReady = visible === "listening" || visible === "speaking"
@@ -316,28 +344,63 @@ export default function SessionPage() {
         {showSpinner ? <span className="spinner" aria-hidden="true" /> : null}
         {statusText(visible, mode, manualPhase)}
       </p>
+      {snapshot?.memuAvailable === false ? (
+        <p className="memu-status" role="status">
+          <img src={memuIcon} alt="" />
+          <span>memU is unavailable. Start memU, then reopen Iris.</span>
+        </p>
+      ) : null}
       <section className="soul-control" aria-label="Soul selection">
-        <label className="mode-control">
+        <label>
           <span>Soul</span>
-          <input
-            value={soulName}
-            disabled={soulLocked || soulPending}
-            onChange={(event) => {
-              setSoulName(event.target.value)
-              setConfirmationSoul(null)
-            }}
-          />
+          <span className="soul-entry">
+            <span className="soul-combobox" onBlur={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget)) setSoulMenuOpen(false)
+            }}>
+              <input
+                value={soulName}
+                disabled={soulLocked || soulPending}
+                onFocus={() => setSoulMenuOpen(true)}
+                onChange={(event) => {
+                  setSoulName(event.target.value)
+                  setSoulDirty(true)
+                  setConfirmationSoul(null)
+                  setPendingNewSoul(null)
+                  setShowNewSoulInfo(false)
+                  setSoulMenuOpen(true)
+                }}
+              />
+              {soulMenuOpen && snapshot?.souls.length ? (
+                <span className="soul-options" role="listbox">
+                  {snapshot.souls.map((soul) => (
+                    <button key={soul} type="button" role="option" aria-selected={soul === soulName}
+                      onClick={() => {
+                        setSoulName(soul)
+                        setSoulDirty(true)
+                        setConfirmationSoul(null)
+                        setPendingNewSoul(null)
+                        setShowNewSoulInfo(false)
+                        setSoulMenuOpen(false)
+                        void selectSoul(soul, true)
+                      }}>
+                      {soul}
+                    </button>
+                  ))}
+                </span>
+              ) : null}
+            </span>
+            <button type="button" aria-label="Use soul"
+              title={knownSoul ? "Select existing soul" : "Create new soul"}
+              disabled={soulLocked || soulPending || !soulName.trim() || !soulDirty}
+              onClick={() => void submitSoul()}>➤</button>
+            {soulReady ? <span className="soul-ready" title="Soul exists and is ready">✓</span> : null}
+            {pendingNewSoul === soulName.trim() ? (
+              <button type="button" className="soul-new" aria-label="New soul information"
+                title="New soul will be created" onClick={() => setShowNewSoulInfo((shown) => !shown)}>!</button>
+            ) : null}
+          </span>
         </label>
-        <p>Selected soul: {snapshot?.soulId || "Choose a soul"}</p>
-        {!soulLocked && snapshot?.souls.length ? (
-          <select aria-label="Existing souls" value="" disabled={soulPending}
-            onChange={(event) => { if (event.target.value) void selectSoul(event.target.value, true) }}>
-            <option value="">Select existing soul</option>
-            {snapshot.souls.map((soul) => (
-              <option key={soul} value={soul}>{soul}</option>
-            ))}
-          </select>
-        ) : null}
+        {showNewSoulInfo ? <p className="soul-info">A new soul will be created when you press Start.</p> : null}
         {confirmationSoul ? (
           <div role="alert">
             <p>{confirmationSoul} already exists. Use its existing database?</p>
@@ -348,17 +411,15 @@ export default function SessionPage() {
         ) : null}
         {soulLocked ? <p>Finish this sitting before changing souls.</p> : null}
       </section>
-      <label className="mode-control">
+      <section className="mode-control" aria-label="Speech mode">
         <span>Speech mode</span>
-        <select
-          value={mode}
-          disabled={modeDisabled}
-          onChange={(event) => void onMode(event.target.value as SessionMode)}
-        >
-          <option value="continuous">Continuous</option>
-          <option value="manual">Manual</option>
-        </select>
-      </label>
+        <div className="mode-options">
+          <button type="button" aria-pressed={mode === "continuous"} disabled={modeDisabled}
+            onClick={() => void onMode("continuous")}>Continuous</button>
+          <button type="button" aria-pressed={mode === "manual"} disabled={modeDisabled}
+            onClick={() => void onMode("manual")}>Manual</button>
+        </div>
+      </section>
       <label className="preview-control">
         <input
           type="checkbox"
@@ -478,7 +539,8 @@ export default function SessionPage() {
           </div>
         </div>
       ) : null}
-      {snapshot?.lastError && snapshot.lastError !== PHOTO_RETRY_MESSAGE ? <p role="alert">{snapshot.lastError}</p> : null}
+      {snapshot?.memuAvailable !== false && snapshot?.lastError && snapshot.lastError !== PHOTO_RETRY_MESSAGE
+        ? <p role="alert">{snapshot.lastError}</p> : null}
       {snapshot?.durationWarning ? <p role="status">Session duration warning</p> : null}
       {snapshot?.usageTotalTokens !== null && snapshot?.usageTotalTokens !== undefined ? (
         <p>Provider tokens: {snapshot.usageTotalTokens.toLocaleString()}</p>

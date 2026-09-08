@@ -48,6 +48,21 @@ h1 {
   font-weight: 700;
 }
 
+.memu-status {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin: 0.75rem 0;
+  font-weight: 700;
+}
+
+.memu-status img {
+  width: 2.25rem;
+  height: 2.25rem;
+  filter: grayscale(1);
+  opacity: 0.65;
+}
+
 .spinner {
   width: 0.9rem;
   height: 0.9rem;
@@ -64,10 +79,93 @@ h1 {
 .mode-control,
 .soul-control {
   display: grid;
-  gap: 0.35rem;
-  margin: 1.5rem 0;
+  gap: 0.75rem;
+  margin: 1.25rem 0;
   font-size: 0.86rem;
   font-weight: 700;
+}
+
+.soul-control label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.soul-entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 3rem auto;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.soul-combobox {
+  position: relative;
+}
+
+.soul-combobox input {
+  box-sizing: border-box;
+  width: 100%;
+}
+
+.soul-options {
+  position: absolute;
+  z-index: 2;
+  top: calc(100% + 0.25rem);
+  right: 0;
+  left: 0;
+  display: grid;
+  padding: 0.25rem;
+  border: 1px solid rgb(24 49 39 / 28%);
+  border-radius: 0.65rem;
+  background: var(--paper);
+  box-shadow: 0 0.5rem 1rem rgb(24 49 39 / 18%);
+}
+
+.soul-options button {
+  min-height: 2.5rem;
+  border: 0;
+  color: var(--ink);
+  background: transparent;
+  text-align: left;
+}
+
+.soul-entry button {
+  padding: 0;
+  font-size: 1.2rem;
+}
+
+.soul-ready {
+  color: var(--leaf);
+  font-size: 1.5rem;
+}
+
+.soul-new {
+  width: 2rem;
+  min-height: 2rem;
+  border: 0;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--signal);
+}
+
+.soul-info {
+  margin: 0;
+  color: var(--signal);
+}
+
+.mode-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+}
+
+.mode-options button {
+  color: var(--ink);
+  background: rgb(255 255 255 / 62%);
+}
+
+.mode-options button[aria-pressed="true"] {
+  color: #fff;
+  background: var(--leaf);
 }
 
 .image-actions {
@@ -107,7 +205,7 @@ h1 {
   display: flex;
   gap: 0.5rem;
   align-items: center;
-  margin-top: 1.5rem;
+  margin-top: 1rem;
   font-size: 0.86rem;
   font-weight: 700;
 }
@@ -149,14 +247,14 @@ select,
   color: inherit;
 }
 
-.soul-control > p {
-  margin: 0.35rem 0;
-}
-
 .controls,
 .manual-controls {
   display: grid;
   gap: 0.75rem;
+}
+
+.controls {
+  margin-top: 1.25rem;
 }
 
 button {
