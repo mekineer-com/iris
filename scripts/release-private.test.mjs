@@ -33,7 +33,7 @@ describe("private release URI", () => {
   })
   test("binds the CLI directly to the fixed WireGuard address and port", () => {
     const uri =
-      "miniapp://release?url=http%3A%2F%2F10.77.0.1%3A6789&package=com.openalma.mentra&version=0.1.0&name=OpenAlma"
+      "miniapp://release?url=http%3A%2F%2F10.77.0.1%3A6789&package=com.openalma.mentra&version=0.1.0&name=OpenAlma%20Iris"
     const release = new URL(findReleaseUri(`before\n${uri}\nafter`))
 
     expect(releaseArgs("10.77.0.1")).toEqual(["release", "--host", "10.77.0.1", "--port", "6789", "--no-cache"])

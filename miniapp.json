@@ -1,7 +1,7 @@
 {
   "packageName": "com.openalma.mentra",
-  "version": "0.1.9",
-  "name": "OpenAlma",
+  "version": "0.1.10",
+  "name": "OpenAlma Iris",
   "description": "OpenAlma speech client for Mentra Live",
   "icon": "icon.png",
   "type": "standard",
