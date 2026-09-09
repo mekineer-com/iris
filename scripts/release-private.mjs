@@ -48,23 +48,6 @@ export function releaseProfile(env) {
   })
 }
 
-export function installationMatches(status, target) {
-  return (
-    status?.installed_package === target.packageName &&
-    status?.installed_version === target.version &&
-    Number(status?.installed_seen_at) > target.startedAt
-  )
-}
-
-export async function readInstallationStatus(env) {
-  const query = new URLSearchParams({device_session_id: env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID})
-  const response = await fetch(`http://127.0.0.1:8099/integration/mentra/status?${query}`, {
-    headers: {Authorization: `Bearer ${env.MENTRA_PUBLIC_OPENALMA_BEARER}`},
-    signal: AbortSignal.timeout(1000),
-  })
-  return response.ok ? await response.json() : null
-}
-
 export function writeReleaseStatus(path, value) {
   const temporary = `${path}.${process.pid}.tmp`
   try {
@@ -92,7 +75,6 @@ export function run() {
   let output = ""
   let emitted = false
   let shutdownRequested = false
-  let installationPoll = null
   const startedAt = Date.now() / 1000
 
   miniapp.stdout.on("data", (chunk) => {
@@ -126,14 +108,6 @@ export function run() {
       shutdown()
       return
     }
-    installationPoll = setInterval(async () => {
-      try {
-        const status = await readInstallationStatus(process.env)
-        if (installationMatches(status, {packageName, version, startedAt})) shutdown()
-      } catch {
-        // The installer stays available and cancellable while mcp is unreachable.
-      }
-    }, 2000)
     void QRCode.toFile(qrPath, uri, {width: 1024, margin: 4, errorCorrectionLevel: "M"})
       .then(() => console.log(`\nPrivate WireGuard release:\n${uri}\nQR image: ${qrPath}\n`))
       .catch((error) => console.error(`Could not write private release QR: ${error.message}`))
@@ -147,7 +121,6 @@ export function run() {
   }
 
   function cleanup() {
-    if (installationPoll) clearInterval(installationPoll)
     try {
       unlinkSync(statusPath)
     } catch (error) {

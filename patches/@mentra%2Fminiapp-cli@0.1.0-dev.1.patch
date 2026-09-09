@@ -7,6 +7,12 @@ index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2
 diff --git a/node_modules/@mentra/miniapp-cli/.bun-tag-6a52822d3278fd37 b/.bun-tag-6a52822d3278fd37
 new file mode 100644
 index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@mentra/miniapp-cli/.bun-tag-b399be2a7ee7508c b/.bun-tag-b399be2a7ee7508c
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@mentra/miniapp-cli/.bun-tag-b89e18c91e338b63 b/.bun-tag-b89e18c91e338b63
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/src/index.ts b/src/index.ts
 index eebd1556474dd1f9bea9dc29612e8f87453fd4aa..6dd22dfd76c7c7efcd5864473f719b3fea91faef 100755
 --- a/src/index.ts
@@ -23,7 +29,7 @@ index eebd1556474dd1f9bea9dc29612e8f87453fd4aa..6dd22dfd76c7c7efcd5864473f719b3f
 @@ -28,12 +28,22 @@ function printUsage(): void {
    console.log('  schema regenerate                Regenerate the published schema file (CLI internal)');
  }
- 
+
 +function option(name: string): string | undefined {
 +  const index = process.argv.indexOf(name);
 +  return index >= 0 ? process.argv[index + 1] : undefined;
@@ -75,23 +81,27 @@ index 0000000000000000000000000000000000000000..4b203a43c5e38767c45e941654484b5d
 +  }
 +})
 diff --git a/src/release.ts b/src/release.ts
-index 619e3408d5d31505188e14578bd96e981a4e9bc3..cbcef98b0c10b4dfb4f417431351ea59e800c8eb 100644
+index 619e3408d5d31505188e14578bd96e981a4e9bc3..67f53329befe1f20e4e67045277af57020b87fbe 100644
 --- a/src/release.ts
 +++ b/src/release.ts
-@@ -25,6 +25,7 @@
+@@ -23,8 +23,10 @@
+  */
+
  import {readFileSync, existsSync, statSync, readdirSync} from 'fs'
++import {randomUUID} from 'crypto'
  import os from 'os'
  import {resolve, join} from 'path'
 +import JSZip from 'jszip'
  import {buildProduction} from './build.js'
  import {pack} from './pack.js'
  import {printQR} from './qr.js'
-@@ -36,23 +37,51 @@ const HEALTH_PATH = '/__mentra_release/health'
+@@ -36,23 +38,52 @@ const HEALTH_PATH = '/__mentra_release/health'
  const MANIFEST_PATH = '/miniapp.json'
  const ICON_PATH = '/icon.png'
  const BUNDLE_PATH = '/bundle.zip'
 +const PROFILE_PATH = '/openalma-profile.json'
- 
++const COMPLETE_PATH = '/__mentra_release/installed'
+
  interface ReleaseOptions {
    noCache?: boolean
 +  host?: string
@@ -113,7 +123,7 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..cbcef98b0c10b4dfb4f417431351ea59
 +    iconBuffer: iconFile ? Buffer.from(await iconFile.async('uint8array')) : null,
 +  }
  }
- 
+
  export async function release(opts: ReleaseOptions = {}): Promise<void> {
    const cwd = process.cwd()
 +  let suppliedBundle: Awaited<ReturnType<typeof readReleaseBundle>> | null = null
@@ -125,7 +135,7 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..cbcef98b0c10b4dfb4f417431351ea59
 +      process.exit(1)
 +    }
 +  }
- 
+
    // ---- 1. Validate manifest + read identity ---------------------------
    const manifestPath = resolve(cwd, 'miniapp.json')
 -  if (!existsSync(manifestPath)) {
@@ -140,9 +150,9 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..cbcef98b0c10b4dfb4f417431351ea59
    } catch {
      console.error('Error: miniapp.json is not valid JSON')
      process.exit(1)
-@@ -69,43 +98,55 @@ export async function release(opts: ReleaseOptions = {}): Promise<void> {
+@@ -69,43 +100,65 @@ export async function release(opts: ReleaseOptions = {}): Promise<void> {
    const name = (manifest.name as string) ?? packageName
- 
+
    // ---- 2. Build (or skip via cache) -----------------------------------
 -  const cacheDir = resolve(cwd, 'build')
 -  const cachedZipName = `${packageName}-${version}.zip`
@@ -178,7 +188,7 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..cbcef98b0c10b4dfb4f417431351ea59
 +      console.log(`✓ Packed ${packageName}@${version} (${sizeKb} KB) in ${((Date.now() - packStart) / 1000).toFixed(1)}s`)
 +    }
    }
- 
+
 -  // ---- 3. Find a free port and load the bundle into memory ------------
 -  const zipBuffer = readFileSync(cachedZipPath)
 +  // ---- 3. Select the listener and load the bundle into memory ----------
@@ -188,8 +198,9 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..cbcef98b0c10b4dfb4f417431351ea59
 -  const manifestBuffer = readFileSync(manifestPath)
 +  const iconBuffer = suppliedBundle ? suppliedBundle.iconBuffer : (existsSync(iconPath) ? readFileSync(iconPath) : null)
 +  const manifestBuffer = suppliedBundle?.manifestBuffer ?? readFileSync(manifestPath)
-+  const setupProfile = process.env.MENTRA_RELEASE_PROFILE
- 
++  const setupProfile = process.env.MENTRA_RELEASE_PROFILE ? JSON.parse(process.env.MENTRA_RELEASE_PROFILE) : null
++  const offerId = randomUUID()
+
 -  const port = await pickPort(DEFAULT_PORT_START, PORT_SCAN_LIMIT)
 -  const lanIp = getLanIp()
 -  if (!lanIp) {
@@ -207,29 +218,63 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..cbcef98b0c10b4dfb4f417431351ea59
      console.error('Error: could not detect LAN IP. Connect to a Wi-Fi network and re-run.')
      process.exit(1)
    }
- 
+
 -  const baseUrl = `http://${lanIp}:${port}`
 +  const baseUrl = `http://${advertisedHost}:${port}`
- 
+
    let installCount = 0
- 
+
    // ---- 4. Serve --------------------------------------------------------
++  let finish!: () => void
++  const done = new Promise<void>((resolve) => { finish = resolve })
++  let stopped = false
++  const stop = () => {
++    if (stopped) return
++    stopped = true
++    server.stop()
++    finish()
++  }
    const server = Bun.serve({
 -    hostname: '0.0.0.0',
 +    hostname: opts.host ?? '0.0.0.0',
      port,
      fetch(req) {
        const url = new URL(req.url)
-@@ -119,6 +160,12 @@ export async function release(opts: ReleaseOptions = {}): Promise<void> {
+@@ -119,6 +172,19 @@ export async function release(opts: ReleaseOptions = {}): Promise<void> {
            headers: {'content-type': 'application/json'},
          })
        }
 +      if (url.pathname === PROFILE_PATH) {
 +        if (!setupProfile) return new Response('Not found', {status: 404})
-+        return new Response(setupProfile, {
++        return new Response(JSON.stringify({offerId, profile: setupProfile}), {
 +          headers: {'content-type': 'application/json', 'cache-control': 'no-store'},
 +        })
++      }
++      if (url.pathname === COMPLETE_PATH && req.method === 'POST') {
++        return req.json().then((body: any) => {
++          if (body?.offerId !== offerId) return new Response('Wrong offer', {status: 409})
++          setTimeout(stop, 0)
++          return new Response(JSON.stringify({ok: true}), {headers: {'content-type': 'application/json'}})
++        }).catch(() => new Response('Invalid acknowledgement', {status: 400}))
 +      }
        if (url.pathname === ICON_PATH) {
          if (!iconBuffer) return new Response('Not found', {status: 404})
          return new Response(iconBuffer, {
+@@ -161,13 +227,11 @@ export async function release(opts: ReleaseOptions = {}): Promise<void> {
+   console.log(`Serving on ${baseUrl}`)
+
+   // ---- 6. Wait for SIGINT ---------------------------------------------
+-  await new Promise<void>((resolve) => {
+-    process.on('SIGINT', () => {
+-      console.log('\nShutting down...')
+-      server.stop()
+-      resolve()
+-    })
++  process.on('SIGINT', () => {
++    console.log('\nShutting down...')
++    stop()
+   })
++  await done
+ }
+
+ // ---------------------------------------------------------------------------

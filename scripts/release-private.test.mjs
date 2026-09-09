@@ -6,32 +6,12 @@ import {join} from "node:path"
 import {
   assertPrivateReleaseConfig,
   findReleaseUri,
-  installationMatches,
-  readInstallationStatus,
   releaseArgs,
   releaseProfile,
   writeReleaseStatus,
 } from "./release-private.mjs"
 
 describe("private release URI", () => {
-  test("completion poll authenticates by device, independent of the selected soul", async () => {
-    const original = globalThis.fetch
-    try {
-      globalThis.fetch = async (url, options) => {
-        expect(new URL(url).search).toBe("?device_session_id=fictional-phone")
-        expect(options.headers.Authorization).toBe("Bearer fictional-generated-key")
-        return Response.json({installed_package: "com.openalma.mentra", installed_version: "0.1.0", installed_seen_at: 101})
-      }
-      const status = await readInstallationStatus({
-        MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID: "fictional-phone",
-        MENTRA_PUBLIC_OPENALMA_BEARER: "fictional-generated-key",
-        MENTRA_PUBLIC_OPENALMA_SOUL_ID: "Changed Soul",
-      })
-      expect(installationMatches(status, {packageName: "com.openalma.mentra", version: "0.1.0", startedAt: 100})).toBe(true)
-    } finally {
-      globalThis.fetch = original
-    }
-  })
   test("binds the CLI directly to the fixed WireGuard address and port", () => {
     const uri =
       "miniapp://release?url=http%3A%2F%2F10.77.0.1%3A6789&package=com.openalma.mentra&version=0.1.0&name=OpenAlma%20Iris"
@@ -70,32 +50,6 @@ describe("private release URI", () => {
       soulId: "Test Soul",
       deviceSessionId: "test-phone",
     })
-  })
-
-  test("accepts only a fresh report for the exact release", () => {
-    const target = {packageName: "com.openalma.mentra", version: "0.1.0", startedAt: 100}
-    expect(
-      installationMatches(
-        {
-          installed_package: "com.openalma.mentra",
-          installed_version: "0.1.0",
-          installed_seen_at: 101,
-        },
-        target,
-      ),
-    ).toBe(true)
-    expect(
-      installationMatches(
-        {installed_package: target.packageName, installed_version: target.version, installed_seen_at: 100},
-        target,
-      ),
-    ).toBe(false)
-    expect(
-      installationMatches(
-        {installed_package: target.packageName, installed_version: "0.0.9", installed_seen_at: 101},
-        target,
-      ),
-    ).toBe(false)
   })
 
   test("writes installer status atomically", () => {
