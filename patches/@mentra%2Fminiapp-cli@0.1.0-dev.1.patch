@@ -1,16 +1,17 @@
 diff --git a/src/index.ts b/src/index.ts
+index eebd1556474dd1f9bea9dc29612e8f87453fd4aa..6dd22dfd76c7c7efcd5864473f719b3fea91faef 100755
 --- a/src/index.ts
 +++ b/src/index.ts
-@@ -15,7 +15,7 @@
+@@ -15,7 +15,7 @@ function printUsage(): void {
    console.log('Usage: mentra-miniapp <command>\n');
    console.log('Commands:');
    console.log('  dev                              Start dev server with hot reload and QR code');
 -  console.log('  release                          Build, pack, and serve a QR to install on a phone');
-+  console.log('  release [--host HOST] [--port PORT]  Build, pack, and serve a QR to install on a phone');
++  console.log('  release [--host HOST] [--port PORT] [--bundle ZIP]  Build or serve a release ZIP for phone installation');
    console.log('  pack                             Production-build and package miniapp into build/<pkg>-<version>.zip (--no-build to skip build)');
    console.log('  manifest                         Edit miniapp.json interactively');
    console.log('  permission list                  List declared permissions');
-@@ -28,12 +28,21 @@
+@@ -28,12 +28,22 @@ function printUsage(): void {
    console.log('  schema regenerate                Regenerate the published schema file (CLI internal)');
  }
  
@@ -29,32 +30,151 @@ diff --git a/src/index.ts b/src/index.ts
 +      noCache: process.argv.includes('--no-cache'),
 +      host: option('--host'),
 +      port: option('--port') === undefined ? undefined : Number(option('--port')),
++      bundle: option('--bundle'),
 +    });
      break;
    case 'pack':
      // Build with NODE_ENV=production before zipping, so `pack` never ships
+diff --git a/node_modules/@mentra/miniapp-cli/src/release.test.ts b/src/release.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b203a43c5e38767c45e941654484b5d73c3b3b1
+--- /dev/null
++++ b/src/release.test.ts
+@@ -0,0 +1,24 @@
++import {expect, test} from 'bun:test'
++import {mkdtempSync, rmSync, writeFileSync} from 'fs'
++import {tmpdir} from 'os'
++import {join} from 'path'
++import JSZip from 'jszip'
++
++import {readReleaseBundle} from './release'
++
++test('reads identity and icon from a prebuilt release', async () => {
++  const dir = mkdtempSync(join(tmpdir(), 'mentra-release-'))
++  try {
++    const path = join(dir, 'bundle.zip')
++    const zip = new JSZip()
++    zip.file('miniapp.json', JSON.stringify({packageName: 'com.example.app', version: '1.2.3'}))
++    zip.file('icon.png', new Uint8Array([1, 2, 3]))
++    writeFileSync(path, await zip.generateAsync({type: 'uint8array'}))
++
++    const bundle = await readReleaseBundle(path)
++    expect(JSON.parse(bundle.manifestBuffer.toString())).toEqual({packageName: 'com.example.app', version: '1.2.3'})
++    expect(bundle.iconBuffer).toEqual(Buffer.from([1, 2, 3]))
++  } finally {
++    rmSync(dir, {recursive: true, force: true})
++  }
++})
 diff --git a/src/release.ts b/src/release.ts
+index 619e3408d5d31505188e14578bd96e981a4e9bc3..9dfe08542c42eb91afb02ac0752fd7de218d57b9 100644
 --- a/src/release.ts
 +++ b/src/release.ts
-@@ -39,6 +39,8 @@
+@@ -25,6 +25,7 @@
+ import {readFileSync, existsSync, statSync, readdirSync} from 'fs'
+ import os from 'os'
+ import {resolve, join} from 'path'
++import JSZip from 'jszip'
+ import {buildProduction} from './build.js'
+ import {pack} from './pack.js'
+ import {printQR} from './qr.js'
+@@ -39,20 +40,47 @@ const BUNDLE_PATH = '/bundle.zip'
  
  interface ReleaseOptions {
    noCache?: boolean
 +  host?: string
 +  port?: number
++  bundle?: string
++}
++
++export async function readReleaseBundle(path: string) {
++  if (!existsSync(path)) throw new Error(`Release bundle not found: ${path}`)
++  const zipBuffer = readFileSync(path)
++  const zip = await JSZip.loadAsync(zipBuffer)
++  const manifestFile = zip.file('miniapp.json')
++  if (!manifestFile) throw new Error('Release bundle is missing miniapp.json')
++  const manifestBuffer = Buffer.from(await manifestFile.async('uint8array'))
++  const iconFile = zip.file('icon.png')
++  return {
++    zipBuffer,
++    manifestBuffer,
++    iconBuffer: iconFile ? Buffer.from(await iconFile.async('uint8array')) : null,
++  }
  }
  
  export async function release(opts: ReleaseOptions = {}): Promise<void> {
-@@ -86,26 +88,34 @@
-     console.log(`✓ Packed ${packageName}@${version} (${sizeKb} KB) in ${((Date.now() - packStart) / 1000).toFixed(1)}s`)
+   const cwd = process.cwd()
++  let suppliedBundle: Awaited<ReturnType<typeof readReleaseBundle>> | null = null
++  if (opts.bundle) {
++    try {
++      suppliedBundle = await readReleaseBundle(resolve(cwd, opts.bundle))
++    } catch (error) {
++      console.error(error instanceof Error ? error.message : String(error))
++      process.exit(1)
++    }
++  }
+ 
+   // ---- 1. Validate manifest + read identity ---------------------------
+   const manifestPath = resolve(cwd, 'miniapp.json')
+-  if (!existsSync(manifestPath)) {
++  if (!suppliedBundle && !existsSync(manifestPath)) {
+     console.error('Error: miniapp.json not found in current directory')
+     process.exit(1)
+   }
+   let manifest: Record<string, unknown>
+   try {
+-    manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'))
++    manifest = JSON.parse(suppliedBundle?.manifestBuffer.toString('utf-8') ?? readFileSync(manifestPath, 'utf-8'))
+   } catch {
+     console.error('Error: miniapp.json is not valid JSON')
+     process.exit(1)
+@@ -69,43 +97,54 @@ export async function release(opts: ReleaseOptions = {}): Promise<void> {
+   const name = (manifest.name as string) ?? packageName
+ 
+   // ---- 2. Build (or skip via cache) -----------------------------------
+-  const cacheDir = resolve(cwd, 'build')
+-  const cachedZipName = `${packageName}-${version}.zip`
+-  const cachedZipPath = join(cacheDir, cachedZipName)
+-
+-  const cacheValid = !opts.noCache && isCacheFresh(cachedZipPath, cwd)
+-  if (cacheValid) {
+-    console.log(`✓ Using cached build (${cachedZipName})`)
+-  } else {
+-    await buildProduction(cwd)
+-
+-    // Pack into build/<pkg>-<v>.zip
+-    const packStart = Date.now()
+-    const zipPath = await pack({outDir: 'build', silent: true})
+-    const sizeKb = Math.round(statSync(zipPath).size / 1024)
+-    console.log(`✓ Packed ${packageName}@${version} (${sizeKb} KB) in ${((Date.now() - packStart) / 1000).toFixed(1)}s`)
++  let cachedZipPath = ''
++  if (!suppliedBundle) {
++    const cacheDir = resolve(cwd, 'build')
++    const cachedZipName = `${packageName}-${version}.zip`
++    cachedZipPath = join(cacheDir, cachedZipName)
++
++    const cacheValid = !opts.noCache && isCacheFresh(cachedZipPath, cwd)
++    if (cacheValid) {
++      console.log(`✓ Using cached build (${cachedZipName})`)
++    } else {
++      await buildProduction(cwd)
++
++      // Pack into build/<pkg>-<v>.zip
++      const packStart = Date.now()
++      const zipPath = await pack({outDir: 'build', silent: true})
++      const sizeKb = Math.round(statSync(zipPath).size / 1024)
++      console.log(`✓ Packed ${packageName}@${version} (${sizeKb} KB) in ${((Date.now() - packStart) / 1000).toFixed(1)}s`)
++    }
    }
  
 -  // ---- 3. Find a free port and load the bundle into memory ------------
+-  const zipBuffer = readFileSync(cachedZipPath)
 +  // ---- 3. Select the listener and load the bundle into memory ----------
-   const zipBuffer = readFileSync(cachedZipPath)
++  const zipBuffer = suppliedBundle?.zipBuffer ?? readFileSync(cachedZipPath)
    const iconPath = resolve(cwd, 'icon.png')
-   const iconBuffer = existsSync(iconPath) ? readFileSync(iconPath) : null
-   const manifestBuffer = readFileSync(manifestPath)
+-  const iconBuffer = existsSync(iconPath) ? readFileSync(iconPath) : null
+-  const manifestBuffer = readFileSync(manifestPath)
++  const iconBuffer = suppliedBundle ? suppliedBundle.iconBuffer : (existsSync(iconPath) ? readFileSync(iconPath) : null)
++  const manifestBuffer = suppliedBundle?.manifestBuffer ?? readFileSync(manifestPath)
  
 -  const port = await pickPort(DEFAULT_PORT_START, PORT_SCAN_LIMIT)
 -  const lanIp = getLanIp()
