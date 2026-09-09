@@ -834,6 +834,11 @@ export class SessionController {
         this.session.storage.get(SOUL_ID_KEY),
         this.session.storage.get(JOURNAL_KEY),
       ])
+      if (!this.config && storedProfile === null) {
+        this.soulLoading = false
+        this.pushSnapshot()
+        return
+      }
       if (!this.config) this.config = parseOpenAlmaProfile(storedProfile)
       const config = this.currentConfig()
       storedSoul = savedSoul

@@ -1,3 +1,12 @@
+diff --git a/node_modules/@mentra/miniapp-cli/.bun-tag-1eab5b070248ec2b b/.bun-tag-1eab5b070248ec2b
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@mentra/miniapp-cli/.bun-tag-46fbbe8e1560f23 b/.bun-tag-46fbbe8e1560f23
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/node_modules/@mentra/miniapp-cli/.bun-tag-6a52822d3278fd37 b/.bun-tag-6a52822d3278fd37
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/src/index.ts b/src/index.ts
 index eebd1556474dd1f9bea9dc29612e8f87453fd4aa..6dd22dfd76c7c7efcd5864473f719b3fea91faef 100755
 --- a/src/index.ts
@@ -66,7 +75,7 @@ index 0000000000000000000000000000000000000000..4b203a43c5e38767c45e941654484b5d
 +  }
 +})
 diff --git a/src/release.ts b/src/release.ts
-index 619e3408d5d31505188e14578bd96e981a4e9bc3..9dfe08542c42eb91afb02ac0752fd7de218d57b9 100644
+index 619e3408d5d31505188e14578bd96e981a4e9bc3..cbcef98b0c10b4dfb4f417431351ea59e800c8eb 100644
 --- a/src/release.ts
 +++ b/src/release.ts
 @@ -25,6 +25,7 @@
@@ -77,7 +86,11 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..9dfe08542c42eb91afb02ac0752fd7de
  import {buildProduction} from './build.js'
  import {pack} from './pack.js'
  import {printQR} from './qr.js'
-@@ -39,20 +40,47 @@ const BUNDLE_PATH = '/bundle.zip'
+@@ -36,23 +37,51 @@ const HEALTH_PATH = '/__mentra_release/health'
+ const MANIFEST_PATH = '/miniapp.json'
+ const ICON_PATH = '/icon.png'
+ const BUNDLE_PATH = '/bundle.zip'
++const PROFILE_PATH = '/openalma-profile.json'
  
  interface ReleaseOptions {
    noCache?: boolean
@@ -127,7 +140,7 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..9dfe08542c42eb91afb02ac0752fd7de
    } catch {
      console.error('Error: miniapp.json is not valid JSON')
      process.exit(1)
-@@ -69,43 +97,54 @@ export async function release(opts: ReleaseOptions = {}): Promise<void> {
+@@ -69,43 +98,55 @@ export async function release(opts: ReleaseOptions = {}): Promise<void> {
    const name = (manifest.name as string) ?? packageName
  
    // ---- 2. Build (or skip via cache) -----------------------------------
@@ -175,6 +188,7 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..9dfe08542c42eb91afb02ac0752fd7de
 -  const manifestBuffer = readFileSync(manifestPath)
 +  const iconBuffer = suppliedBundle ? suppliedBundle.iconBuffer : (existsSync(iconPath) ? readFileSync(iconPath) : null)
 +  const manifestBuffer = suppliedBundle?.manifestBuffer ?? readFileSync(manifestPath)
++  const setupProfile = process.env.MENTRA_RELEASE_PROFILE
  
 -  const port = await pickPort(DEFAULT_PORT_START, PORT_SCAN_LIMIT)
 -  const lanIp = getLanIp()
@@ -206,3 +220,16 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..9dfe08542c42eb91afb02ac0752fd7de
      port,
      fetch(req) {
        const url = new URL(req.url)
+@@ -119,6 +160,12 @@ export async function release(opts: ReleaseOptions = {}): Promise<void> {
+           headers: {'content-type': 'application/json'},
+         })
+       }
++      if (url.pathname === PROFILE_PATH) {
++        if (!setupProfile) return new Response('Not found', {status: 404})
++        return new Response(setupProfile, {
++          headers: {'content-type': 'application/json', 'cache-control': 'no-store'},
++        })
++      }
+       if (url.pathname === ICON_PATH) {
+         if (!iconBuffer) return new Response('Not found', {status: 404})
+         return new Response(iconBuffer, {

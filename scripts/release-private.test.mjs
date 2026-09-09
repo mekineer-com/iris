@@ -9,6 +9,7 @@ import {
   installationMatches,
   readInstallationStatus,
   releaseArgs,
+  releaseProfile,
   writeReleaseStatus,
 } from "./release-private.mjs"
 
@@ -62,6 +63,13 @@ describe("private release URI", () => {
     expect(() => assertPrivateReleaseConfig("10.77.0.1", {...env, MENTRA_PUBLIC_OPENALMA_BEARER: ""}, interfaces, ["rdp"])).toThrow(
       "MENTRA_PUBLIC_OPENALMA_BEARER",
     )
+    expect(JSON.parse(releaseProfile({...env, MENTRA_PUBLIC_OPENALMA_SOUL_ID: "Test%20Soul"}))).toEqual({
+      baseUrl: "http://10.77.0.1",
+      bearer: "fictional",
+      userId: "Test User",
+      soulId: "Test Soul",
+      deviceSessionId: "test-phone",
+    })
   })
 
   test("accepts only a fresh report for the exact release", () => {

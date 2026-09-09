@@ -299,7 +299,7 @@ describe("SessionController", () => {
     })
     controller.start()
     await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(lastSnapshot(session)).toMatchObject({configured: false, soulLoading: false})
+    expect(lastSnapshot(session)).toMatchObject({configured: false, soulLoading: false, lastError: null})
     expect(requests).toBe(0)
 
     await session.handlers["openalma:set-profile"](CONFIG)

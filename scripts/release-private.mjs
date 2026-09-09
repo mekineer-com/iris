@@ -38,6 +38,16 @@ export function releaseArgs(host, bundle = process.env.MENTRA_RELEASE_BUNDLE) {
   return ["release", "--host", host, "--port", "6789", "--no-cache", ...(bundle ? ["--bundle", bundle] : [])]
 }
 
+export function releaseProfile(env) {
+  return JSON.stringify({
+    baseUrl: env.MENTRA_PUBLIC_OPENALMA_BASE_URL.replace(/\/+$/, ""),
+    bearer: env.MENTRA_PUBLIC_OPENALMA_BEARER,
+    userId: decodeURIComponent(env.MENTRA_PUBLIC_OPENALMA_USER_ID),
+    soulId: decodeURIComponent(env.MENTRA_PUBLIC_OPENALMA_SOUL_ID),
+    deviceSessionId: env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID,
+  })
+}
+
 export function installationMatches(status, target) {
   return (
     status?.installed_package === target.packageName &&
@@ -76,7 +86,7 @@ export function run() {
   assertPrivateReleaseConfig(host, process.env, networkInterfaces(), links.map((link) => link.ifname))
   const miniapp = spawn(join(root, "node_modules", ".bin", "mentra-miniapp"), releaseArgs(host), {
     cwd: root,
-    env: process.env,
+    env: {...process.env, MENTRA_RELEASE_PROFILE: releaseProfile(process.env)},
     stdio: ["inherit", "pipe", "inherit"],
   })
   let output = ""
