@@ -37,6 +37,9 @@ describe("private release URI", () => {
     const release = new URL(findReleaseUri(`before\n${uri}\nafter`))
 
     expect(releaseArgs("10.77.0.1")).toEqual(["release", "--host", "10.77.0.1", "--port", "6789", "--no-cache"])
+    expect(releaseArgs("10.77.0.1", "/tmp/iris.zip")).toEqual([
+      "release", "--host", "10.77.0.1", "--port", "6789", "--no-cache", "--bundle", "/tmp/iris.zip",
+    ])
     expect(release.searchParams.get("url")).toBe("http://10.77.0.1:6789")
     expect(release.searchParams.get("package")).toBe("com.openalma.mentra")
     expect(release.searchParams.get("version")).toBe("0.1.0")

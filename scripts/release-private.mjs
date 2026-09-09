@@ -34,8 +34,8 @@ export function assertPrivateReleaseConfig(host, env, interfaces, wireguardNames
   if (missing.length) throw new Error(`Missing required build settings: ${missing.join(", ")}`)
 }
 
-export function releaseArgs(host) {
-  return ["release", "--host", host, "--port", "6789", "--no-cache"]
+export function releaseArgs(host, bundle = process.env.MENTRA_RELEASE_BUNDLE) {
+  return ["release", "--host", host, "--port", "6789", "--no-cache", ...(bundle ? ["--bundle", bundle] : [])]
 }
 
 export function installationMatches(status, target) {
