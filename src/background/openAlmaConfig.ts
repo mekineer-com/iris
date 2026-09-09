@@ -1,50 +1,43 @@
 import manifest from "../../miniapp.json"
+import type {OpenAlmaProfile} from "../shared/types"
 
-export type OpenAlmaConfig = {
-  baseUrl: string
-  bearer: string
-  userId: string
-  soulId: string
-  deviceSessionId: string
+export const OPENALMA_PROFILE_KEY = "openalma.connection-profile"
+
+export type OpenAlmaConfig = OpenAlmaProfile & {
   packageName: string
   version: string
 }
 
-function required(name: string, value: string | undefined): string {
-  const normalized = value?.trim() ?? ""
+function required(name: keyof OpenAlmaProfile, value: unknown): string {
+  const normalized = typeof value === "string" ? value.trim() : ""
   if (!normalized) throw new Error(`${name} is not configured`)
   return normalized
 }
 
-function identity(name: string, value: string | undefined): string {
-  return decodeURIComponent(required(name, value))
-}
-
-export function readOpenAlmaConfig(): OpenAlmaConfig {
-  const rawBaseUrl = required("MENTRA_PUBLIC_OPENALMA_BASE_URL", process.env.MENTRA_PUBLIC_OPENALMA_BASE_URL)
-  if (!/^https?:\/\//.test(rawBaseUrl)) {
-    throw new Error("MENTRA_PUBLIC_OPENALMA_BASE_URL must use http or https")
+export function parseOpenAlmaProfile(value: unknown): OpenAlmaConfig {
+  const profile = typeof value === "string" ? JSON.parse(value) as unknown : value
+  if (!profile || typeof profile !== "object") throw new Error("OpenAlma profile is invalid")
+  const raw = profile as Record<string, unknown>
+  const baseUrl = required("baseUrl", raw.baseUrl).replace(/\/+$/, "")
+  if (!/^https?:\/\/[^\s@?#]+$/.test(baseUrl)) {
+    throw new Error("baseUrl must be an http or https URL without credentials, query, or fragment")
   }
-  const authority = rawBaseUrl.slice(rawBaseUrl.indexOf("://") + 3).split("/", 1)[0]
-  if (!authority || /[\s@?#]/.test(rawBaseUrl)) {
-    throw new Error("MENTRA_PUBLIC_OPENALMA_BASE_URL must not contain credentials, query, or fragment")
-  }
-
-  const deviceSessionId = required(
-    "MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID",
-    process.env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID,
-  )
+  const deviceSessionId = required("deviceSessionId", raw.deviceSessionId)
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(deviceSessionId)) {
-    throw new Error("MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID has an invalid format")
+    throw new Error("deviceSessionId has an invalid format")
   }
-
   return {
-    baseUrl: rawBaseUrl.replace(/\/+$/, ""),
-    bearer: required("MENTRA_PUBLIC_OPENALMA_BEARER", process.env.MENTRA_PUBLIC_OPENALMA_BEARER),
-    userId: identity("MENTRA_PUBLIC_OPENALMA_USER_ID", process.env.MENTRA_PUBLIC_OPENALMA_USER_ID),
-    soulId: identity("MENTRA_PUBLIC_OPENALMA_SOUL_ID", process.env.MENTRA_PUBLIC_OPENALMA_SOUL_ID),
+    baseUrl,
+    bearer: required("bearer", raw.bearer),
+    userId: required("userId", raw.userId),
+    soulId: required("soulId", raw.soulId),
     deviceSessionId,
     packageName: manifest.packageName,
     version: manifest.version,
   }
+}
+
+export function serializeOpenAlmaProfile(config: OpenAlmaConfig): string {
+  const {baseUrl, bearer, userId, soulId, deviceSessionId} = config
+  return JSON.stringify({baseUrl, bearer, userId, soulId, deviceSessionId})
 }

@@ -5,7 +5,16 @@ export type ManualPhase = "idle" | "recording" | "review" | "submitted"
 export type ManualAction = "talk" | "done" | "redo" | "send"
 export const PHOTO_RETRY_MESSAGE = "Photo processing is unfinished. Retry or discard the pending work."
 
+export type OpenAlmaProfile = {
+  baseUrl: string
+  bearer: string
+  userId: string
+  soulId: string
+  deviceSessionId: string
+}
+
 export interface SessionSnapshot {
+  configured: boolean
   mode: SessionMode
   connection: ConnectionState
   soulId: string

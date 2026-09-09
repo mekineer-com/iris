@@ -2,7 +2,14 @@ import {useEffect, useRef, useState} from "react"
 import {useRpc} from "@mentra/miniapp/ui"
 
 import type {Channels, ImageRequest, SelectSoulResult} from "../../shared/channels"
-import {PHOTO_RETRY_MESSAGE, type ConnectionState, type ManualAction, type ManualPhase, type SessionMode} from "../../shared/types"
+import {
+  PHOTO_RETRY_MESSAGE,
+  type ConnectionState,
+  type ManualAction,
+  type ManualPhase,
+  type OpenAlmaProfile,
+  type SessionMode,
+} from "../../shared/types"
 import {useChannel} from "../hooks/useChannel"
 import memuIcon from "../memu-icon.png"
 
@@ -75,6 +82,8 @@ type PendingPhoto = {file: File; imageId: string; previewUrl: string | null}
 
 export default function SessionPage() {
   const snapshot = useChannel("openalma:update")
+  const profileRpc = useRpc<Channels, "openalma:set-profile">("openalma:set-profile")
+  const clearProfileRpc = useRpc<Channels, "openalma:clear-profile">("openalma:clear-profile")
   const startRpc = useRpc<Channels, "openalma:start">("openalma:start")
   const stopRpc = useRpc<Channels, "openalma:stop">("openalma:stop")
   const soulRpc = useRpc<Channels, "openalma:set-soul">("openalma:set-soul")
@@ -104,6 +113,14 @@ export default function SessionPage() {
   const [imagePending, setImagePending] = useState(false)
   const [imageStatus, setImageStatus] = useState<string | null>(null)
   const [rpcError, setRpcError] = useState<string | null>(null)
+  const [profilePending, setProfilePending] = useState(false)
+  const [profile, setProfile] = useState<OpenAlmaProfile>({
+    baseUrl: "",
+    bearer: "",
+    userId: "",
+    soulId: "",
+    deviceSessionId: "",
+  })
   const startOwner = useRef(0)
   const imageOwner = useRef(0)
 
@@ -318,6 +335,18 @@ export default function SessionPage() {
     }
   }
 
+  const saveProfile = async () => {
+    setProfilePending(true)
+    setRpcError(null)
+    try {
+      await profileRpc(profile)
+    } catch (error) {
+      setRpcError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setProfilePending(false)
+    }
+  }
+
   const sittingLabel = stopping
     ? "Stopping..."
     : starting
@@ -334,6 +363,31 @@ export default function SessionPage() {
   const manualDisabled = manualPending || visible === "speaking"
   const voiceReady = visible === "listening" || visible === "speaking"
 
+  if (!snapshot) return <main><p className="status">Loading Iris...</p></main>
+  if (!snapshot.configured) {
+    const field = (name: keyof OpenAlmaProfile, label: string, type = "text") => (
+      <label>{label}<input type={type} value={profile[name]} disabled={profilePending}
+        onChange={(event) => setProfile({...profile, [name]: event.target.value})} /></label>
+    )
+    return (
+      <main>
+        <header><p className="eyebrow">OpenAlma voice</p><h1>Iris setup</h1></header>
+        <section className="soul-control" aria-label="OpenAlma connection setup">
+          {field("baseUrl", "OpenAlma address")}
+          {field("bearer", "Connection key", "password")}
+          {field("userId", "Your name")}
+          {field("soulId", "Soul name")}
+          {field("deviceSessionId", "Phone ID")}
+          <button type="button" disabled={profilePending} onClick={() => void saveProfile()}>
+            {profilePending ? "Connecting..." : "Save and connect"}
+          </button>
+          {snapshot.lastError ? <p role="alert">{snapshot.lastError}</p> : null}
+          {rpcError ? <p role="alert">{rpcError}</p> : null}
+        </section>
+      </main>
+    )
+  }
+
   return (
     <main>
       <header>
@@ -347,7 +401,7 @@ export default function SessionPage() {
       {snapshot?.memuAvailable === false ? (
         <p className="memu-status" role="status">
           <img src={memuIcon} alt="" />
-          <span>memU is unavailable. Start memU, then reopen Iris.</span>
+          <span>memU is unavailable. Start memU, or <button type="button" onClick={() => void clearProfileRpc({})}>change connection</button>.</span>
         </p>
       ) : null}
       <section className="soul-control" aria-label="Soul selection">

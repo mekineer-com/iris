@@ -18,8 +18,9 @@ Before changing the Gemini wire or diagnosing provider behavior, read
 [`GEMINI_LIVE.md`](GEMINI_LIVE.md). It pins Iris's model-specific contract,
 official sources, proven behavior, and local redacted fixtures.
 
-Iris stores the selected soul in `session.storage` under `openalma.soul-id`.
-The compiled soul seeds the field; existing suggestions come from authenticated
+Iris stores its OpenAlma connection profile and selected soul in phone-local
+`session.storage`. With no profile it shows setup and makes no OpenAlma or Gemini
+request. Existing soul suggestions come from authenticated
 `GET /integration/mentra/souls?user_id=...`. Selection or creation uses `POST`
 on the same route with `user_id`, `soul_id`, and `use_existing`. Only a 409
 with `detail.reason: existing_exact` offers consent to reuse; sanitized-name
@@ -30,7 +31,9 @@ Start recovers that journal's original soul, then Stop completes finalization.
 
 While a sitting is active, **Take photo** and **Choose image** durably store a non-empty JPEG/PNG before sending it to Gemini. Immediate send is the default; optional preview provides Send/Retake. Files over 1 MB pause for a cost/latency warning that can be permanently dismissed. Gemini's spoken description is saved as the image caption only after its transcript is acknowledged.
 
-Create `.env.local` from `.env.example`. The dedicated bearer is bundled into the private MiniApp and only grants access over the private WireGuard route; the permanent Gemini key stays on the OpenAlma server.
+The MiniApp ZIP is generic and contains no endpoint, credential, user, soul, or
+phone identity. `.env.local` is used only by the private release wrapper for its
+WireGuard bind and installation-completion poll; it is never compiled into Iris.
 
 ```
 bun install

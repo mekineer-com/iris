@@ -1,5 +1,5 @@
 import type {Rpc} from "@mentra/miniapp/ui"
-import type {ManualAction, SessionMode, SessionSnapshot} from "./types"
+import type {ManualAction, OpenAlmaProfile, SessionMode, SessionSnapshot} from "./types"
 
 export type ImageRequest = {
   imageId: string
@@ -14,6 +14,8 @@ export type SelectSoulResult =
 
 export interface Channels {
   "openalma:update": SessionSnapshot
+  "openalma:set-profile": Rpc<OpenAlmaProfile, {ok: true}>
+  "openalma:clear-profile": Rpc<Record<string, never>, {ok: true}>
   "openalma:start": Rpc<{mode: SessionMode}, {ok: true}>
   "openalma:stop": Rpc<Record<string, never>, {ok: true}>
   "openalma:set-soul": Rpc<{soulId: string; useExisting: boolean}, SelectSoulResult>

@@ -7,6 +7,7 @@ import type {
   EarconName,
   ManualAction,
   ManualPhase,
+  OpenAlmaProfile,
   SessionMode,
   SessionSnapshot,
 } from "../shared/types"
@@ -14,7 +15,7 @@ import {approxBase64ByteLength, normalizePcm16Audio} from "./audioHelpers"
 import {GeminiLiveController, JOURNAL_KEY, journalSoulId} from "./GeminiLiveController"
 import type {GeminiCallbacks} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
-import {readOpenAlmaConfig} from "./openAlmaConfig"
+import {OPENALMA_PROFILE_KEY, parseOpenAlmaProfile, serializeOpenAlmaProfile} from "./openAlmaConfig"
 import {reportInstallation} from "./installation"
 import {timeoutSignal} from "./timeoutSignal"
 
@@ -91,7 +92,7 @@ export class SessionController {
   private readonly watchdogMs: number
   private readonly earconTimeoutMs: number
   private readonly responseWatchdogMs: number
-  private readonly config?: OpenAlmaConfig
+  private config?: OpenAlmaConfig
   private readonly fetchFn: typeof fetch
   private readonly createLiveController: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
   private liveController: GeminiLiveController | null
@@ -129,6 +130,39 @@ export class SessionController {
     this.send = ui.send
     this.preferencesLoaded = this.loadPreferences()
     this.unsubs.push(ui.onOpen(() => this.pushSnapshot()))
+    this.unsubs.push(
+      ui.handle("openalma:set-profile", async (payload) => {
+        await this.preferencesLoaded
+        if (ACTIVE.has(this.connection) || this.connection === "stopping") {
+          throw new Error("Stop Iris before changing its connection")
+        }
+        const config = parseOpenAlmaProfile(payload as OpenAlmaProfile)
+        await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(config))
+        this.config = config
+        this.soulId = config.soulId
+        this.soulLoading = true
+        this.memuAvailable = null
+        this.lastError = null
+        this.preferencesLoaded = this.loadPreferences()
+        await this.preferencesLoaded
+        return {ok: true as const}
+      }),
+    )
+    this.unsubs.push(
+      ui.handle("openalma:clear-profile", async () => {
+        await this.preferencesLoaded
+        if (this.soulLocked()) throw new Error("Stop or recover this sitting before changing its connection")
+        await this.session.storage.delete(OPENALMA_PROFILE_KEY)
+        this.config = undefined
+        this.soulId = ""
+        this.souls = []
+        this.soulConfirmed = false
+        this.memuAvailable = null
+        this.lastError = null
+        this.pushSnapshot()
+        return {ok: true as const}
+      }),
+    )
     this.unsubs.push(
       ui.handle("openalma:start", async (payload) => {
         const mode = (payload as {mode?: SessionMode} | null)?.mode ?? this.mode
@@ -290,7 +324,7 @@ export class SessionController {
     const epoch = this.speakerEpoch
     let timeout: ReturnType<typeof setTimeout> | null = null
     try {
-      const config = this.config ?? readOpenAlmaConfig()
+      const config = this.currentConfig()
       await Promise.race([
         this.session.speaker.play({
           audioUrl: `${config.baseUrl}/integration/mentra/earcons/${name}.wav`,
@@ -322,6 +356,7 @@ export class SessionController {
 
   private snapshot(): SessionSnapshot {
     return {
+      configured: Boolean(this.config),
       mode: this.mode,
       connection: this.connection,
       soulId: this.soulId,
@@ -573,7 +608,7 @@ export class SessionController {
   }
 
   private async reportSelectedSoul(): Promise<void> {
-    if (process.env.NODE_ENV !== "production") return
+    if (process.env.NODE_ENV !== "production" || !this.config) return
     try {
       await reportInstallation({...this.currentConfig(), soulId: this.soulId}, this.fetchFn)
     } catch (error) {
@@ -792,13 +827,15 @@ export class SessionController {
   private async loadPreferences(): Promise<void> {
     let storedSoul: string | null = null
     try {
-      const config = this.currentConfig()
-      const [microphone, camera, savedSoul, journal] = await Promise.all([
+      const [storedProfile, microphone, camera, savedSoul, journal] = await Promise.all([
+        this.session.storage.get(OPENALMA_PROFILE_KEY),
         this.session.storage.get(MICROPHONE_ENABLED_KEY),
         this.session.storage.get(CAMERA_ENABLED_KEY),
         this.session.storage.get(SOUL_ID_KEY),
         this.session.storage.get(JOURNAL_KEY),
       ])
+      if (!this.config) this.config = parseOpenAlmaProfile(storedProfile)
+      const config = this.currentConfig()
       storedSoul = savedSoul
       this.microphoneEnabled = microphone !== "0"
       this.cameraEnabled = camera !== "0"
@@ -826,7 +863,8 @@ export class SessionController {
   }
 
   private currentConfig(): OpenAlmaConfig {
-    return this.config ?? readOpenAlmaConfig()
+    if (!this.config) throw new Error("Set up the OpenAlma connection first")
+    return this.config
   }
 
   private soulLocked(): boolean {

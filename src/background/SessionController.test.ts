@@ -6,6 +6,7 @@ import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {SessionController} from "./SessionController"
 
 type Snapshot = {
+  configured: boolean
   mode: string
   connection: string
   soulId: string
@@ -287,6 +288,34 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
 }
 
 describe("SessionController", () => {
+  test("does no network work until a phone-local profile is saved", async () => {
+    const session = new FakeSession()
+    let requests = 0
+    const controller = new SessionController(session as never, {
+      fetchFn: (async () => {
+        requests += 1
+        return new Response(JSON.stringify({souls: [CONFIG.soulId]}))
+      }) as typeof fetch,
+    })
+    controller.start()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(lastSnapshot(session)).toMatchObject({configured: false, soulLoading: false})
+    expect(requests).toBe(0)
+
+    await session.handlers["openalma:set-profile"](CONFIG)
+    expect(lastSnapshot(session)).toMatchObject({configured: true, soulId: CONFIG.soulId, memuAvailable: true})
+    expect(JSON.parse(session.stored.get("openalma.connection-profile") ?? "")).toEqual({
+      baseUrl: CONFIG.baseUrl,
+      bearer: CONFIG.bearer,
+      userId: CONFIG.userId,
+      soulId: CONFIG.soulId,
+      deviceSessionId: CONFIG.deviceSessionId,
+    })
+    expect(requests).toBe(1)
+    await session.handlers["openalma:clear-profile"]({})
+    expect(lastSnapshot(session)?.configured).toBe(false)
+  })
+
   test("direct Start waits for discovery and never starts an unavailable saved soul", async () => {
     let release!: (response: Response) => void
     const lookup = new Promise<Response>((resolve) => { release = resolve })
@@ -761,6 +790,7 @@ describe("SessionController", () => {
     const harness = setup()
     harness.session.onOpenCb?.()
     expect(harness.session.snapshots[0]).toEqual({
+      configured: true,
       mode: "continuous",
       connection: "idle",
       soulId: "Test Soul",
