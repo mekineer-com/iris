@@ -323,6 +323,7 @@ describe("SessionController", () => {
     expect(requests).toBe(1)
     await session.handlers["openalma:clear-profile"]({})
     expect(lastSnapshot(session)?.configured).toBe(false)
+    expect(session.stored.get("openalma.connection-profile-cleared")).toBe("1")
   })
 
   test("confirms and creates a missing owner before the first soul", async () => {
@@ -351,6 +352,7 @@ describe("SessionController", () => {
       `${CONFIG.baseUrl}/integration/mentra/souls`,
     ])
     expect(JSON.parse(session.stored.get("openalma.connection-profile") ?? "").userId).toBe(CONFIG.userId)
+    expect(session.stored.has("openalma.connection-profile-cleared")).toBe(false)
   })
 
   test("replaces a stale profile user with the discovered owner", async () => {

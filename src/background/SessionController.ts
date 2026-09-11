@@ -15,7 +15,12 @@ import {approxBase64ByteLength, normalizePcm16Audio} from "./audioHelpers"
 import {GeminiLiveController, JOURNAL_KEY, journalSoulId} from "./GeminiLiveController"
 import type {GeminiCallbacks} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
-import {OPENALMA_PROFILE_KEY, parseOpenAlmaProfile, serializeOpenAlmaProfile} from "./openAlmaConfig"
+import {
+  OPENALMA_PROFILE_CLEARED_KEY,
+  OPENALMA_PROFILE_KEY,
+  parseOpenAlmaProfile,
+  serializeOpenAlmaProfile,
+} from "./openAlmaConfig"
 import {reportInstallation} from "./installation"
 import {timeoutSignal} from "./timeoutSignal"
 
@@ -143,6 +148,7 @@ export class SessionController {
         )
         const config = identity.config
         await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(config))
+        await this.session.storage.delete(OPENALMA_PROFILE_CLEARED_KEY)
         this.config = config
         this.soulId = config.soulId
         this.soulLoading = true
@@ -158,6 +164,7 @@ export class SessionController {
         await this.preferencesLoaded
         if (this.soulLocked()) throw new Error("Stop or recover this sitting before changing its connection")
         await this.session.storage.delete(OPENALMA_PROFILE_KEY)
+        await this.session.storage.set(OPENALMA_PROFILE_CLEARED_KEY, "1")
         this.config = undefined
         this.soulId = ""
         this.souls = []

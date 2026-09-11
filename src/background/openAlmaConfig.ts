@@ -2,6 +2,7 @@ import manifest from "../../miniapp.json"
 import type {OpenAlmaProfile} from "../shared/types"
 
 export const OPENALMA_PROFILE_KEY = "openalma.connection-profile"
+export const OPENALMA_PROFILE_CLEARED_KEY = "openalma.connection-profile-cleared"
 
 export type OpenAlmaConfig = OpenAlmaProfile & {
   packageName: string
