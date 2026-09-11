@@ -114,6 +114,7 @@ export default function SessionPage() {
   const [imageStatus, setImageStatus] = useState<string | null>(null)
   const [rpcError, setRpcError] = useState<string | null>(null)
   const [profilePending, setProfilePending] = useState(false)
+  const [identityConfirmed, setIdentityConfirmed] = useState(false)
   const [profile, setProfile] = useState<OpenAlmaProfile>({
     baseUrl: "",
     bearer: "",
@@ -339,7 +340,7 @@ export default function SessionPage() {
     setProfilePending(true)
     setRpcError(null)
     try {
-      await profileRpc(profile)
+      await profileRpc({...profile, confirmIdentity: identityConfirmed})
     } catch (error) {
       setRpcError(error instanceof Error ? error.message : String(error))
     } finally {
@@ -378,6 +379,8 @@ export default function SessionPage() {
           {field("userId", "Your name")}
           {field("soulId", "Soul name")}
           {field("deviceSessionId", "Phone ID")}
+          <label><input type="checkbox" checked={identityConfirmed} disabled={profilePending}
+            onChange={(event) => setIdentityConfirmed(event.target.checked)} /> Confirm new owner and Soul spellings</label>
           <button type="button" disabled={profilePending} onClick={() => void saveProfile()}>
             {profilePending ? "Connecting..." : "Save and connect"}
           </button>

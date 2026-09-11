@@ -14,7 +14,7 @@ export type SelectSoulResult =
 
 export interface Channels {
   "openalma:update": SessionSnapshot
-  "openalma:set-profile": Rpc<OpenAlmaProfile, {ok: true}>
+  "openalma:set-profile": Rpc<OpenAlmaProfile & {confirmIdentity?: boolean}, {ok: true}>
   "openalma:clear-profile": Rpc<Record<string, never>, {ok: true}>
   "openalma:start": Rpc<{mode: SessionMode}, {ok: true}>
   "openalma:stop": Rpc<Record<string, never>, {ok: true}>

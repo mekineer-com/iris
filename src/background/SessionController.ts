@@ -136,14 +136,19 @@ export class SessionController {
         if (ACTIVE.has(this.connection) || this.connection === "stopping") {
           throw new Error("Stop Iris before changing its connection")
         }
-        const config = parseOpenAlmaProfile(payload as OpenAlmaProfile)
+        const submitted = payload as OpenAlmaProfile & {confirmIdentity?: unknown}
+        const identity = await this.resolveProfileIdentity(
+          parseOpenAlmaProfile(submitted),
+          submitted.confirmIdentity === true,
+        )
+        const config = identity.config
         await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(config))
         this.config = config
         this.soulId = config.soulId
         this.soulLoading = true
         this.memuAvailable = null
         this.lastError = null
-        this.preferencesLoaded = this.loadPreferences()
+        this.preferencesLoaded = this.loadPreferences(identity)
         await this.preferencesLoaded
         return {ok: true as const}
       }),
@@ -824,7 +829,9 @@ export class SessionController {
     this.manualAudioBytes = 0
   }
 
-  private async loadPreferences(): Promise<void> {
+  private async loadPreferences(
+    resolvedIdentity?: {config: OpenAlmaConfig; souls: string[]},
+  ): Promise<void> {
     let storedSoul: string | null = null
     try {
       const [storedProfile, microphone, camera, savedSoul, journal] = await Promise.all([
@@ -840,22 +847,19 @@ export class SessionController {
         return
       }
       if (!this.config) this.config = parseOpenAlmaProfile(storedProfile)
-      const config = this.currentConfig()
+      const identity = resolvedIdentity ?? await this.resolveProfileIdentity(this.currentConfig(), false)
+      const config = identity.config
+      if (config.userId !== this.config.userId) {
+        await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(config))
+      }
+      this.config = config
       storedSoul = savedSoul
       this.microphoneEnabled = microphone !== "0"
       this.cameraEnabled = camera !== "0"
       this.soulId = storedSoul?.trim() || config.soulId
       this.recoverySoulId = journalSoulId(journal, config)
       if (this.recoverySoulId) this.soulId = this.recoverySoulId
-      const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
-        headers: {Authorization: `Bearer ${config.bearer}`}, signal: timeoutSignal(10_000),
-      })
-      if (!response.ok) throw new Error(`Soul discovery failed (${response.status})`)
-      const result = await response.json() as Partial<{souls: unknown}>
-      if (!Array.isArray(result.souls) || result.souls.some((soul) => typeof soul !== "string")) {
-        throw new Error("Soul discovery returned an invalid response")
-      }
-      this.souls = result.souls
+      this.souls = identity.souls
       this.memuAvailable = true
     } catch (error) {
       this.memuAvailable = false
@@ -870,6 +874,66 @@ export class SessionController {
   private currentConfig(): OpenAlmaConfig {
     if (!this.config) throw new Error("Set up the OpenAlma connection first")
     return this.config
+  }
+
+  private async resolveProfileIdentity(
+    config: OpenAlmaConfig,
+    confirmed: boolean,
+  ): Promise<{config: OpenAlmaConfig; souls: string[]}> {
+    const headers = {Authorization: `Bearer ${config.bearer}`}
+    const ownerResponse = await this.fetchFn(`${config.baseUrl}/integration/mentra/owner`, {
+      headers,
+      signal: timeoutSignal(10_000),
+    })
+    if (!ownerResponse.ok) throw new Error(`Owner discovery failed (${ownerResponse.status})`)
+    const ownerResult = await ownerResponse.json() as Partial<{user_id: unknown}>
+    if (ownerResult.user_id !== null && typeof ownerResult.user_id !== "string") {
+      throw new Error("Owner discovery returned an invalid response")
+    }
+
+    const soulsResponse = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
+      headers,
+      signal: timeoutSignal(10_000),
+    })
+    if (!soulsResponse.ok) throw new Error(`Soul discovery failed (${soulsResponse.status})`)
+    const soulsResult = await soulsResponse.json() as Partial<{souls: unknown}>
+    if (!Array.isArray(soulsResult.souls) || soulsResult.souls.some((soul) => typeof soul !== "string")) {
+      throw new Error("Soul discovery returned an invalid response")
+    }
+
+    let userId = ownerResult.user_id?.trim() ?? ""
+    if ((!userId || soulsResult.souls.length === 0) && !confirmed) {
+      throw new Error("Confirm new owner and Soul spellings before setup")
+    }
+    const jsonHeaders = {...headers, "Content-Type": "application/json"}
+    if (!userId) {
+      const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/owner`, {
+        method: "POST",
+        headers: jsonHeaders,
+        signal: timeoutSignal(10_000),
+        body: JSON.stringify({user_id: config.userId}),
+      })
+      if (!response.ok) throw new Error(`Owner setup failed (${response.status})`)
+      const result = await response.json() as Partial<{user_id: unknown}>
+      if (typeof result.user_id !== "string" || !result.user_id.trim()) {
+        throw new Error("Owner setup returned an invalid response")
+      }
+      userId = result.user_id
+    }
+    let souls = soulsResult.souls
+    if (souls.length === 0) {
+      const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
+        method: "POST",
+        headers: jsonHeaders,
+        signal: timeoutSignal(10_000),
+        body: JSON.stringify({soul_id: config.soulId, use_existing: false}),
+      })
+      if (!response.ok) throw new Error(`Soul setup failed (${response.status})`)
+      const result = await response.json() as Partial<{soul_id: unknown}>
+      if (result.soul_id !== config.soulId) throw new Error("Soul setup returned an invalid response")
+      souls = [config.soulId]
+    }
+    return {config: {...config, userId}, souls}
   }
 
   private soulLocked(): boolean {

@@ -34,6 +34,15 @@ const CONFIG: OpenAlmaConfig = {
   version: "0.1.0",
 }
 
+function withOwnerDiscovery(fetchFn: typeof fetch, userId = CONFIG.userId): typeof fetch {
+  return (async (url, init) => {
+    if (String(url).endsWith("/integration/mentra/owner") && !init?.method) {
+      return Response.json({user_id: userId})
+    }
+    return fetchFn(url, init)
+  }) as typeof fetch
+}
+
 function silentPcm(): string {
   return Buffer.alloc(8).toString("base64")
 }
@@ -256,7 +265,7 @@ function setup(
     earconTimeoutMs: options.earconTimeoutMs,
     responseWatchdogMs: options.responseWatchdogMs,
     config: CONFIG,
-    fetchFn: options.fetchFn ?? (async (_url, init) => {
+    fetchFn: withOwnerDiscovery(options.fetchFn ?? (async (_url, init) => {
       if (!init?.method) {
         return new Response(JSON.stringify({souls: [CONFIG.soulId]}), {headers: {"Content-Type": "application/json"}})
       }
@@ -264,7 +273,7 @@ function setup(
       return new Response(JSON.stringify({soul_id: body.soul_id, created: !body.use_existing}), {
         headers: {"Content-Type": "application/json"},
       })
-    }) as typeof fetch,
+    }) as typeof fetch),
     createLiveController: (config, callbacks) => {
       configs.push(config)
       live = new FakeLive(callbacks)
@@ -292,10 +301,10 @@ describe("SessionController", () => {
     const session = new FakeSession()
     let requests = 0
     const controller = new SessionController(session as never, {
-      fetchFn: (async () => {
+      fetchFn: withOwnerDiscovery((async () => {
         requests += 1
         return new Response(JSON.stringify({souls: [CONFIG.soulId]}))
-      }) as typeof fetch,
+      }) as typeof fetch),
     })
     controller.start()
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -314,6 +323,53 @@ describe("SessionController", () => {
     expect(requests).toBe(1)
     await session.handlers["openalma:clear-profile"]({})
     expect(lastSnapshot(session)?.configured).toBe(false)
+  })
+
+  test("confirms and creates a missing owner before the first soul", async () => {
+    const session = new FakeSession()
+    const requests: Array<{url: string; method: string; body: unknown}> = []
+    const controller = new SessionController(session as never, {
+      fetchFn: (async (url, init) => {
+        const method = init?.method ?? "GET"
+        const body = init?.body ? JSON.parse(String(init.body)) : null
+        requests.push({url: String(url), method, body})
+        if (String(url).endsWith("/owner")) {
+          return Response.json({user_id: method === "POST" ? CONFIG.userId : null})
+        }
+        if (method === "GET") return Response.json({souls: []})
+        return Response.json({soul_id: CONFIG.soulId, created: true})
+      }) as typeof fetch,
+    })
+    controller.start()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    await expect(session.handlers["openalma:set-profile"](CONFIG)).rejects.toThrow("Confirm new owner")
+    await session.handlers["openalma:set-profile"]({...CONFIG, confirmIdentity: true})
+
+    expect(requests.filter((request) => request.method === "POST").map((request) => request.url)).toEqual([
+      `${CONFIG.baseUrl}/integration/mentra/owner`,
+      `${CONFIG.baseUrl}/integration/mentra/souls`,
+    ])
+    expect(JSON.parse(session.stored.get("openalma.connection-profile") ?? "").userId).toBe(CONFIG.userId)
+  })
+
+  test("replaces a stale profile user with the discovered owner", async () => {
+    const session = new FakeSession()
+    const stale = {...CONFIG, userId: "Stale User"}
+    const controller = new SessionController(session as never, {
+      config: stale,
+      fetchFn: withOwnerDiscovery((async () => Response.json({souls: [CONFIG.soulId]})) as typeof fetch),
+    })
+    controller.start()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(JSON.parse(session.stored.get("openalma.connection-profile") ?? "")).toEqual({
+      baseUrl: CONFIG.baseUrl,
+      bearer: CONFIG.bearer,
+      userId: CONFIG.userId,
+      soulId: CONFIG.soulId,
+      deviceSessionId: CONFIG.deviceSessionId,
+    })
   })
 
   test("direct Start waits for discovery and never starts an unavailable saved soul", async () => {
