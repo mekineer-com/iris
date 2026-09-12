@@ -165,10 +165,10 @@ export class SessionController {
       ui.handle("openalma:clear-profile", async () => {
         await this.preferencesLoaded
         if (this.soulLocked()) throw new Error("Stop or recover this sitting before changing its connection")
+        await this.session.storage.set(OPENALMA_PROFILE_CLEARED_KEY, "1")
         await Promise.all([
           this.session.storage.delete(OPENALMA_PROFILE_KEY),
           this.session.storage.delete(SOUL_ID_KEY),
-          this.session.storage.set(OPENALMA_PROFILE_CLEARED_KEY, "1"),
         ])
         this.config = undefined
         this.soulId = ""

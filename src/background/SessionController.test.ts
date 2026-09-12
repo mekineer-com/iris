@@ -327,6 +327,45 @@ describe("SessionController", () => {
     expect(session.stored.has("openalma.soul-id")).toBe(false)
   })
 
+  test("protects profile state when Clear Profile storage partially fails", async () => {
+    const profileKey = "openalma.connection-profile"
+    const markerKey = "openalma.connection-profile-cleared"
+    const soulKey = "openalma.soul-id"
+    const readyFetch = withOwnerDiscovery((async () => Response.json({souls: [CONFIG.soulId]})) as typeof fetch)
+
+    const markerFailure = new FakeSession()
+    markerFailure.stored.set(profileKey, JSON.stringify(CONFIG))
+    markerFailure.stored.set(soulKey, CONFIG.soulId)
+    const set = markerFailure.storage.set
+    markerFailure.storage.set = async (key, value) => {
+      if (key === markerKey) throw new Error("marker failed")
+      await set(key, value)
+    }
+    new SessionController(markerFailure as never, {config: CONFIG, fetchFn: readyFetch}).start()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    await expect(markerFailure.handlers["openalma:clear-profile"]({})).rejects.toThrow("marker failed")
+    expect(markerFailure.stored.has(profileKey)).toBe(true)
+    expect(markerFailure.stored.has(soulKey)).toBe(true)
+    expect(lastSnapshot(markerFailure)?.configured).toBe(true)
+
+    const deleteFailure = new FakeSession()
+    deleteFailure.stored.set(profileKey, JSON.stringify(CONFIG))
+    deleteFailure.stored.set(soulKey, CONFIG.soulId)
+    const deleteKey = deleteFailure.storage.delete
+    deleteFailure.storage.delete = async (key) => {
+      if (key === profileKey) throw new Error("delete failed")
+      await deleteKey(key)
+    }
+    new SessionController(deleteFailure as never, {config: CONFIG, fetchFn: readyFetch}).start()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    await expect(deleteFailure.handlers["openalma:clear-profile"]({})).rejects.toThrow("delete failed")
+    expect(deleteFailure.stored.get(markerKey)).toBe("1")
+    expect(deleteFailure.stored.has(profileKey)).toBe(true)
+    expect(lastSnapshot(deleteFailure)?.configured).toBe(true)
+  })
+
   test("confirms and creates a missing owner before the first soul", async () => {
     const session = new FakeSession()
     const requests: Array<{url: string; method: string; body: unknown}> = []
