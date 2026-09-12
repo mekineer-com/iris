@@ -163,8 +163,11 @@ export class SessionController {
       ui.handle("openalma:clear-profile", async () => {
         await this.preferencesLoaded
         if (this.soulLocked()) throw new Error("Stop or recover this sitting before changing its connection")
-        await this.session.storage.delete(OPENALMA_PROFILE_KEY)
-        await this.session.storage.set(OPENALMA_PROFILE_CLEARED_KEY, "1")
+        await Promise.all([
+          this.session.storage.delete(OPENALMA_PROFILE_KEY),
+          this.session.storage.delete(SOUL_ID_KEY),
+          this.session.storage.set(OPENALMA_PROFILE_CLEARED_KEY, "1"),
+        ])
         this.config = undefined
         this.soulId = ""
         this.souls = []
@@ -856,9 +859,6 @@ export class SessionController {
       if (!this.config) this.config = parseOpenAlmaProfile(storedProfile)
       const identity = resolvedIdentity ?? await this.resolveProfileIdentity(this.currentConfig(), false)
       const config = identity.config
-      if (config.userId !== this.config.userId) {
-        await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(config))
-      }
       this.config = config
       storedSoul = savedSoul
       this.microphoneEnabled = microphone !== "0"
@@ -909,6 +909,9 @@ export class SessionController {
     }
 
     let userId = ownerResult.user_id?.trim() ?? ""
+    if (userId && userId !== config.userId) {
+      throw new Error(`Connection user does not match OpenAlma owner "${userId}"`)
+    }
     if ((!userId || soulsResult.souls.length === 0) && !confirmed) {
       throw new Error("Confirm new owner and Soul spellings before setup")
     }
