@@ -49,6 +49,8 @@ const MICROPHONE_ENABLED_KEY = "openalma.microphone-enabled"
 const CAMERA_ENABLED_KEY = "openalma.camera-enabled"
 const SOUL_ID_KEY = "openalma.soul-id"
 
+class OwnerMismatchError extends Error {}
+
 function trace(event: string, detail: Record<string, unknown> = {}): void {
   if (process.env.NODE_ENV === "test") return
   console.info(`[OpenAlma] ${new Date().toISOString()} ${event}`, detail)
@@ -869,6 +871,13 @@ export class SessionController {
       this.souls = identity.souls
       this.memuAvailable = true
     } catch (error) {
+      if (error instanceof OwnerMismatchError) {
+        this.config = undefined
+        this.soulId = ""
+        this.souls = []
+        this.soulConfirmed = false
+        this.recoverySoulId = null
+      }
       this.memuAvailable = false
       this.lastError = error instanceof Error ? error.message : String(error)
     }
@@ -910,7 +919,7 @@ export class SessionController {
 
     let userId = ownerResult.user_id?.trim() ?? ""
     if (userId && userId !== config.userId) {
-      throw new Error(`Connection user does not match OpenAlma owner "${userId}"`)
+      throw new OwnerMismatchError(`Connection user does not match OpenAlma owner "${userId}"`)
     }
     if ((!userId || soulsResult.souls.length === 0) && !confirmed) {
       throw new Error("Confirm new owner and Soul spellings before setup")

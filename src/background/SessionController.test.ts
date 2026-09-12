@@ -359,6 +359,8 @@ describe("SessionController", () => {
   test("rejects a profile user that differs from the discovered owner", async () => {
     const session = new FakeSession()
     const stale = {...CONFIG, userId: "Stale User"}
+    session.stored.set("openalma.connection-profile", JSON.stringify(stale))
+    session.stored.set("openalma.soul-id", stale.soulId)
     const controller = new SessionController(session as never, {
       config: stale,
       fetchFn: withOwnerDiscovery((async () => Response.json({souls: [CONFIG.soulId]})) as typeof fetch),
@@ -367,10 +369,24 @@ describe("SessionController", () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
 
     expect(lastSnapshot(session)).toMatchObject({
+      configured: false,
+      soulId: "",
+      souls: [],
       memuAvailable: false,
       lastError: `Connection user does not match OpenAlma owner "${CONFIG.userId}"`,
     })
+    expect(session.stored.has("openalma.connection-profile")).toBe(true)
+    expect(session.stored.has("openalma.soul-id")).toBe(true)
+    await expect(session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow(
+      "Local recovery state unavailable",
+    )
+    await expect(
+      session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: false}),
+    ).rejects.toThrow("Set up")
+
+    await session.handlers["openalma:clear-profile"]({})
     expect(session.stored.has("openalma.connection-profile")).toBe(false)
+    expect(session.stored.has("openalma.soul-id")).toBe(false)
   })
 
   test("direct Start waits for discovery and never starts an unavailable saved soul", async () => {
