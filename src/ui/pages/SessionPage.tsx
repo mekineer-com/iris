@@ -182,6 +182,15 @@ export default function SessionPage() {
     }
   }
 
+  const clearProfile = async () => {
+    setRpcError(null)
+    try {
+      await clearProfileRpc({})
+    } catch (error) {
+      setRpcError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
   const submitSoul = async (): Promise<void> => {
     const soulId = soulName.trim()
     if (knownSoul) {
@@ -404,7 +413,7 @@ export default function SessionPage() {
       {snapshot?.memuAvailable === false ? (
         <p className="memu-status" role="status">
           <img src={memuIcon} alt="" />
-          <span>memU is unavailable. Start memU, or <button type="button" onClick={() => void clearProfileRpc({})}>change connection</button>.</span>
+          <span>memU is unavailable. Start memU, or <button type="button" onClick={() => void clearProfile()}>change connection</button>.</span>
         </p>
       ) : null}
       <section className="soul-control" aria-label="Soul selection">
