@@ -20,7 +20,10 @@ official sources, proven behavior, and local redacted fixtures.
 
 Iris stores its OpenAlma connection profile and selected soul in phone-local
 `session.storage`. With no profile it shows setup and makes no OpenAlma or Gemini
-request. Existing soul suggestions come from authenticated
+request. Setup first discovers the one shared OpenAlma owner through the
+bearer-authenticated `/integration/mentra/owner` contract; a saved profile whose
+user does not match that owner is rejected as stale rather than silently reused.
+Existing soul suggestions come from authenticated
 `GET /integration/mentra/souls?user_id=...`. Selection or creation uses `POST`
 on the same route with `user_id`, `soul_id`, and `use_existing`. Only a 409
 with `detail.reason: existing_exact` offers consent to reuse; sanitized-name
@@ -28,6 +31,9 @@ collisions remain errors. Start waits for local preferences and discovery.
 A saved name missing from discovery requires explicit selection or creation.
 Selection stays locked during a sitting and while its Gemini journal remains;
 Start recovers that journal's original soul, then Stop completes finalization.
+An explicitly cleared profile is remembered: installer/updates will not reseed
+an identity the user chose to remove, and Clear Profile failures surface
+through the existing error UI.
 
 While a sitting is active, **Take photo** and **Choose image** durably store a non-empty JPEG/PNG before sending it to Gemini. Immediate send is the default; optional preview provides Send/Retake. Files over 1 MB pause for a cost/latency warning that can be permanently dismissed. Gemini's spoken description is saved as the image caption only after its transcript is acknowledged.
 
