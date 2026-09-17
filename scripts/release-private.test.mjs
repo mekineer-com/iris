@@ -6,6 +6,7 @@ import {join} from "node:path"
 import {
   assertPrivateReleaseConfig,
   findReleaseUri,
+  installationCompletesOffer,
   releaseArgs,
   releaseProfile,
   writeReleaseStatus,
@@ -59,5 +60,26 @@ describe("private release URI", () => {
       package_name: "com.openalma.mentra",
       version: "0.1.0",
     })
+  })
+
+  test("completes only a fresh exact-device first install or version change", () => {
+    const offer = {
+      deviceSessionId: "test-phone",
+      packageName: "com.openalma.mentra",
+      version: "0.1.1",
+      previousVersion: "0.1.0",
+      startedAt: 100,
+    }
+    const status = {
+      installed_device: "test-phone",
+      installed_package: "com.openalma.mentra",
+      installed_version: "0.1.1",
+      installed_seen_at: 101,
+    }
+    expect(installationCompletesOffer(status, offer)).toBe(true)
+    expect(installationCompletesOffer({...status, installed_device: "other-phone"}, offer)).toBe(false)
+    expect(installationCompletesOffer({...status, installed_seen_at: 100}, offer)).toBe(false)
+    expect(installationCompletesOffer(status, {...offer, previousVersion: "0.1.1"})).toBe(false)
+    expect(installationCompletesOffer(status, {...offer, previousVersion: ""})).toBe(true)
   })
 })

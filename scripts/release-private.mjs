@@ -62,6 +62,14 @@ export function writeReleaseStatus(path, value) {
   }
 }
 
+export function installationCompletesOffer(status, offer) {
+  return status?.installed_device === offer.deviceSessionId &&
+    status?.installed_package === offer.packageName &&
+    status?.installed_version === offer.version &&
+    Number(status?.installed_seen_at) > offer.startedAt &&
+    offer.previousVersion !== offer.version
+}
+
 export function run() {
   loadEnvLocal(root)
   const host = new URL(process.env.MENTRA_PUBLIC_OPENALMA_BASE_URL).hostname
@@ -75,6 +83,8 @@ export function run() {
   let output = ""
   let emitted = false
   let shutdownRequested = false
+  let pollTimer = null
+  let polling = false
   const startedAt = Date.now() / 1000
 
   miniapp.stdout.on("data", (chunk) => {
@@ -94,12 +104,16 @@ export function run() {
       shutdown()
       return
     }
+    const deviceSessionId = process.env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID
+    const previousVersion = process.env.MENTRA_PUBLIC_OPENALMA_PREVIOUS_VERSION ?? ""
     const qrPath = join(root, "build", `openalma-${version}-wireguard-qr.png`)
     try {
       writeReleaseStatus(statusPath, {
         release_uri: uri,
         package_name: packageName,
         version,
+        device_session_id: deviceSessionId,
+        previous_version: previousVersion || null,
         pid: process.pid,
         started_at: startedAt,
       })
@@ -108,6 +122,34 @@ export function run() {
       shutdown()
       return
     }
+    const poll = async () => {
+      if (polling || shutdownRequested) return
+      polling = true
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 2000)
+      try {
+        const query = new URLSearchParams({device_session_id: deviceSessionId})
+        const response = await fetch(
+          `${process.env.MENTRA_PUBLIC_OPENALMA_BASE_URL.replace(/\/+$/, "")}/integration/mentra/status?${query}`,
+          {signal: controller.signal, headers: {Authorization: `Bearer ${process.env.MENTRA_PUBLIC_OPENALMA_BEARER}`}},
+        )
+        if (!response.ok) return
+        const status = await response.json()
+        if (installationCompletesOffer(status, {
+          deviceSessionId, packageName, version, previousVersion, startedAt,
+        })) {
+          console.log(`Iris ${version} reported installed on ${deviceSessionId}; stopping installer`)
+          shutdown()
+        }
+      } catch {
+        // Transient status failures must not interrupt a manual installation.
+      } finally {
+        clearTimeout(timeout)
+        polling = false
+      }
+    }
+    pollTimer = setInterval(() => void poll(), 2000)
+    void poll()
     void QRCode.toFile(qrPath, uri, {width: 1024, margin: 4, errorCorrectionLevel: "M"})
       .then(() => console.log(`\nPrivate WireGuard release:\n${uri}\nQR image: ${qrPath}\n`))
       .catch((error) => console.error(`Could not write private release QR: ${error.message}`))
@@ -121,6 +163,7 @@ export function run() {
   }
 
   function cleanup() {
+    if (pollTimer) clearInterval(pollTimer)
     try {
       unlinkSync(statusPath)
     } catch (error) {

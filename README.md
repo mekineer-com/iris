@@ -10,7 +10,7 @@ miniapps/openalma/
 
 in `mentra-os/.git/info/exclude`.
 
-MentraOS `package.json` lists `miniapps/*` as workspaces. Keep OpenAlma out of that glob with a local parent line `!miniapps/openalma` (do not push that MentraOS edit upstream). Otherwise `bun install` here rewrites MentraOS `bun.lock` and links the in-tree SDK instead of npm `0.3.0-dev.1`.
+The OpenAlma Mentra fork already commits `!miniapps/openalma` in its workspace list. An unmodified upstream MentraOS checkout may need that exclusion locally; do not send it upstream. Otherwise `bun install` here rewrites MentraOS `bun.lock` and links the in-tree SDK instead of the MiniApp's pinned npm dependency.
 
 The MiniApp connects OpenAlma's authenticated Mentra bootstrap to Gemini Live native audio and sitting-scoped durable transcripts. Continuous mode uses provider VAD. Manual mode records one memory-only take, then waits for `Send` or `Redo`; `Done` never sends by itself. Persistent Iris-local switches independently mute microphone capture or disable camera actions without ending the sitting. Temporary transcript-sync failure remains visible and retries without ending voice; a provider turn missing usable transcript text records a non-conversational gap marker before failing loud. Graceful Stop may play and persist one short first-person reflection after two completed user turns.
 
