@@ -393,7 +393,8 @@ export class GeminiLiveController {
     try {
       this.sendImageTurn(activeSocket, image.mimeType, image.data)
     } catch {
-      throw new Error("Gemini image send failed")
+      if (this.activityPauseReason) await this.requestPhotoRetry(pending)
+      throw new Error(this.activityPauseReason || "Gemini image send failed")
     }
     pending.providerSent = true
     if (pending.imageSequence === undefined) {
@@ -478,7 +479,11 @@ export class GeminiLiveController {
         this.reportError(new Error("OpenAlma snapshot replay returned invalid image data"))
         return
       }
-      if (this.activityPauseReason || this.pendingImage !== pending || pending.providerSent || this.stopping) return
+      if (this.pendingImage !== pending || pending.providerSent || this.stopping) return
+      if (this.activityPauseReason) {
+        await this.requestPhotoRetry(pending)
+        return
+      }
       if (this.socket !== socket || socket.readyState !== WS_OPEN) {
         retryOnReplacement = true
         return

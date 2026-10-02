@@ -724,6 +724,35 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("pause during photo upload or replay retains explicit Retry and Discard", async () => {
+    const storage = new FakeStorage()
+    let finishUpload!: () => void
+    const uploadGate = new Promise<void>(resolve => { finishUpload = resolve })
+    const h = harness({storage, snapshotGate: uploadGate})
+    await start(h)
+    const sending = h.controller.sendImage({imageId: "paused-photo", mimeType: "image/png", data: "AQID"})
+    await waitFor(() => h.requests.some(request => request.url.endsWith('/snapshot')))
+    h.controller.activityPauseReason = "Paused. Retry in OpenAlma launcher."
+    finishUpload()
+    await expect(sending).rejects.toThrow("Retry in OpenAlma launcher")
+    expect(h.photoRetryChanges.at(-1)).toBe(true)
+    await h.controller.stop()
+    let finishReplay!: () => void
+    const replayGate = new Promise<void>(resolve => { finishReplay = resolve })
+    const recovered = harness({storage, replayGates: [replayGate]})
+    await start(recovered)
+    const retrying = recovered.controller.retryImage()
+    await waitFor(() => recovered.requests.some(request => request.url.endsWith('/snapshot/replay')))
+    recovered.controller.activityPauseReason = "Paused. Retry in OpenAlma launcher."
+    finishReplay()
+    await retrying
+    expect(recovered.photoRetryChanges.at(-1)).toBe(true)
+    recovered.controller.activityPauseReason = null
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(recovered.requests.filter(request => request.url.endsWith('/snapshot/replay'))).toHaveLength(1)
+    await recovered.controller.stop()
+  })
+
   test("does not treat later speech as the image turn while finalization retries", async () => {
     const h = harness({storage: new FakeStorage(), finalizeStatuses: Array(10).fill(503)})
     await start(h)
