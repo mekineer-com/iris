@@ -43,6 +43,13 @@ The MiniApp ZIP is generic and contains no endpoint, credential, user, soul, or
 phone identity. `.env.local` is used only by the private release wrapper for its
 WireGuard bind and installation-completion poll; it is never compiled into Iris.
 
+A failed Memorize or consolidation pauses new activity for that Soul. Start
+reports launcher recovery; an active sitting learns the pause on its existing
+heartbeat, stops new audio/photo sends and preserves manual takes. Already-paid
+output can finish, and transcript saving, token renewal and Stop remain usable.
+Stop skips a new reflection while paused. Retry belongs to the launcher; a later
+healthy heartbeat permits input again. No offline input queue is created.
+
 ```
 bun install
 bun test

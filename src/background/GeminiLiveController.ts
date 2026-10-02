@@ -154,6 +154,7 @@ export class GeminiLiveController {
   private ended = true
   private reconnectAttempted = false
   private backgroundImageErrorVisible = false
+  activityPauseReason: string | null = null
   private reconnecting = false
   private errorReported = false
   private inputTranscript = ""
@@ -198,6 +199,7 @@ export class GeminiLiveController {
     trace("provider.start.begin")
     const generation = ++this.generation
     this.stopping = false
+    this.activityPauseReason = null
     this.ready = false
     this.ended = true
     this.resumptionHandle = ""
@@ -280,6 +282,7 @@ export class GeminiLiveController {
   }
 
   sendAudio(base64Pcm: string): void {
+    if (this.activityPauseReason) return
     if (!this.ready && !this.stopping) {
       // ponytail: drop audio during the single reconnect; add a bounded queue only if field tests show speech loss.
       return
@@ -289,6 +292,7 @@ export class GeminiLiveController {
   }
 
   sendActivity(audioChunks: readonly string[]): void {
+    if (this.activityPauseReason) throw new Error(this.activityPauseReason)
     const socket = this.socket
     if (this.mode !== "manual") throw new Error("Manual activity requires Manual mode")
     if (audioChunks.length === 0) throw new Error("Manual recording is empty")
@@ -323,6 +327,7 @@ export class GeminiLiveController {
   }
 
   async sendImage(image: ImageRequest): Promise<void> {
+    if (this.activityPauseReason) throw new Error(this.activityPauseReason)
     if (!this.storage) throw new Error("Local image journal unavailable")
     const socket = this.socket
     if (!this.ready || this.stopping || !socket || socket.readyState !== WS_OPEN) {
@@ -424,6 +429,7 @@ export class GeminiLiveController {
   }
 
   private sendImageTurn(socket: SocketLike, mimeType: "image/jpeg" | "image/png", data: string): void {
+    if (this.activityPauseReason) throw new Error(this.activityPauseReason)
     socket.send(JSON.stringify({
       clientContent: {
         turns: [{
@@ -439,7 +445,7 @@ export class GeminiLiveController {
     const pending = this.pendingImage
     const socket = this.socket
     if (
-      !pending || (pending.retryRequested && !userRequested) || pending.caption || pending.providerSent || this.imageRetrying || this.stopping ||
+      this.activityPauseReason || !pending || (pending.retryRequested && !userRequested) || pending.caption || pending.providerSent || this.imageRetrying || this.stopping ||
       !this.ready || !socket || socket.readyState !== WS_OPEN
     ) return
     this.imageRetrying = true
@@ -472,7 +478,7 @@ export class GeminiLiveController {
         this.reportError(new Error("OpenAlma snapshot replay returned invalid image data"))
         return
       }
-      if (this.pendingImage !== pending || pending.providerSent || this.stopping) return
+      if (this.activityPauseReason || this.pendingImage !== pending || pending.providerSent || this.stopping) return
       if (this.socket !== socket || socket.readyState !== WS_OPEN) {
         retryOnReplacement = true
         return
@@ -528,7 +534,7 @@ export class GeminiLiveController {
         }
         this.interruptionFinalized = false
       }
-      if (graceful && !stoppedMidTurn && this.ready && this.completeUserTurns >= 2) {
+      if (graceful && !this.activityPauseReason && !stoppedMidTurn && this.ready && this.completeUserTurns >= 2) {
         trace("provider.reflection.begin")
         const reflection = await this.requestReflection()
         trace("provider.reflection.end", {persisted: Boolean(reflection && reflection !== "NO_SUMMARY")})
@@ -587,6 +593,7 @@ export class GeminiLiveController {
       ) {
         continue
       }
+      if (errorBody?.detail?.code === "soul_paused") throw new Error(errorBody.detail.message)
       throw new Error(`OpenAlma Start failed (${response.status})`)
     }
     const body = (await response.json()) as Partial<StartResponse>
@@ -1010,6 +1017,15 @@ export class GeminiLiveController {
       trace("recall.network_failure", {id, elapsedMs: Date.now() - startedAt})
       this.completeRecall(id, pending, "Memory recall is temporarily unavailable.", true)
       return
+    }
+    if (response.status === 409) {
+      const body = await response.clone().json().catch(() => null)
+      if (body?.detail?.code === "soul_paused") {
+        this.activityPauseReason = body.detail.message
+        this.callbacks.onPersistenceError(this.activityPauseReason)
+        this.completeRecall(id, pending, "Memory recall is paused; recovery is in OpenAlma launcher.", false)
+        return
+      }
     }
     if ([400, 401, 403, 404, 409, 422, 503].includes(response.status)) {
       trace("recall.fatal", {id, status: response.status, elapsedMs: Date.now() - startedAt})
@@ -1575,10 +1591,15 @@ export class GeminiLiveController {
       } else {
         this.lastHeartbeatSuccessAt = Date.now()
         const body = await response.json().catch(() => null)
-        if (typeof body?.background_error === "string" && body.background_error) {
+        const previousPause = this.activityPauseReason
+        this.activityPauseReason = typeof body?.pause_reason === "string" && body.pause_reason
+          ? `${this.config.soulId} is paused. Retry in OpenAlma launcher.` : null
+        if (this.activityPauseReason) {
+          this.callbacks.onPersistenceError(this.activityPauseReason)
+        } else if (typeof body?.background_error === "string" && body.background_error) {
           this.backgroundImageErrorVisible = true
           this.callbacks.onPersistenceError(body.background_error)
-        } else if (this.backgroundImageErrorVisible) {
+        } else if (this.backgroundImageErrorVisible || previousPause) {
           this.backgroundImageErrorVisible = false
           this.callbacks.onPersistenceError(null)
         }

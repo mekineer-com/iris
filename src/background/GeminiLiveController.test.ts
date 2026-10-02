@@ -1140,6 +1140,22 @@ describe("GeminiLiveController", () => {
     }
   })
 
+  test("a paused recall leaves the admitted response alive and Stop skips new reflection", async () => {
+    const h = harness({recallStatus: 409, recallBody: {detail: {
+      code: "soul_paused", message: "Test Soul is paused. Retry in OpenAlma launcher.",
+    }}})
+    await start(h)
+    completeTurn(h)
+    completeTurn(h)
+    h.sockets[0].message({toolCall: {functionCalls: [{id: 'paused-recall', name: 'recall_memory', args: {query: 'Test'}}]}})
+    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
+    expect(h.errors).toEqual([])
+    expect(h.sockets[0].readyState).toBe(1)
+    await h.controller.stop(true)
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
+    expect(h.requests.some(request => request.url.endsWith('/end'))).toBe(true)
+  })
+
   test("recall scope, internal, and config failures are fatal without exposing the query", async () => {
     for (const status of [404, 503]) {
       const h = harness({recallStatus: status, recallBody: {detail: "private scope detail"}})
@@ -2190,6 +2206,35 @@ describe("GeminiLiveController", () => {
     delete heartbeatBody.background_error
     await waitFor(() => h.persistenceErrors.slice(seen).includes(null))
     await h.controller.stop()
+  })
+
+  test("pause blocks new input without cutting output and heartbeat recovery unblocks it", async () => {
+    const heartbeatBody = {ok: true, pause_reason: "Failed Memorize" as string | null}
+    const h = harness({heartbeatMs: 5, heartbeatBody})
+    await start(h, "manual")
+    await waitFor(() => Boolean(h.controller.activityPauseReason))
+    const socket = h.sockets[0]
+    const sent = socket.sent.length
+    h.controller.sendAudio("AQID")
+    expect(socket.sent.length).toBe(sent)
+    expect(() => h.controller.sendActivity(["AQID"])).toThrow("Retry in OpenAlma launcher")
+    socket.message({serverContent: {modelTurn: {parts: [{inlineData: {mimeType: "audio/pcm;rate=24000", data: "AQEBAQ=="}}]}}})
+    await waitFor(() => h.audio.includes("AQEBAQ=="))
+    expect(socket.readyState).toBe(1)
+    expect(h.errors).toEqual([])
+    heartbeatBody.pause_reason = null
+    await waitFor(() => h.controller.activityPauseReason === null)
+    h.controller.sendActivity(["AQID"])
+    expect(socket.sent.length).toBeGreaterThan(sent)
+    await h.controller.stop()
+  })
+
+  test("paused Start reports launcher recovery instead of a generic HTTP failure", async () => {
+    const h = harness({startStatus: 409, startBody: {detail: {
+      code: "soul_paused", message: "Test Soul is paused. Retry in OpenAlma launcher.",
+    }}})
+    await expect(h.controller.start()).rejects.toThrow("Retry in OpenAlma launcher")
+    expect(h.sockets).toHaveLength(0)
   })
 
   test("publishes latest valid usage at turn boundaries and ignores malformed metadata", async () => {
