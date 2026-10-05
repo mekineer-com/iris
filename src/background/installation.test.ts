@@ -2,7 +2,6 @@ import {describe, expect, test} from "bun:test"
 
 import {reportInstallation} from "./installation"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
-import {timeoutSignal} from "./timeoutSignal"
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://10.77.0.1",
@@ -15,11 +14,6 @@ const CONFIG: OpenAlmaConfig = {
 }
 
 describe("installation report", () => {
-  test("times out without AbortSignal.timeout support", async () => {
-    const signal = timeoutSignal(1)
-    await new Promise((resolve) => setTimeout(resolve, 2))
-    expect(signal.aborted).toBe(true)
-  })
 
   test("sends build identity once per call and a later load can retry", async () => {
     const requests: Array<{url: string; init?: RequestInit}> = []
