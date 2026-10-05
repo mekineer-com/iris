@@ -440,6 +440,7 @@ describe("SessionController", () => {
     expect(await rejected).toContain("Select or create")
     expect(h.configs).toEqual([])
     expect(lastSnapshot(h.session)?.soulId).toBe("Missing Soul")
+    expect(lastSnapshot(h.session)).toMatchObject({souls: [CONFIG.soulId], soulConfirmed: false})
   })
 
   test("immediate Start uses the saved soul and Stop cancels a delayed lookup", async () => {
@@ -560,23 +561,6 @@ describe("SessionController", () => {
     await h.session.handlers["openalma:stop"]({})
     await h.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true})
     expect(lastSnapshot(h.session)).toMatchObject({soulId: "Other Soul", soulLocked: false})
-  })
-
-  test("keeps an unavailable saved soul visible but requires an explicit new selection", async () => {
-    const harness = setup({
-      stored: {"openalma.soul-id": "Unavailable Soul"},
-      fetchFn: (async () => new Response(JSON.stringify({souls: ["Available Soul"]}))) as typeof fetch,
-    })
-
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(lastSnapshot(harness.session)).toMatchObject({
-      soulId: "Unavailable Soul",
-      souls: ["Available Soul"],
-      soulConfirmed: false,
-    })
-    await expect(harness.session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow(
-      "Select or create this soul",
-    )
   })
 
   test("failed discovery does not confirm a saved soul", async () => {

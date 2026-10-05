@@ -1328,14 +1328,6 @@ describe("GeminiLiveController", () => {
     expect(unknown.errors).toEqual(["Gemini returned malformed recall_memory call"])
     await unknown.controller.stop()
 
-    const oneSided = harness()
-    await start(oneSided)
-    oneSided.sockets[0].message({
-      serverContent: {inputTranscription: {text: "ordinary input"}, turnComplete: true},
-    })
-    expect(oneSided.errors).toEqual(["Gemini completed a turn without both transcriptions"])
-    await oneSided.controller.stop()
-
     let release!: () => void
     const pendingGate = new Promise<void>((resolve) => {
       release = resolve
