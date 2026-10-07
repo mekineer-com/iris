@@ -366,7 +366,7 @@ describe("SessionController", () => {
     expect(lastSnapshot(deleteFailure)?.configured).toBe(true)
   })
 
-  test("confirms and creates a missing owner before the first soul", async () => {
+  test("leaves missing owner setup to the launcher", async () => {
     const session = new FakeSession()
     const requests: Array<{url: string; method: string; body: unknown}> = []
     const controller = new SessionController(session as never, {
@@ -384,15 +384,29 @@ describe("SessionController", () => {
     controller.start()
     await new Promise((resolve) => setTimeout(resolve, 0))
 
-    await expect(session.handlers["openalma:set-profile"](CONFIG)).rejects.toThrow("Confirm new owner")
-    await session.handlers["openalma:set-profile"]({...CONFIG, confirmIdentity: true})
+    await expect(session.handlers["openalma:set-profile"](CONFIG)).rejects.toThrow("owner in the launcher")
+    expect(requests.map(({method}) => method)).toEqual(["GET"])
+    expect(session.stored.has("openalma.connection-profile")).toBe(false)
+  })
 
-    expect(requests.filter((request) => request.method === "POST").map((request) => request.url)).toEqual([
-      `${CONFIG.baseUrl}/integration/mentra/owner`,
-      `${CONFIG.baseUrl}/integration/mentra/souls`,
-    ])
-    expect(JSON.parse(session.stored.get("openalma.connection-profile") ?? "").userId).toBe(CONFIG.userId)
-    expect(session.stored.has("openalma.connection-profile-cleared")).toBe(false)
+  test("seeds download defaults once without choosing a Soul or overwriting settings", async () => {
+    const session = new FakeSession()
+    const installationDefaults = {baseUrl: CONFIG.baseUrl, userId: CONFIG.userId, deviceSessionId: CONFIG.deviceSessionId}
+    const requests: string[] = []
+    const fetchFn = (async (url, init) => {
+      requests.push(init?.method ?? "GET")
+      return Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: []})
+    }) as typeof fetch
+    new SessionController(session as never, {installationDefaults, fetchFn}).start()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(lastSnapshot(session)).toMatchObject({configured: true, soulId: "", soulConfirmed: false})
+    expect(requests.every((method) => method === "GET")).toBe(true)
+    const saved = JSON.parse(session.stored.get("openalma.connection-profile") ?? "")
+    expect(saved).toMatchObject(installationDefaults)
+    session.stored.set("openalma.connection-profile", JSON.stringify({...saved, baseUrl: "http://changed.example"}))
+    new SessionController(session as never, {installationDefaults, fetchFn}).start()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(JSON.parse(session.stored.get("openalma.connection-profile") ?? "").baseUrl).toBe("http://changed.example")
   })
 
   test("rejects a profile user that differs from the discovered owner", async () => {

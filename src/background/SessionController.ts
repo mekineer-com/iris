@@ -7,7 +7,6 @@ import type {
   EarconName,
   ManualAction,
   ManualPhase,
-  OpenAlmaProfile,
   SessionMode,
   SessionSnapshot,
 } from "../shared/types"
@@ -38,6 +37,7 @@ export type SessionControllerOptions = {
   earconTimeoutMs?: number
   responseWatchdogMs?: number
   config?: OpenAlmaConfig
+  installationDefaults?: unknown
   fetchFn?: typeof fetch
   createLiveController?: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
 }
@@ -100,6 +100,7 @@ export class SessionController {
   private readonly earconTimeoutMs: number
   private readonly responseWatchdogMs: number
   private config?: OpenAlmaConfig
+  private readonly installationDefaults?: unknown
   private host?: InstallationHost
   private readonly fetchFn: typeof fetch
   private readonly createLiveController: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
@@ -109,6 +110,7 @@ export class SessionController {
     private readonly session: MiniappSession,
     options: SessionControllerOptions = {},
   ) {
+    this.installationDefaults = options.installationDefaults
     this.watchdogMs = options.watchdogMs ?? 3000
     // ponytail: one bound covers tiny local cues; split only if remote/long clips are introduced.
     this.earconTimeoutMs = options.earconTimeoutMs ?? 2000
@@ -144,11 +146,7 @@ export class SessionController {
         if (ACTIVE.has(this.connection) || this.connection === "stopping") {
           throw new Error("Stop Iris before changing its connection")
         }
-        const submitted = payload as OpenAlmaProfile & {confirmIdentity?: unknown}
-        const identity = await this.resolveProfileIdentity(
-          parseOpenAlmaProfile(submitted),
-          submitted.confirmIdentity === true,
-        )
+        const identity = await this.resolveProfileIdentity(parseOpenAlmaProfile(payload))
         const config = identity.config
         await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(config))
         await this.session.storage.delete(OPENALMA_PROFILE_CLEARED_KEY)
@@ -848,7 +846,7 @@ export class SessionController {
   ): Promise<void> {
     let storedSoul: string | null = null
     try {
-      const [storedProfile, microphone, camera, savedSoul, journal, host] = await Promise.all([
+      let [storedProfile, microphone, camera, savedSoul, journal, host] = await Promise.all([
         this.session.storage.get(OPENALMA_PROFILE_KEY),
         this.session.storage.get(MICROPHONE_ENABLED_KEY),
         this.session.storage.get(CAMERA_ENABLED_KEY),
@@ -857,13 +855,18 @@ export class SessionController {
         this.session.storage.get(OPENALMA_HOST_KEY),
       ])
       this.host = installationHost(host)
+      if (!this.config && storedProfile === null && this.installationDefaults !== undefined) {
+        const defaults = parseOpenAlmaProfile(this.installationDefaults)
+        storedProfile = serializeOpenAlmaProfile(defaults)
+        await this.session.storage.set(OPENALMA_PROFILE_KEY, storedProfile)
+      }
       if (!this.config && storedProfile === null) {
         this.soulLoading = false
         this.pushSnapshot()
         return
       }
       if (!this.config) this.config = parseOpenAlmaProfile(storedProfile)
-      const identity = resolvedIdentity ?? await this.resolveProfileIdentity(this.currentConfig(), false)
+      const identity = resolvedIdentity ?? await this.resolveProfileIdentity(this.currentConfig())
       const config = identity.config
       this.config = config
       storedSoul = savedSoul
@@ -898,7 +901,6 @@ export class SessionController {
 
   private async resolveProfileIdentity(
     config: OpenAlmaConfig,
-    confirmed: boolean,
   ): Promise<{config: OpenAlmaConfig; souls: string[]}> {
     const headers = {Authorization: `Bearer ${config.bearer}`}
     const ownerResponse = await this.fetchFn(`${config.baseUrl}/integration/mentra/owner`, {
@@ -911,6 +913,11 @@ export class SessionController {
       throw new Error("Owner discovery returned an invalid response")
     }
 
+    const userId = ownerResult.user_id?.trim() ?? ""
+    if (!userId) throw new Error("Set up the OpenAlma owner in the launcher")
+    if (userId !== config.userId) {
+      throw new OwnerMismatchError(`Connection user does not match OpenAlma owner "${userId}"`)
+    }
     const soulsResponse = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
       headers,
       signal: timeoutSignal(10_000),
@@ -921,42 +928,7 @@ export class SessionController {
       throw new Error("Soul discovery returned an invalid response")
     }
 
-    let userId = ownerResult.user_id?.trim() ?? ""
-    if (userId && userId !== config.userId) {
-      throw new OwnerMismatchError(`Connection user does not match OpenAlma owner "${userId}"`)
-    }
-    if ((!userId || soulsResult.souls.length === 0) && !confirmed) {
-      throw new Error("Confirm new owner and Soul spellings before setup")
-    }
-    const jsonHeaders = {...headers, "Content-Type": "application/json"}
-    if (!userId) {
-      const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/owner`, {
-        method: "POST",
-        headers: jsonHeaders,
-        signal: timeoutSignal(10_000),
-        body: JSON.stringify({user_id: config.userId}),
-      })
-      if (!response.ok) throw new Error(`Owner setup failed (${response.status})`)
-      const result = await response.json() as Partial<{user_id: unknown}>
-      if (typeof result.user_id !== "string" || !result.user_id.trim()) {
-        throw new Error("Owner setup returned an invalid response")
-      }
-      userId = result.user_id
-    }
-    let souls = soulsResult.souls
-    if (souls.length === 0) {
-      const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
-        method: "POST",
-        headers: jsonHeaders,
-        signal: timeoutSignal(10_000),
-        body: JSON.stringify({soul_id: config.soulId, use_existing: false}),
-      })
-      if (!response.ok) throw new Error(`Soul setup failed (${response.status})`)
-      const result = await response.json() as Partial<{soul_id: unknown}>
-      if (result.soul_id !== config.soulId) throw new Error("Soul setup returned an invalid response")
-      souls = [config.soulId]
-    }
-    return {config: {...config, userId}, souls}
+    return {config: {...config, userId}, souls: soulsResult.souls}
   }
 
   private soulLocked(): boolean {

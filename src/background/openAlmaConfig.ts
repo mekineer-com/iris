@@ -29,9 +29,9 @@ export function parseOpenAlmaProfile(value: unknown): OpenAlmaConfig {
   }
   return {
     baseUrl,
-    bearer: required("bearer", raw.bearer),
+    bearer: typeof raw.bearer === "string" ? raw.bearer.trim() : "",
     userId: required("userId", raw.userId),
-    soulId: required("soulId", raw.soulId),
+    soulId: typeof raw.soulId === "string" ? raw.soulId.trim() : "",
     deviceSessionId,
     packageName: manifest.packageName,
     version: manifest.version,

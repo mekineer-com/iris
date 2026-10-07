@@ -1,18 +1,3 @@
-diff --git a/node_modules/@mentra/miniapp-cli/.bun-tag-1eab5b070248ec2b b/.bun-tag-1eab5b070248ec2b
-new file mode 100644
-index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
-diff --git a/node_modules/@mentra/miniapp-cli/.bun-tag-46fbbe8e1560f23 b/.bun-tag-46fbbe8e1560f23
-new file mode 100644
-index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
-diff --git a/node_modules/@mentra/miniapp-cli/.bun-tag-6a52822d3278fd37 b/.bun-tag-6a52822d3278fd37
-new file mode 100644
-index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
-diff --git a/node_modules/@mentra/miniapp-cli/.bun-tag-b399be2a7ee7508c b/.bun-tag-b399be2a7ee7508c
-new file mode 100644
-index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
-diff --git a/node_modules/@mentra/miniapp-cli/.bun-tag-b89e18c91e338b63 b/.bun-tag-b89e18c91e338b63
-new file mode 100644
-index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/src/index.ts b/src/index.ts
 index eebd1556474dd1f9bea9dc29612e8f87453fd4aa..6dd22dfd76c7c7efcd5864473f719b3fea91faef 100755
 --- a/src/index.ts
@@ -50,38 +35,7 @@ index eebd1556474dd1f9bea9dc29612e8f87453fd4aa..6dd22dfd76c7c7efcd5864473f719b3f
      break;
    case 'pack':
      // Build with NODE_ENV=production before zipping, so `pack` never ships
-diff --git a/node_modules/@mentra/miniapp-cli/src/release.test.ts b/src/release.test.ts
-new file mode 100644
-index 0000000000000000000000000000000000000000..4b203a43c5e38767c45e941654484b5d73c3b3b1
---- /dev/null
-+++ b/src/release.test.ts
-@@ -0,0 +1,24 @@
-+import {expect, test} from 'bun:test'
-+import {mkdtempSync, rmSync, writeFileSync} from 'fs'
-+import {tmpdir} from 'os'
-+import {join} from 'path'
-+import JSZip from 'jszip'
-+
-+import {readReleaseBundle} from './release'
-+
-+test('reads identity and icon from a prebuilt release', async () => {
-+  const dir = mkdtempSync(join(tmpdir(), 'mentra-release-'))
-+  try {
-+    const path = join(dir, 'bundle.zip')
-+    const zip = new JSZip()
-+    zip.file('miniapp.json', JSON.stringify({packageName: 'com.example.app', version: '1.2.3'}))
-+    zip.file('icon.png', new Uint8Array([1, 2, 3]))
-+    writeFileSync(path, await zip.generateAsync({type: 'uint8array'}))
-+
-+    const bundle = await readReleaseBundle(path)
-+    expect(JSON.parse(bundle.manifestBuffer.toString())).toEqual({packageName: 'com.example.app', version: '1.2.3'})
-+    expect(bundle.iconBuffer).toEqual(Buffer.from([1, 2, 3]))
-+  } finally {
-+    rmSync(dir, {recursive: true, force: true})
-+  }
-+})
 diff --git a/src/release.ts b/src/release.ts
-index 619e3408d5d31505188e14578bd96e981a4e9bc3..67f53329befe1f20e4e67045277af57020b87fbe 100644
 --- a/src/release.ts
 +++ b/src/release.ts
 @@ -23,8 +23,10 @@
@@ -95,11 +49,11 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..67f53329befe1f20e4e67045277af570
  import {buildProduction} from './build.js'
  import {pack} from './pack.js'
  import {printQR} from './qr.js'
-@@ -36,23 +38,52 @@ const HEALTH_PATH = '/__mentra_release/health'
+@@ -36,23 +38,62 @@
  const MANIFEST_PATH = '/miniapp.json'
  const ICON_PATH = '/icon.png'
  const BUNDLE_PATH = '/bundle.zip'
-+const PROFILE_PATH = '/openalma-profile.json'
++const OFFER_PATH = '/openalma-offer.json'
 +const COMPLETE_PATH = '/__mentra_release/installed'
 
  interface ReleaseOptions {
@@ -122,6 +76,16 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..67f53329befe1f20e4e67045277af570
 +    manifestBuffer,
 +    iconBuffer: iconFile ? Buffer.from(await iconFile.async('uint8array')) : null,
 +  }
++}
++
++export async function seedReleaseBundle(zipBuffer: Buffer, defaults: unknown): Promise<Buffer> {
++  const zip = await JSZip.loadAsync(zipBuffer)
++  const manifest = JSON.parse(await zip.file('miniapp.json')!.async('string'))
++  const background = typeof manifest.entry?.background === 'string' ? zip.file(manifest.entry.background) : null
++  if (!background) throw new Error('Release bundle is missing its background entry')
++  zip.file(manifest.entry.background,
++    `globalThis.__OPENALMA_INSTALL_DEFAULTS__ = ${JSON.stringify(defaults)};\n${await background.async('string')}`)
++  return zip.generateAsync({type: 'nodebuffer'})
  }
 
  export async function release(opts: ReleaseOptions = {}): Promise<void> {
@@ -150,7 +114,7 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..67f53329befe1f20e4e67045277af570
    } catch {
      console.error('Error: miniapp.json is not valid JSON')
      process.exit(1)
-@@ -69,43 +100,65 @@ export async function release(opts: ReleaseOptions = {}): Promise<void> {
+@@ -69,43 +110,67 @@
    const name = (manifest.name as string) ?? packageName
 
    // ---- 2. Build (or skip via cache) -----------------------------------
@@ -192,13 +156,15 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..67f53329befe1f20e4e67045277af570
 -  // ---- 3. Find a free port and load the bundle into memory ------------
 -  const zipBuffer = readFileSync(cachedZipPath)
 +  // ---- 3. Select the listener and load the bundle into memory ----------
-+  const zipBuffer = suppliedBundle?.zipBuffer ?? readFileSync(cachedZipPath)
++  let zipBuffer = suppliedBundle?.zipBuffer ?? readFileSync(cachedZipPath)
    const iconPath = resolve(cwd, 'icon.png')
 -  const iconBuffer = existsSync(iconPath) ? readFileSync(iconPath) : null
 -  const manifestBuffer = readFileSync(manifestPath)
 +  const iconBuffer = suppliedBundle ? suppliedBundle.iconBuffer : (existsSync(iconPath) ? readFileSync(iconPath) : null)
 +  const manifestBuffer = suppliedBundle?.manifestBuffer ?? readFileSync(manifestPath)
-+  const setupProfile = process.env.MENTRA_RELEASE_PROFILE ? JSON.parse(process.env.MENTRA_RELEASE_PROFILE) : null
++  const defaults = process.env.MENTRA_RELEASE_DEFAULTS ? JSON.parse(process.env.MENTRA_RELEASE_DEFAULTS) : null
++  if (defaults) zipBuffer = await seedReleaseBundle(zipBuffer, defaults)
++  const automatic = process.env.MENTRA_RELEASE_HOST_PACKAGE === 'com.mentra.mentra.openalma'
 +  const offerId = randomUUID()
 
 -  const port = await pickPort(DEFAULT_PORT_START, PORT_SCAN_LIMIT)
@@ -240,17 +206,18 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..67f53329befe1f20e4e67045277af570
      port,
      fetch(req) {
        const url = new URL(req.url)
-@@ -119,6 +172,19 @@ export async function release(opts: ReleaseOptions = {}): Promise<void> {
+@@ -119,6 +184,20 @@
            headers: {'content-type': 'application/json'},
          })
        }
-+      if (url.pathname === PROFILE_PATH) {
-+        if (!setupProfile) return new Response('Not found', {status: 404})
-+        return new Response(JSON.stringify({offerId, profile: setupProfile}), {
++      if (url.pathname === OFFER_PATH) {
++        if (!automatic || !defaults) return new Response('Not found', {status: 404})
++        return new Response(JSON.stringify({offerId, deviceSessionId: defaults.deviceSessionId}), {
 +          headers: {'content-type': 'application/json', 'cache-control': 'no-store'},
 +        })
 +      }
 +      if (url.pathname === COMPLETE_PATH && req.method === 'POST') {
++        if (!automatic) return new Response('Not found', {status: 404})
 +        return req.json().then((body: any) => {
 +          if (body?.offerId !== offerId) return new Response('Wrong offer', {status: 409})
 +          setTimeout(stop, 0)
@@ -260,7 +227,7 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..67f53329befe1f20e4e67045277af570
        if (url.pathname === ICON_PATH) {
          if (!iconBuffer) return new Response('Not found', {status: 404})
          return new Response(iconBuffer, {
-@@ -161,13 +227,11 @@ export async function release(opts: ReleaseOptions = {}): Promise<void> {
+@@ -161,13 +240,11 @@
    console.log(`Serving on ${baseUrl}`)
 
    // ---- 6. Wait for SIGINT ---------------------------------------------
@@ -278,3 +245,100 @@ index 619e3408d5d31505188e14578bd96e981a4e9bc3..67f53329befe1f20e4e67045277af570
  }
 
  // ---------------------------------------------------------------------------
+diff --git a/src/release.test.ts b/src/release.test.ts
+new file mode 100644
+--- /dev/null
++++ b/src/release.test.ts
+@@ -0,0 +1,92 @@
++import {expect, test} from 'bun:test'
++import {mkdtempSync, readFileSync, rmSync, writeFileSync} from 'fs'
++import {tmpdir} from 'os'
++import {join, resolve} from 'path'
++import JSZip from 'jszip'
++
++import {readReleaseBundle, seedReleaseBundle} from './release'
++
++test('reads identity and icon from a prebuilt release', async () => {
++  const dir = mkdtempSync(join(tmpdir(), 'mentra-release-'))
++  try {
++    const path = join(dir, 'bundle.zip')
++    const zip = new JSZip()
++    zip.file('miniapp.json', JSON.stringify({packageName: 'com.example.app', version: '1.2.3'}))
++    zip.file('icon.png', new Uint8Array([1, 2, 3]))
++    writeFileSync(path, await zip.generateAsync({type: 'uint8array'}))
++
++    const bundle = await readReleaseBundle(path)
++    expect(JSON.parse(bundle.manifestBuffer.toString())).toEqual({packageName: 'com.example.app', version: '1.2.3'})
++    expect(bundle.iconBuffer).toEqual(Buffer.from([1, 2, 3]))
++  } finally {
++    rmSync(dir, {recursive: true, force: true})
++  }
++})
++
++test('seeds the served background before its entrypoint without changing the base ZIP', async () => {
++  const zip = new JSZip()
++  zip.file('miniapp.json', JSON.stringify({entry: {background: 'dist/background.js'}}))
++  zip.file('dist/background.js', '(function(){globalThis.loadedDefaults = globalThis.__OPENALMA_INSTALL_DEFAULTS__})()')
++  zip.file('dist/ui.js', 'unchanged UI')
++  const original = await zip.generateAsync({type: 'nodebuffer'})
++  const defaults = {baseUrl: 'http://test.example', userId: 'Test "User"', deviceSessionId: 'stock-test'}
++  const served = await JSZip.loadAsync(await seedReleaseBundle(original, defaults))
++  const script = await served.file('dist/background.js')!.async('string')
++  const scope: Record<string, unknown> = {}
++  new Function('globalThis', script)(scope)
++  expect(scope.loadedDefaults).toEqual(defaults)
++  expect(await served.file('dist/ui.js')!.async('string')).toBe('unchanged UI')
++  expect(await (await JSZip.loadAsync(original)).file('dist/background.js')!.async('string')).not.toContain('__OPENALMA_INSTALL_DEFAULTS__ =')
++})
++
++test('serves defaults for either host but automatic offers and acknowledgements only for the fork', async () => {
++  const dir = mkdtempSync(join(tmpdir(), 'mentra-offer-'))
++  try {
++    const zip = new JSZip()
++    const manifest = JSON.parse(readFileSync(resolve('miniapp.json'), 'utf8'))
++    zip.file('miniapp.json', JSON.stringify(manifest))
++    zip.file(manifest.entry.background, '(function(){globalThis.loadedDefaults = globalThis.__OPENALMA_INSTALL_DEFAULTS__})()')
++    const path = join(dir, 'bundle.zip')
++    writeFileSync(path, await zip.generateAsync({type: 'nodebuffer'}))
++    for (const host of ['com.mentra.mentra', 'com.mentra.mentra.openalma']) {
++      const socket = Bun.serve({hostname: '127.0.0.1', port: 0, fetch: () => new Response()})
++      const port = socket.port!
++      socket.stop()
++      const defaults = {baseUrl: 'http://test.example', userId: 'Test User', deviceSessionId: 'stock-test'}
++      const child = Bun.spawn([process.execPath, resolve(import.meta.dir, 'index.ts'),
++        'release', '--host', '127.0.0.1', '--port', String(port), '--bundle', path], {
++        cwd: dir, stdout: 'pipe', stderr: 'inherit',
++        env: {...process.env, MENTRA_RELEASE_DEFAULTS: JSON.stringify(defaults), MENTRA_RELEASE_HOST_PACKAGE: host},
++      })
++      try {
++        const reader = child.stdout.getReader()
++        let output = ''
++        while (!output.includes('Serving on')) {
++          const chunk = await reader.read()
++          if (chunk.done) throw new Error(`Installer exited: ${output}`)
++          output += new TextDecoder().decode(chunk.value)
++        }
++        const base = `http://127.0.0.1:${port}`
++        const offerResponse = await fetch(`${base}/openalma-offer.json`)
++        const served = await JSZip.loadAsync(await (await fetch(`${base}/bundle.zip`)).arrayBuffer())
++        const scope: Record<string, unknown> = {}
++        new Function('globalThis', await served.file(manifest.entry.background)!.async('string'))(scope)
++        expect(scope.loadedDefaults).toEqual(defaults)
++        expect((await fetch(`${base}/__mentra_release/installed`, {method: 'POST', body: JSON.stringify({offerId: 'wrong'})})).status)
++          .toBe(host === 'com.mentra.mentra' ? 404 : 409)
++        if (host === 'com.mentra.mentra') expect(offerResponse.status).toBe(404)
++        else {
++          const offer = await offerResponse.json()
++          expect(Object.keys(offer).sort()).toEqual(['deviceSessionId', 'offerId'])
++          expect(offer.deviceSessionId).toBe(defaults.deviceSessionId)
++          expect((await fetch(`${base}/__mentra_release/installed`, {method: 'POST', body: JSON.stringify({offerId: offer.offerId})})).status).toBe(200)
++        }
++      } finally {
++        child.kill('SIGINT')
++        await child.exited
++      }
++    }
++  } finally {
++    rmSync(dir, {recursive: true, force: true})
++  }
++})

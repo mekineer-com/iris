@@ -32,8 +32,8 @@ describe("private release URI", () => {
       MENTRA_PUBLIC_OPENALMA_BASE_URL: "http://10.77.0.1",
       MENTRA_PUBLIC_OPENALMA_BEARER: "fictional",
       MENTRA_PUBLIC_OPENALMA_USER_ID: "Test User",
-      MENTRA_PUBLIC_OPENALMA_SOUL_ID: "Test Soul",
       MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID: "test-phone",
+      MENTRA_RELEASE_HOST_PACKAGE: "com.mentra.mentra",
     }
     const interfaces = {rdp: [{family: "IPv4", address: "10.77.0.1"}]}
 
@@ -44,11 +44,9 @@ describe("private release URI", () => {
     expect(() => assertPrivateReleaseConfig("10.77.0.1", {...env, MENTRA_PUBLIC_OPENALMA_BEARER: ""}, interfaces, ["rdp"])).toThrow(
       "MENTRA_PUBLIC_OPENALMA_BEARER",
     )
-    expect(JSON.parse(releaseProfile({...env, MENTRA_PUBLIC_OPENALMA_SOUL_ID: "Test%20Soul"}))).toEqual({
+    expect(JSON.parse(releaseProfile(env))).toEqual({
       baseUrl: "http://10.77.0.1",
-      bearer: "fictional",
       userId: "Test User",
-      soulId: "Test Soul",
       deviceSessionId: "test-phone",
     })
   })
@@ -62,12 +60,11 @@ describe("private release URI", () => {
     })
   })
 
-  test("completes only a fresh exact-device first install or version change", () => {
+  test("completes only a fresh exact stock installation report", () => {
     const offer = {
       deviceSessionId: "test-phone",
       packageName: "com.openalma.mentra",
       version: "0.1.1",
-      previousVersion: "0.1.0",
       startedAt: 100,
     }
     const status = {
@@ -79,7 +76,6 @@ describe("private release URI", () => {
     expect(installationCompletesOffer(status, offer)).toBe(true)
     expect(installationCompletesOffer({...status, installed_device: "other-phone"}, offer)).toBe(false)
     expect(installationCompletesOffer({...status, installed_seen_at: 100}, offer)).toBe(false)
-    expect(installationCompletesOffer(status, {...offer, previousVersion: "0.1.1"})).toBe(false)
-    expect(installationCompletesOffer(status, {...offer, previousVersion: ""})).toBe(true)
+    expect(installationCompletesOffer({...status, host: {host_package: "com.mentra.mentra.openalma"}}, offer)).toBe(false)
   })
 })

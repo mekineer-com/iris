@@ -21,8 +21,8 @@ const requiredBuildEnv = [
   "MENTRA_PUBLIC_OPENALMA_BASE_URL",
   "MENTRA_PUBLIC_OPENALMA_BEARER",
   "MENTRA_PUBLIC_OPENALMA_USER_ID",
-  "MENTRA_PUBLIC_OPENALMA_SOUL_ID",
   "MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID",
+  "MENTRA_RELEASE_HOST_PACKAGE",
 ]
 
 export function assertPrivateReleaseConfig(host, env, interfaces, wireguardNames) {
@@ -32,6 +32,9 @@ export function assertPrivateReleaseConfig(host, env, interfaces, wireguardNames
   if (!onWireGuard) throw new Error(`Iris base URL host ${host} is not a local WireGuard address`)
   const missing = requiredBuildEnv.filter((name) => !env[name]?.trim())
   if (missing.length) throw new Error(`Missing required build settings: ${missing.join(", ")}`)
+  if (!["com.mentra.mentra", "com.mentra.mentra.openalma"].includes(env.MENTRA_RELEASE_HOST_PACKAGE)) {
+    throw new Error("Unknown Mentra app installation")
+  }
 }
 
 export function releaseArgs(host, bundle = process.env.MENTRA_RELEASE_BUNDLE) {
@@ -41,9 +44,7 @@ export function releaseArgs(host, bundle = process.env.MENTRA_RELEASE_BUNDLE) {
 export function releaseProfile(env) {
   return JSON.stringify({
     baseUrl: env.MENTRA_PUBLIC_OPENALMA_BASE_URL.replace(/\/+$/, ""),
-    bearer: env.MENTRA_PUBLIC_OPENALMA_BEARER,
     userId: decodeURIComponent(env.MENTRA_PUBLIC_OPENALMA_USER_ID),
-    soulId: decodeURIComponent(env.MENTRA_PUBLIC_OPENALMA_SOUL_ID),
     deviceSessionId: env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID,
   })
 }
@@ -67,7 +68,7 @@ export function installationCompletesOffer(status, offer) {
     status?.installed_package === offer.packageName &&
     status?.installed_version === offer.version &&
     Number(status?.installed_seen_at) > offer.startedAt &&
-    offer.previousVersion !== offer.version
+    !status?.host
 }
 
 export function run() {
@@ -77,7 +78,7 @@ export function run() {
   assertPrivateReleaseConfig(host, process.env, networkInterfaces(), links.map((link) => link.ifname))
   const miniapp = spawn(join(root, "node_modules", ".bin", "mentra-miniapp"), releaseArgs(host), {
     cwd: root,
-    env: {...process.env, MENTRA_RELEASE_PROFILE: releaseProfile(process.env)},
+    env: {...process.env, MENTRA_RELEASE_DEFAULTS: releaseProfile(process.env)},
     stdio: ["inherit", "pipe", "inherit"],
   })
   let output = ""
@@ -105,7 +106,6 @@ export function run() {
       return
     }
     const deviceSessionId = process.env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID
-    const previousVersion = process.env.MENTRA_PUBLIC_OPENALMA_PREVIOUS_VERSION ?? ""
     const qrPath = join(root, "build", `openalma-${version}-wireguard-qr.png`)
     try {
       writeReleaseStatus(statusPath, {
@@ -113,7 +113,7 @@ export function run() {
         package_name: packageName,
         version,
         device_session_id: deviceSessionId,
-        previous_version: previousVersion || null,
+        host_package: process.env.MENTRA_RELEASE_HOST_PACKAGE,
         pid: process.pid,
         started_at: startedAt,
       })
@@ -136,7 +136,7 @@ export function run() {
         if (!response.ok) return
         const status = await response.json()
         if (installationCompletesOffer(status, {
-          deviceSessionId, packageName, version, previousVersion, startedAt,
+          deviceSessionId, packageName, version, startedAt,
         })) {
           console.log(`Iris ${version} reported installed on ${deviceSessionId}; stopping installer`)
           shutdown()
@@ -148,8 +148,10 @@ export function run() {
         polling = false
       }
     }
-    pollTimer = setInterval(() => void poll(), 2000)
-    void poll()
+    if (process.env.MENTRA_RELEASE_HOST_PACKAGE === "com.mentra.mentra") {
+      pollTimer = setInterval(() => void poll(), 2000)
+      void poll()
+    }
     void QRCode.toFile(qrPath, uri, {width: 1024, margin: 4, errorCorrectionLevel: "M"})
       .then(() => console.log(`\nPrivate WireGuard release:\n${uri}\nQR image: ${qrPath}\n`))
       .catch((error) => console.error(`Could not write private release QR: ${error.message}`))
