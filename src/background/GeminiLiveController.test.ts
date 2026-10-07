@@ -99,6 +99,7 @@ function harness(
     snapshotStatus?: number
     snapshotGate?: Promise<void>
     replayGates?: Promise<void>[]
+    replayResponses?: Response[]
     replayStatuses?: number[]
     replayBodies?: unknown[]
     finalizeStatuses?: number[]
@@ -127,6 +128,7 @@ function harness(
   const tokenStatuses = [...(options.tokenStatuses ?? [])]
   const finalizeStatuses = [...(options.finalizeStatuses ?? [])]
   const replayGates = [...(options.replayGates ?? [])]
+  const replayResponses = [...(options.replayResponses ?? [])]
   const replayStatuses = [...(options.replayStatuses ?? [])]
   const replayBodies = [...(options.replayBodies ?? [])]
   let refreshedTokens = 0
@@ -197,6 +199,7 @@ function harness(
     }
     if (url.endsWith("/snapshot/replay")) {
       await replayGates.shift()
+      if (replayResponses.length) return replayResponses.shift()!
       return Response.json(
         replayBodies.shift() ?? {mime_type: "image/png", data: "AQID"},
         {status: replayStatuses.shift() ?? 200},
@@ -544,7 +547,7 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
-  test("Stop during snapshot never sends the stale image turn", async () => {
+  test("Stop during snapshot or replay never sends stale images or changes replacement recovery", async () => {
     let release!: () => void
     const snapshotGate = new Promise<void>((resolve) => {
       release = resolve
@@ -557,6 +560,55 @@ describe("GeminiLiveController", () => {
     release()
     await expect(sending).rejects.toThrow("Photo send cancelled")
     expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(0)
+
+    for (const [status, body] of [
+      [404, null],
+      [503, null],
+      [200, {}],
+      [200, {mime_type: "image/png", data: "AQID"}],
+    ] as const) {
+      const storage = new FakeStorage()
+      const seed = harness({storage})
+      await start(seed)
+      await seed.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+      await seed.controller.stop()
+
+      let finishReplay!: () => void
+      const replayGate = new Promise<void>((resolve) => { finishReplay = resolve })
+      const response = Response.json(body, {status})
+      let readingBody = false
+      if (status === 200) {
+        spyOn(response, "json").mockImplementation(async () => {
+          readingBody = true
+          await replayGate
+          return body
+        })
+      }
+      const old = harness({storage, replayResponses: [response], replayGates: status === 200 ? [] : [replayGate]})
+      await start(old)
+      const retrying = old.controller.retryImage()
+      await waitFor(() => status === 200 ? readingBody :
+        old.requests.some((request) => request.url.endsWith("/snapshot/replay")))
+      await old.controller.stop()
+
+      const replacement = harness({storage, appendStatuses: Array(100).fill(503)})
+      await start(replacement)
+      completeTurn(replacement, "A fictional replacement question.", "A fictional replacement answer.")
+      await waitFor(() => replacement.requests.some((request) => request.url.endsWith("/transcripts/append")))
+      const journal = storage.values.get("openalma:gemini-session-v1")!
+      expect(JSON.parse(journal).pendingImage.imageId).toBe("image-1")
+      expect(JSON.parse(journal).pendingTranscripts).toHaveLength(2)
+      const callbacks = [old.photoRetryChanges.length, old.persistenceErrors.length, old.errors.length]
+
+      finishReplay()
+      await retrying
+
+      expect(storage.values.get("openalma:gemini-session-v1")).toBe(journal)
+      expect([old.photoRetryChanges.length, old.persistenceErrors.length, old.errors.length]).toEqual(callbacks)
+      expect(old.errors).toEqual([])
+      expect(old.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(0)
+      await replacement.controller.stop()
+    }
   })
 
   test("snapshot finishing after reconnect sends the photo on the replacement", async () => {

@@ -459,6 +459,7 @@ export class GeminiLiveController {
         soul_id: this.config.soulId,
         image_id: pending.imageId,
       }, SNAPSHOT_TIMEOUT_MS).catch(() => null)
+      if (this.pendingImage !== pending || pending.providerSent || this.stopping) return
       if (!response || response.status >= 500) {
         await this.requestPhotoRetry(pending)
         return
@@ -469,6 +470,7 @@ export class GeminiLiveController {
         return
       }
       const replay = await response.json().catch(() => null) as {mime_type?: unknown; data?: unknown} | null
+      if (this.pendingImage !== pending || pending.providerSent || this.stopping) return
       const mimeType = replay?.mime_type
       const data = replay?.data
       if (
@@ -479,7 +481,6 @@ export class GeminiLiveController {
         this.reportError(new Error("OpenAlma snapshot replay returned invalid image data"))
         return
       }
-      if (this.pendingImage !== pending || pending.providerSent || this.stopping) return
       if (this.activityPauseReason) {
         await this.requestPhotoRetry(pending)
         return
