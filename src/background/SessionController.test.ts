@@ -4,25 +4,7 @@ import type {GeminiCallbacks} from "./GeminiLiveController"
 import {GeminiLiveController} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {SessionController} from "./SessionController"
-
-type Snapshot = {
-  configured: boolean
-  mode: string
-  connection: string
-  soulId: string
-  souls: string[]
-  soulLoading: boolean
-  soulConfirmed: boolean
-  soulLocked: boolean
-  memuAvailable: boolean | null
-  manualPhase: string
-  microphoneEnabled: boolean
-  cameraEnabled: boolean
-  photoRetryPending: boolean
-  lastError: string | null
-  usageTotalTokens: number | null
-  durationWarning: boolean
-}
+import type {SessionSnapshot as Snapshot} from "../shared/types"
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://127.0.0.1:9999",
@@ -361,11 +343,18 @@ describe("SessionController", () => {
     }) as typeof fetch})
     const saving = h.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"})
     await waiting
+    expect(lastSnapshot(h.session)?.connectionLocked).toBe(true)
+    await expect(h.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://other.example"}))
+      .rejects.toThrow("Wait for settings or stop")
+    await expect(h.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true}))
+      .rejects.toThrow("Finish or recover")
     await expect(h.session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow("Wait for settings")
     finish()
     await saving
     await h.session.handlers["openalma:start"]({mode: "continuous"})
     expect(h.configs[0].baseUrl).toBe("http://changed.example")
+    await expect(h.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://other.example"}))
+      .rejects.toThrow("Wait for settings or stop")
     await h.session.handlers["openalma:stop"]({})
   })
 
@@ -408,10 +397,11 @@ describe("SessionController", () => {
       })
       if (recovering) session.stored.set("openalma:gemini-session-v1", journal)
       let starts = 0
+      let posts = 0
       let ownerId = CONFIG.userId
       const controller = new SessionController(session as never, {
         fetchFn: (async (url, init) => {
-          if (init?.method === "POST") return Response.json({soul_id: stale.soulId, created: false})
+          if (init?.method === "POST") {posts += 1; return Response.json({soul_id: stale.soulId, created: false})}
           return Response.json(String(url).endsWith("/owner") ? {user_id: ownerId} : {souls: [stale.soulId]})
         }) as typeof fetch,
         createLiveController: (_config, callbacks) => {
@@ -427,6 +417,7 @@ describe("SessionController", () => {
         connectionProfile: {baseUrl: stale.baseUrl, userId: stale.userId, deviceSessionId: stale.deviceSessionId},
         soulId: recovering ? "Recovery Soul" : stale.soulId,
         soulLocked: recovering,
+        connectionLocked: false,
         souls: [],
         memuAvailable: false,
         lastError: `Connection user does not match OpenAlma owner "${CONFIG.userId}"`,
@@ -440,24 +431,24 @@ describe("SessionController", () => {
       if (recovering) {
         expect(session.stored.get("openalma:gemini-session-v1")).toBe(journal)
         await expect(session.handlers["openalma:set-profile"]({...stale, baseUrl: "http://repaired.example"}))
-          .rejects.toThrow("Stop or recover")
+          .rejects.toThrow("does not match OpenAlma owner")
         await expect(session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true}))
           .rejects.toThrow("Finish or recover")
       } else {
-        await session.handlers["openalma:set-soul"]({soulId: stale.soulId, useExisting: true})
-        await expect(session.handlers["openalma:start"]({mode: "continuous"}))
+        await expect(session.handlers["openalma:set-soul"]({soulId: stale.soulId, useExisting: true}))
           .rejects.toThrow("does not match OpenAlma owner")
-        expect(starts).toBe(0)
-        await expect(session.handlers["openalma:set-profile"]({...stale, userId: CONFIG.userId}))
-          .rejects.toThrow("cannot change the owner or installation ID")
-        await expect(session.handlers["openalma:set-profile"]({...stale, baseUrl: "http://repaired.example"}))
-          .rejects.toThrow("does not match OpenAlma owner")
-        // Address-only repair succeeds once it reaches the locally bound owner.
-        ownerId = stale.userId
-        await session.handlers["openalma:set-profile"]({...stale, baseUrl: "http://repaired.example"})
-        expect(lastSnapshot(session)).toMatchObject({soulId: stale.soulId, soulConfirmed: true,
-          connectionProfile: {baseUrl: "http://repaired.example", userId: stale.userId, deviceSessionId: stale.deviceSessionId}})
       }
+      expect(posts).toBe(0)
+      await expect(session.handlers["openalma:set-profile"]({...stale, userId: CONFIG.userId}))
+        .rejects.toThrow("cannot change the owner or installation ID")
+      expect(JSON.parse(session.stored.get("openalma.connection-profile")!).baseUrl).toBe(stale.baseUrl)
+      ownerId = stale.userId
+      await session.handlers["openalma:set-profile"]({...stale, baseUrl: "http://repaired.example"})
+      expect(lastSnapshot(session)).toMatchObject({soulId: recovering ? "Recovery Soul" : stale.soulId,
+        soulConfirmed: true, soulLocked: recovering, connectionLocked: false,
+        connectionProfile: {baseUrl: "http://repaired.example", userId: stale.userId, deviceSessionId: stale.deviceSessionId}})
+      expect(session.stored.get("openalma.soul-id")).toBe(stale.soulId)
+      if (recovering) expect(session.stored.get("openalma:gemini-session-v1")).toBe(journal)
     }
   })
 
@@ -509,6 +500,8 @@ describe("SessionController", () => {
     const selection = h.session.handlers["openalma:set-soul"]({soulId: "Next Soul", useExisting: false})
     await new Promise((resolve) => setTimeout(resolve, 0))
     await expect(h.session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow("settings to finish")
+    await expect(h.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"}))
+      .rejects.toThrow("Wait for settings or stop")
     await expect(h.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: false})).rejects.toThrow("Finish or recover")
     release(new Response(JSON.stringify({soul_id: "Next Soul", created: true})))
     await selection
@@ -577,6 +570,7 @@ describe("SessionController", () => {
   test("Stop keeps pending recovery locked until the original soul's journal clears", async () => {
     const h = setup()
     await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const previousController = h.live
     await expect(h.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true})).rejects.toThrow("Finish or recover")
     const journal = JSON.stringify({version: 1,
       scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
@@ -588,7 +582,12 @@ describe("SessionController", () => {
     await h.session.handlers["openalma:stop"]({})
     expect(lastSnapshot(h.session)).toMatchObject({connection: "idle", soulLocked: true})
     await expect(h.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true})).rejects.toThrow("Finish or recover")
+    await h.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://repaired.example"})
+    expect(h.session.stored.get("openalma:gemini-session-v1")).toBe(journal)
     await h.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(h.live).not.toBe(previousController)
+    expect(previousController.stops).toBe(1)
+    expect(h.configs.map((config) => config.baseUrl)).toEqual([CONFIG.baseUrl, "http://repaired.example"])
     expect(h.configs.map((config) => config.soulId)).toEqual([CONFIG.soulId, CONFIG.soulId])
     h.session.stored.delete("openalma:gemini-session-v1")
     await h.session.handlers["openalma:stop"]({})
@@ -602,19 +601,65 @@ describe("SessionController", () => {
       "Select or create this soul",
     )
     expect(lastSnapshot(harness.session).soulConfirmed).toBe(false)
+    await expect(harness.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: false}))
+      .rejects.toThrow("Soul discovery failed")
     const journal = JSON.stringify({version: 1,
       scope: {userId: CONFIG.userId, soulId: "Recovery Soul", deviceSessionId: CONFIG.deviceSessionId},
-      resumption: {handle: "fictional-handle", updatedAt: Date.now()},
+      pendingTranscripts: [{eventId: "fictional-event", text: "Unsent fictional transcript"}],
+      pendingImage: {imageId: "fictional-image"},
+      resumption: {handle: "fictional-handle", updatedAt: Date.now() - 31 * 60 * 1000},
     })
     const locked = setup({stored: {"openalma:gemini-session-v1": journal,
       "openalma.microphone-enabled": "0", "openalma.camera-enabled": "0"},
-      fetchFn: (async () => new Response("unavailable", {status: 503})) as typeof fetch})
+      fetchFn: (async (url) => String(url).startsWith("http://changed.example")
+        ? Response.json({souls: ["Recovery Soul"]})
+        : new Response("unavailable", {status: 503})) as typeof fetch})
     await expect(locked.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true}))
       .rejects.toThrow("Finish or recover")
-    expect(lastSnapshot(locked.session)).toMatchObject({soulId: "Recovery Soul", soulLocked: true, memuAvailable: false,
+    expect(lastSnapshot(locked.session)).toMatchObject({soulId: "Recovery Soul", soulLocked: true, connectionLocked: false, memuAvailable: false,
       microphoneEnabled: false, cameraEnabled: false})
-    await expect(locked.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"}))
-      .rejects.toThrow("Stop or recover")
+    await locked.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example", bearer: "replacement"})
+    expect(lastSnapshot(locked.session)).toMatchObject({soulId: "Recovery Soul", soulLocked: true,
+      connectionLocked: false, memuAvailable: true, microphoneEnabled: false, cameraEnabled: false})
+    expect(JSON.parse(locked.session.stored.get("openalma.connection-profile")!)).toEqual({
+      baseUrl: "http://changed.example", bearer: CONFIG.bearer, userId: CONFIG.userId,
+      deviceSessionId: CONFIG.deviceSessionId,
+    })
+    expect(locked.session.stored.get("openalma.soul-id")).toBe(CONFIG.soulId)
+    expect(locked.session.stored.get("openalma:gemini-session-v1")).toBe(journal)
+    await expect(locked.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true}))
+      .rejects.toThrow("Finish or recover")
+    await locked.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(locked.configs[0]).toMatchObject({baseUrl: "http://changed.example", soulId: "Recovery Soul",
+      userId: CONFIG.userId, deviceSessionId: CONFIG.deviceSessionId})
+    await locked.session.handlers["openalma:stop"]({})
+  })
+
+  test("successful revalidation clears unavailable state on selection and recovery Start", async () => {
+    for (const recovering of [false, true]) {
+      let available = false
+      const journal = JSON.stringify({version: 1,
+        scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+        pendingTranscripts: [{eventId: "fictional-event", text: "Fictional unsent transcript"}],
+      })
+      const h = setup({stored: recovering ? {"openalma:gemini-session-v1": journal} : {},
+        fetchFn: (async (_url, init) => {
+          if (!available) return new Response("unavailable", {status: 503})
+          if (!init?.method) return Response.json({souls: [CONFIG.soulId, "Discovered Soul"]})
+          return Response.json({soul_id: CONFIG.soulId, created: false})
+        }) as typeof fetch})
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(lastSnapshot(h.session)?.memuAvailable).toBe(false)
+      available = true
+      if (recovering) await h.session.handlers["openalma:start"]({mode: "continuous"})
+      else await h.session.handlers["openalma:set-soul"]({soulId: CONFIG.soulId, useExisting: true})
+      expect(lastSnapshot(h.session)).toMatchObject({memuAvailable: true, lastError: null,
+        souls: [CONFIG.soulId, "Discovered Soul"], soulId: CONFIG.soulId})
+      if (recovering) {
+        expect(h.session.stored.get("openalma:gemini-session-v1")).toBe(journal)
+        await h.session.handlers["openalma:stop"]({})
+      }
+    }
   })
 
   test("keeps a recovered journal soul locked and binds each new sitting to its selected soul", async () => {
@@ -697,6 +742,9 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     harness.live.reconnecting(true)
     expect(lastSnapshot(harness.session)?.connection).toBe("reconnecting")
+    expect(lastSnapshot(harness.session)?.connectionLocked).toBe(true)
+    await expect(harness.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"}))
+      .rejects.toThrow("Wait for settings or stop")
     harness.live.reconnecting(false)
     expect(lastSnapshot(harness.session)?.connection).toBe("listening")
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -905,7 +953,11 @@ describe("SessionController", () => {
     })
     const harness = setup({startGate: gate})
     const start = harness.session.handlers["openalma:start"]({mode: "continuous"})
-    await Promise.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(lastSnapshot(harness.session)?.connection).toBe("starting")
+    expect(lastSnapshot(harness.session)?.connectionLocked).toBe(true)
+    await expect(harness.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"}))
+      .rejects.toThrow("Wait for settings or stop")
 
     await harness.session.handlers["openalma:stop"]({})
     release()
@@ -950,6 +1002,7 @@ describe("SessionController", () => {
       soulLoading: true,
       soulConfirmed: false,
       soulLocked: true,
+      connectionLocked: true,
       memuAvailable: null,
       manualPhase: "idle",
       microphoneEnabled: true,
@@ -1266,6 +1319,9 @@ describe("SessionController", () => {
     })
     await Promise.resolve()
     expect(stopped).toBe(false)
+    expect(lastSnapshot(harness.session)).toMatchObject({connection: "stopping", connectionLocked: true})
+    await expect(harness.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"}))
+      .rejects.toThrow("Wait for settings or stop")
     expect(harness.live.stops).toBe(1)
     release()
     await stop

@@ -48,8 +48,6 @@ const MICROPHONE_ENABLED_KEY = "openalma.microphone-enabled"
 const CAMERA_ENABLED_KEY = "openalma.camera-enabled"
 const SOUL_ID_KEY = "openalma.soul-id"
 
-class OwnerMismatchError extends Error {}
-
 function trace(event: string, detail: Record<string, unknown> = {}): void {
   if (process.env.NODE_ENV === "test") return
   console.info(`[OpenAlma] ${new Date().toISOString()} ${event}`, detail)
@@ -141,8 +139,8 @@ export class SessionController {
     this.unsubs.push(
       ui.handle("openalma:set-profile", async (payload) => {
         await this.preferencesLoaded
-        if (this.soulLocked()) {
-          throw new Error("Stop or recover this sitting before changing its connection")
+        if (this.connectionLocked()) {
+          throw new Error("Wait for settings or stop this sitting before changing its connection")
         }
         const submitted = parseOpenAlmaProfile({...payload as OpenAlmaConfig, bearer: this.config?.bearer})
         if (this.config && (submitted.deviceSessionId !== this.config.deviceSessionId || submitted.userId !== this.config.userId)) {
@@ -191,6 +189,12 @@ export class SessionController {
         this.pushSnapshot()
         try {
           const config = this.currentConfig()
+          if (this.memuAvailable === false) {
+            const identity = await this.resolveProfileIdentity(config)
+            this.souls = identity.souls
+            this.memuAvailable = true
+            this.lastError = null
+          }
           const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
             method: "POST",
             signal: timeoutSignal(10_000),
@@ -370,6 +374,7 @@ export class SessionController {
       soulLoading: this.soulLoading,
       soulConfirmed: this.soulConfirmed,
       soulLocked: this.soulLocked(),
+      connectionLocked: this.connectionLocked(),
       memuAvailable: this.memuAvailable,
       manualPhase: this.manualPhase,
       microphoneEnabled: this.microphoneEnabled,
@@ -410,7 +415,12 @@ export class SessionController {
       if (!this.soulConfirmed && !this.recoverySoulId) {
         throw new Error("Select or create this soul before starting Iris")
       }
-      if (this.memuAvailable === false) await this.resolveProfileIdentity(this.currentConfig())
+      if (this.memuAvailable === false) {
+        const identity = await this.resolveProfileIdentity(this.currentConfig())
+        if (generation !== this.startGeneration) return
+        this.souls = identity.souls
+        this.memuAvailable = true
+      }
       if (generation !== this.startGeneration) return
       this.recoverySoulId = this.soulId
       if (!this.liveController) {
@@ -904,7 +914,7 @@ export class SessionController {
     const userId = ownerResult.user_id?.trim() ?? ""
     if (!userId) throw new Error("Set up the OpenAlma owner in the launcher")
     if (userId !== config.userId) {
-      throw new OwnerMismatchError(`Connection user does not match OpenAlma owner "${userId}"`)
+      throw new Error(`Connection user does not match OpenAlma owner "${userId}"`)
     }
     const soulsResponse = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
       headers,
@@ -919,9 +929,13 @@ export class SessionController {
     return {config: {...config, userId}, souls: soulsResult.souls}
   }
 
-  private soulLocked(): boolean {
+  private connectionLocked(): boolean {
     return this.soulLoading || this.soulSelecting || ACTIVE.has(this.connection) ||
-      this.connection === "stopping" || this.recoverySoulId !== null
+      this.connection === "stopping"
+  }
+
+  private soulLocked(): boolean {
+    return this.connectionLocked() || this.recoverySoulId !== null
   }
 
   private async refreshRecoveryLock(): Promise<void> {

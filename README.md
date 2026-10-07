@@ -21,10 +21,11 @@ Before changing the Gemini wire or diagnosing provider behavior, read
 official sources, proven behavior, and local redacted fixtures.
 
 Iris stores its OpenAlma connection profile and selected soul in phone-local
-`session.storage`. With no profile it shows setup and makes no OpenAlma or Gemini
-request. Setup first discovers the one shared OpenAlma owner through the
-bearer-authenticated `/integration/mentra/owner` contract; a saved profile whose
-user does not match that owner is rejected as stale rather than silently reused.
+`session.storage`. With no profile it asks you to install Iris from the launcher
+and makes no OpenAlma or Gemini request. Discovery checks the one shared OpenAlma
+owner through the bearer-authenticated `/integration/mentra/owner` contract; a
+saved profile whose user does not match that owner is kept for address repair,
+but Soul selection and Start refuse the mismatched owner.
 Existing soul suggestions come from authenticated
 `GET /integration/mentra/souls?user_id=...`. Selection or creation uses `POST`
 on the same route with `user_id`, `soul_id`, and `use_existing`. Only a 409
@@ -35,7 +36,8 @@ Selection stays locked during a sitting and while its Gemini journal remains;
 Start recovers that journal's original soul, then Stop completes finalization.
 The bottom gear opens existing settings. **Edit Connection** preserves the
 installation identity and selected Soul; its Save is locked during a sitting or
-pending recovery. The owner and installation ID are read-only. There is no
+settings work, but allows address-only repair with pending recovery data intact.
+The owner and installation ID are read-only. There is no
 Clear Connection/reset path.
 
 While a sitting is active, **Take photo** and **Choose image** durably store a non-empty JPEG/PNG before sending it to Gemini. Immediate send is the default; optional preview provides Send/Retake. Files over 1 MB pause for a cost/latency warning that can be permanently dismissed. Gemini's spoken description is saved as the image caption only after its transcript is acknowledged.

@@ -162,6 +162,7 @@ export default function SessionPage() {
   const active = starting || reconnecting || visible === "listening" || visible === "speaking"
   const modeDisabled = active || stopping || startPending || stopPending || modePending
   const soulLocked = snapshot?.soulLocked ?? true
+  const connectionLocked = (snapshot?.connectionLocked ?? true) || active || stopping || soulPending
   const soulReady = !soulDirty && snapshot?.soulConfirmed && soulName.trim() === snapshot.soulId
   const knownSoul = snapshot?.souls.includes(soulName.trim()) ?? false
 
@@ -377,22 +378,30 @@ export default function SessionPage() {
   const voiceReady = visible === "listening" || visible === "speaking"
 
   if (!snapshot) return <main><p className="status">Loading Iris...</p></main>
-  if (!snapshot.configured || editingConnection) {
+  if (!snapshot.configured) return (
+    <main>
+      <h1>Iris setup</h1>
+      <p role="status">Install Iris from the OpenAlma launcher.</p>
+      {snapshot.lastError ? <p role="alert">{snapshot.lastError}</p> : null}
+    </main>
+  )
+  if (editingConnection) {
     const field = (name: keyof OpenAlmaProfile, label: string, type = "text", readOnly = false) => (
       <label>{label}<input type={type} value={profile[name]} disabled={profilePending} readOnly={readOnly}
         onChange={(event) => setProfile({...profile, [name]: event.target.value})} /></label>
     )
     return (
       <main>
-        <header><p className="eyebrow">OpenAlma voice</p><h1>{snapshot.configured ? "Edit Connection" : "Iris setup"}</h1></header>
+        <header><p className="eyebrow">OpenAlma voice</p><h1>Edit Connection</h1></header>
         <section className="soul-control" aria-label="OpenAlma connection setup">
           {field("baseUrl", "OpenAlma address")}
           {field("userId", "Your name", "text", true)}
           {field("deviceSessionId", "Installation ID", "text", true)}
-          <button type="button" disabled={profilePending || soulLocked} onClick={() => void saveProfile()}>
+          <button type="button" disabled={profilePending || connectionLocked} onClick={() => void saveProfile()}>
             {profilePending ? "Connecting..." : "Save and connect"}
           </button>
-          {snapshot.configured ? <button type="button" disabled={profilePending} onClick={() => setEditingConnection(false)}>Back</button> : null}
+          {connectionLocked ? <p>Wait for settings or stop this sitting before changing its connection.</p> : null}
+          <button type="button" disabled={profilePending} onClick={() => setEditingConnection(false)}>Back</button>
           {snapshot.lastError ? <p role="alert">{snapshot.lastError}</p> : null}
           {rpcError ? <p role="alert">{rpcError}</p> : null}
         </section>
