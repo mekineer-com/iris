@@ -21,7 +21,7 @@ import {
   parseOpenAlmaProfile,
   serializeOpenAlmaProfile,
 } from "./openAlmaConfig"
-import {reportInstallation} from "./installation"
+import {installationHost, OPENALMA_HOST_KEY, reportInstallation, type InstallationHost} from "./installation"
 import {timeoutSignal} from "./timeoutSignal"
 
 type Send = <C extends keyof Channels & string>(channel: C, payload: Channels[C]) => void
@@ -100,6 +100,7 @@ export class SessionController {
   private readonly earconTimeoutMs: number
   private readonly responseWatchdogMs: number
   private config?: OpenAlmaConfig
+  private host?: InstallationHost
   private readonly fetchFn: typeof fetch
   private readonly createLiveController: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
   private liveController: GeminiLiveController | null
@@ -627,7 +628,7 @@ export class SessionController {
   private async reportSelectedSoul(): Promise<void> {
     if (process.env.NODE_ENV !== "production" || !this.config) return
     try {
-      await reportInstallation({...this.currentConfig(), soulId: this.soulId}, this.fetchFn)
+      await reportInstallation({...this.currentConfig(), soulId: this.soulId}, this.fetchFn, this.host)
     } catch (error) {
       console.error("[OpenAlma] installation report failed:", error)
       this.reportInstallationError()
@@ -847,13 +848,15 @@ export class SessionController {
   ): Promise<void> {
     let storedSoul: string | null = null
     try {
-      const [storedProfile, microphone, camera, savedSoul, journal] = await Promise.all([
+      const [storedProfile, microphone, camera, savedSoul, journal, host] = await Promise.all([
         this.session.storage.get(OPENALMA_PROFILE_KEY),
         this.session.storage.get(MICROPHONE_ENABLED_KEY),
         this.session.storage.get(CAMERA_ENABLED_KEY),
         this.session.storage.get(SOUL_ID_KEY),
         this.session.storage.get(JOURNAL_KEY),
+        this.session.storage.get(OPENALMA_HOST_KEY),
       ])
+      this.host = installationHost(host)
       if (!this.config && storedProfile === null) {
         this.soulLoading = false
         this.pushSnapshot()

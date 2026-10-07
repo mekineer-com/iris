@@ -1,6 +1,6 @@
 import {describe, expect, test} from "bun:test"
 
-import {reportInstallation} from "./installation"
+import {installationHost, reportInstallation} from "./installation"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 
 const CONFIG: OpenAlmaConfig = {
@@ -14,6 +14,16 @@ const CONFIG: OpenAlmaConfig = {
 }
 
 describe("installation report", () => {
+  test("reports a known host without requiring a selected Soul", async () => {
+    const host = installationHost(JSON.stringify({host_package: "com.mentra.mentra.openalma", host_version: "3.2.1"}))
+    let body: unknown
+    await reportInstallation({...CONFIG, soulId: ""}, (async (_url: string, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body))
+      return new Response(null, {status: 200})
+    }) as typeof fetch, host)
+    expect(body).toMatchObject({soul_id: null, host_package: "com.mentra.mentra.openalma", host_version: "3.2.1"})
+    expect(installationHost(null)).toBeUndefined()
+  })
 
   test("sends build identity once per call and a later load can retry", async () => {
     const requests: Array<{url: string; init?: RequestInit}> = []
