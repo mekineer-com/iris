@@ -20,7 +20,7 @@ import {
   parseOpenAlmaProfile,
   serializeOpenAlmaProfile,
 } from "./openAlmaConfig"
-import {installationHost, OPENALMA_HOST_KEY, reportInstallation, type InstallationHost} from "./installation"
+import {installationHost, OPENALMA_HOST_KEY, reportInstallation} from "./installation"
 import {timeoutSignal} from "./timeoutSignal"
 
 type Send = <C extends keyof Channels & string>(channel: C, payload: Channels[C]) => void
@@ -101,7 +101,6 @@ export class SessionController {
   private readonly responseWatchdogMs: number
   private config?: OpenAlmaConfig
   private readonly installationDefaults?: unknown
-  private host?: InstallationHost
   private readonly fetchFn: typeof fetch
   private readonly createLiveController: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
   private liveController: GeminiLiveController | null
@@ -626,7 +625,8 @@ export class SessionController {
   private async reportSelectedSoul(): Promise<void> {
     if (process.env.NODE_ENV !== "production" || !this.config) return
     try {
-      await reportInstallation({...this.currentConfig(), soulId: this.soulId}, this.fetchFn, this.host)
+      const host = installationHost(await this.session.storage.get(OPENALMA_HOST_KEY))
+      await reportInstallation({...this.currentConfig(), soulId: this.soulId}, this.fetchFn, host)
     } catch (error) {
       console.error("[OpenAlma] installation report failed:", error)
       this.reportInstallationError()
@@ -846,15 +846,13 @@ export class SessionController {
   ): Promise<void> {
     let storedSoul: string | null = null
     try {
-      let [storedProfile, microphone, camera, savedSoul, journal, host] = await Promise.all([
+      let [storedProfile, microphone, camera, savedSoul, journal] = await Promise.all([
         this.session.storage.get(OPENALMA_PROFILE_KEY),
         this.session.storage.get(MICROPHONE_ENABLED_KEY),
         this.session.storage.get(CAMERA_ENABLED_KEY),
         this.session.storage.get(SOUL_ID_KEY),
         this.session.storage.get(JOURNAL_KEY),
-        this.session.storage.get(OPENALMA_HOST_KEY),
       ])
-      this.host = installationHost(host)
       if (!this.config && storedProfile === null && this.installationDefaults !== undefined) {
         const defaults = parseOpenAlmaProfile(this.installationDefaults)
         storedProfile = serializeOpenAlmaProfile(defaults)

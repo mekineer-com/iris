@@ -622,18 +622,24 @@ describe("SessionController", () => {
     const previous = process.env.NODE_ENV
     process.env.NODE_ENV = "production"
     const reports: string[] = []
+    const hostVersions: string[] = []
     try {
-      const h = setup({stored: {"openalma.soul-id": "Stored Soul"}, fetchFn: (async (url, init) => {
+      const h = setup({stored: {"openalma.soul-id": "Stored Soul",
+        "openalma.host": JSON.stringify({host_package: "com.mentra.mentra.openalma", host_version: "3.2.0"})}, fetchFn: (async (url, init) => {
         if (!init?.method) return Response.json({souls: ["Stored Soul"]})
         const body = JSON.parse(String(init?.body))
         if (String(url).endsWith("/installation/seen")) {
           reports.push(body.soul_id)
+          hostVersions.push(body.host_version)
           return Response.json({ok: true})
         }
         return Response.json({soul_id: body.soul_id, created: true})
       }) as typeof fetch})
+      await h.session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+      h.session.stored.set("openalma.host", JSON.stringify({host_package: "com.mentra.mentra.openalma", host_version: "3.2.1"}))
       await h.session.handlers["openalma:set-soul"]({soulId: "Selected Soul", useExisting: false})
       expect(reports).toEqual(["Stored Soul", "Selected Soul"])
+      expect(hostVersions).toEqual(["3.2.0", "3.2.1"])
     } finally {
       process.env.NODE_ENV = previous
     }
