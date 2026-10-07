@@ -642,7 +642,8 @@ describe("SessionController", () => {
       let available = false
       const journal = JSON.stringify({version: 1,
         scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
-        pendingTranscripts: [{eventId: "fictional-event", text: "Fictional unsent transcript"}],
+        pendingTranscripts: [{event_id: "fictional-session:1", sequence: 1,
+          event_kind: "transcript", role: "user", content: "Fictional unsent transcript", status: "complete"}],
       })
       const h = setup({stored: recovering ? {"openalma:gemini-session-v1": journal} : {},
         fetchFn: (async (_url, init) => {
