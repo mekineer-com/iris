@@ -605,8 +605,10 @@ describe("SessionController", () => {
       .rejects.toThrow("Soul discovery failed")
     const journal = JSON.stringify({version: 1,
       scope: {userId: CONFIG.userId, soulId: "Recovery Soul", deviceSessionId: CONFIG.deviceSessionId},
-      pendingTranscripts: [{eventId: "fictional-event", text: "Unsent fictional transcript"}],
-      pendingImage: {imageId: "fictional-image"},
+      pendingTranscripts: [{event_id: "fictional-session:1", sequence: 1,
+        event_kind: "transcript", role: "user", content: "Unsent fictional transcript", status: "complete"}],
+      pendingImage: {imageId: "fictional-image", mediaRef: "mentra_media/fictional-scope/fictional-image.png",
+        providerSent: false, captureAfterCurrent: false, generation: 1, sessionId: "fictional-session"},
       resumption: {handle: "fictional-handle", updatedAt: Date.now() - 31 * 60 * 1000},
     })
     const locked = setup({stored: {"openalma:gemini-session-v1": journal,
