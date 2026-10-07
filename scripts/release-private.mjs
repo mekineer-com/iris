@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import {execFileSync, spawn} from "node:child_process"
-import {renameSync, unlinkSync, writeFileSync} from "node:fs"
+import {mkdirSync, renameSync, unlinkSync, writeFileSync} from "node:fs"
 import {networkInterfaces} from "node:os"
 import {dirname, join, resolve} from "node:path"
 import {fileURLToPath} from "node:url"
@@ -50,6 +50,7 @@ export function releaseProfile(env) {
 }
 
 export function writeReleaseStatus(path, value) {
+  mkdirSync(dirname(path), {recursive: true})
   const temporary = `${path}.${process.pid}.tmp`
   try {
     writeFileSync(temporary, JSON.stringify(value))

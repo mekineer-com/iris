@@ -846,6 +846,10 @@ export class SessionController {
       ])
       if (!this.config && storedProfile === null && this.installationDefaults !== undefined) {
         const defaults = parseOpenAlmaProfile(this.installationDefaults)
+        const host = installationHost(await this.session.storage.get(OPENALMA_HOST_KEY))
+        if (host && defaults.deviceSessionId !== host.deviceSessionId) {
+          throw new Error("Install Iris from its OpenAlma Mentra row in the launcher")
+        }
         storedProfile = serializeOpenAlmaProfile(defaults)
         await this.session.storage.set(OPENALMA_PROFILE_KEY, storedProfile)
       }

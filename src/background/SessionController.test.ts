@@ -372,6 +372,13 @@ describe("SessionController", () => {
   test("seeds download defaults once without choosing a Soul or overwriting settings", async () => {
     const session = new FakeSession()
     const installationDefaults = {baseUrl: CONFIG.baseUrl, userId: CONFIG.userId, deviceSessionId: CONFIG.deviceSessionId}
+    const wrong = new FakeSession()
+    wrong.stored.set("openalma.host", JSON.stringify({host_package: "com.mentra.mentra.openalma",
+      host_version: "3.2.1", deviceSessionId: "other-installation"}))
+    new SessionController(wrong as never, {installationDefaults}).start()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(wrong.stored.has("openalma.connection-profile")).toBe(false)
+    expect(lastSnapshot(wrong)?.lastError).toContain("OpenAlma Mentra row")
     const requests: string[] = []
     const fetchFn = (async (url, init) => {
       requests.push(init?.method ?? "GET")
@@ -564,11 +571,13 @@ describe("SessionController", () => {
       scope: {userId: CONFIG.userId, soulId: "Recovery Soul", deviceSessionId: CONFIG.deviceSessionId},
       resumption: {handle: "fictional-handle", updatedAt: Date.now()},
     })
-    const locked = setup({stored: {"openalma:gemini-session-v1": journal},
+    const locked = setup({stored: {"openalma:gemini-session-v1": journal,
+      "openalma.microphone-enabled": "0", "openalma.camera-enabled": "0"},
       fetchFn: (async () => new Response("unavailable", {status: 503})) as typeof fetch})
     await expect(locked.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true}))
       .rejects.toThrow("Finish or recover")
-    expect(lastSnapshot(locked.session)).toMatchObject({soulId: "Recovery Soul", soulLocked: true, memuAvailable: false})
+    expect(lastSnapshot(locked.session)).toMatchObject({soulId: "Recovery Soul", soulLocked: true, memuAvailable: false,
+      microphoneEnabled: false, cameraEnabled: false})
     await expect(locked.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"}))
       .rejects.toThrow("Stop or recover")
   })
@@ -615,7 +624,7 @@ describe("SessionController", () => {
     const hostVersions: string[] = []
     try {
       const h = setup({stored: {"openalma.soul-id": "Stored Soul",
-        "openalma.host": JSON.stringify({host_package: "com.mentra.mentra.openalma", host_version: "3.2.0"})}, fetchFn: (async (url, init) => {
+        "openalma.host": JSON.stringify({host_package: "com.mentra.mentra.openalma", host_version: "3.2.0", deviceSessionId: CONFIG.deviceSessionId})}, fetchFn: (async (url, init) => {
         if (!init?.method) return Response.json({souls: ["Stored Soul"]})
         const body = JSON.parse(String(init?.body))
         if (String(url).endsWith("/installation/seen")) {
@@ -626,7 +635,7 @@ describe("SessionController", () => {
         return Response.json({soul_id: body.soul_id, created: true})
       }) as typeof fetch})
       await h.session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
-      h.session.stored.set("openalma.host", JSON.stringify({host_package: "com.mentra.mentra.openalma", host_version: "3.2.1"}))
+      h.session.stored.set("openalma.host", JSON.stringify({host_package: "com.mentra.mentra.openalma", host_version: "3.2.1", deviceSessionId: CONFIG.deviceSessionId}))
       await h.session.handlers["openalma:set-soul"]({soulId: "Selected Soul", useExisting: false})
       expect(reports).toEqual(["Stored Soul", "Selected Soul"])
       expect(hostVersions).toEqual(["3.2.0", "3.2.1"])

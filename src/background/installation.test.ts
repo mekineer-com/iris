@@ -15,7 +15,7 @@ const CONFIG: OpenAlmaConfig = {
 
 describe("installation report", () => {
   test("reports a known host without requiring a selected Soul", async () => {
-    const host = installationHost(JSON.stringify({host_package: "com.mentra.mentra.openalma", host_version: "3.2.1"}))
+    const host = installationHost(JSON.stringify({host_package: "com.mentra.mentra.openalma", host_version: "3.2.1", deviceSessionId: CONFIG.deviceSessionId}))
     let body: unknown
     await reportInstallation({...CONFIG, soulId: ""}, (async (_url: string, init?: RequestInit) => {
       body = JSON.parse(String(init?.body))

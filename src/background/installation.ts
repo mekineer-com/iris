@@ -2,16 +2,17 @@ import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {timeoutSignal} from "./timeoutSignal"
 
 export const OPENALMA_HOST_KEY = "openalma.host"
-export type InstallationHost = {host_package: "com.mentra.mentra.openalma"; host_version: string}
+export type InstallationHost = {host_package: "com.mentra.mentra.openalma"; host_version: string; deviceSessionId: string}
 
 export function installationHost(value: string | null): InstallationHost | undefined {
   if (value === null) return undefined
   const host = JSON.parse(value) as Partial<InstallationHost>
   if (!host || typeof host !== "object" || host.host_package !== "com.mentra.mentra.openalma" ||
-      typeof host.host_version !== "string" || !host.host_version.trim() || host.host_version.length > 64) {
+      typeof host.host_version !== "string" || !host.host_version.trim() || host.host_version.length > 64 ||
+      typeof host.deviceSessionId !== "string" || !host.deviceSessionId) {
     throw new Error("Invalid Mentra host marker")
   }
-  return {host_package: host.host_package, host_version: host.host_version.trim()}
+  return {host_package: host.host_package, host_version: host.host_version.trim(), deviceSessionId: host.deviceSessionId}
 }
 
 export async function reportInstallation(
@@ -32,7 +33,7 @@ export async function reportInstallation(
       device_session_id: config.deviceSessionId,
       package_name: config.packageName,
       version: config.version,
-      ...host,
+      ...(host ? {host_package: host.host_package, host_version: host.host_version} : {}),
     }),
   })
   if (!response.ok) throw new Error(`Installation report failed (${response.status})`)

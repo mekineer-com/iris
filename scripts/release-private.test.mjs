@@ -52,7 +52,7 @@ describe("private release URI", () => {
   })
 
   test("writes installer status atomically", () => {
-    const path = join(mkdtempSync(join(tmpdir(), "iris-release-test-")), "status.json")
+    const path = join(mkdtempSync(join(tmpdir(), "iris-release-test-")), "build", "status.json")
     writeReleaseStatus(path, {package_name: "com.openalma.mentra", version: "0.1.0"})
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
       package_name: "com.openalma.mentra",
