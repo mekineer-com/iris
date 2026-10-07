@@ -397,33 +397,68 @@ describe("SessionController", () => {
   })
 
   test("rejects a profile user that differs from the discovered owner", async () => {
-    const session = new FakeSession()
-    const stale = {...CONFIG, userId: "Stale User"}
-    session.stored.set("openalma.connection-profile", JSON.stringify(stale))
-    session.stored.set("openalma.soul-id", stale.soulId)
-    const controller = new SessionController(session as never, {
-      config: stale,
-      fetchFn: withOwnerDiscovery((async () => Response.json({souls: [CONFIG.soulId]})) as typeof fetch),
-    })
-    controller.start()
-    await new Promise((resolve) => setTimeout(resolve, 0))
+    for (const recovering of [false, true]) {
+      const session = new FakeSession()
+      const stale = {...CONFIG, userId: "Stale User"}
+      session.stored.set("openalma.connection-profile", JSON.stringify(stale))
+      session.stored.set("openalma.soul-id", stale.soulId)
+      const journal = JSON.stringify({version: 1,
+        scope: {userId: stale.userId, soulId: "Recovery Soul", deviceSessionId: stale.deviceSessionId},
+        resumption: {handle: "fictional-handle", updatedAt: Date.now()},
+      })
+      if (recovering) session.stored.set("openalma:gemini-session-v1", journal)
+      let starts = 0
+      let ownerId = CONFIG.userId
+      const controller = new SessionController(session as never, {
+        fetchFn: (async (url, init) => {
+          if (init?.method === "POST") return Response.json({soul_id: stale.soulId, created: false})
+          return Response.json(String(url).endsWith("/owner") ? {user_id: ownerId} : {souls: [stale.soulId]})
+        }) as typeof fetch,
+        createLiveController: (_config, callbacks) => {
+          starts += 1
+          return new FakeLive(callbacks) as unknown as GeminiLiveController
+        },
+      })
+      controller.start()
+      await new Promise((resolve) => setTimeout(resolve, 0))
 
-    expect(lastSnapshot(session)).toMatchObject({
-      configured: false,
-      soulId: "",
-      souls: [],
-      memuAvailable: false,
-      lastError: `Connection user does not match OpenAlma owner "${CONFIG.userId}"`,
-    })
-    expect(session.stored.has("openalma.connection-profile")).toBe(true)
-    expect(session.stored.has("openalma.soul-id")).toBe(true)
-    await expect(session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow(
-      "Local recovery state unavailable",
-    )
-    await expect(
-      session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: false}),
-    ).rejects.toThrow("Set up")
-
+      expect(lastSnapshot(session)).toMatchObject({
+        configured: true,
+        connectionProfile: {baseUrl: stale.baseUrl, userId: stale.userId, deviceSessionId: stale.deviceSessionId},
+        soulId: recovering ? "Recovery Soul" : stale.soulId,
+        soulLocked: recovering,
+        souls: [],
+        memuAvailable: false,
+        lastError: `Connection user does not match OpenAlma owner "${CONFIG.userId}"`,
+      })
+      expect(session.stored.has("openalma.connection-profile")).toBe(true)
+      expect(session.stored.has("openalma.soul-id")).toBe(true)
+      await expect(session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow(
+        recovering ? "does not match OpenAlma owner" : "Select or create this soul",
+      )
+      expect(starts).toBe(0)
+      if (recovering) {
+        expect(session.stored.get("openalma:gemini-session-v1")).toBe(journal)
+        await expect(session.handlers["openalma:set-profile"]({...stale, baseUrl: "http://repaired.example"}))
+          .rejects.toThrow("Stop or recover")
+        await expect(session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true}))
+          .rejects.toThrow("Finish or recover")
+      } else {
+        await session.handlers["openalma:set-soul"]({soulId: stale.soulId, useExisting: true})
+        await expect(session.handlers["openalma:start"]({mode: "continuous"}))
+          .rejects.toThrow("does not match OpenAlma owner")
+        expect(starts).toBe(0)
+        await expect(session.handlers["openalma:set-profile"]({...stale, userId: CONFIG.userId}))
+          .rejects.toThrow("cannot change the owner or installation ID")
+        await expect(session.handlers["openalma:set-profile"]({...stale, baseUrl: "http://repaired.example"}))
+          .rejects.toThrow("does not match OpenAlma owner")
+        // Address-only repair succeeds once it reaches the locally bound owner.
+        ownerId = stale.userId
+        await session.handlers["openalma:set-profile"]({...stale, baseUrl: "http://repaired.example"})
+        expect(lastSnapshot(session)).toMatchObject({soulId: stale.soulId, soulConfirmed: true,
+          connectionProfile: {baseUrl: "http://repaired.example", userId: stale.userId, deviceSessionId: stale.deviceSessionId}})
+      }
+    }
   })
 
   test("direct Start waits for discovery and never starts an unavailable saved soul", async () => {

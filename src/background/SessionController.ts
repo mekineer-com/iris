@@ -410,6 +410,8 @@ export class SessionController {
       if (!this.soulConfirmed && !this.recoverySoulId) {
         throw new Error("Select or create this soul before starting Iris")
       }
+      if (this.memuAvailable === false) await this.resolveProfileIdentity(this.currentConfig())
+      if (generation !== this.startGeneration) return
       this.recoverySoulId = this.soulId
       if (!this.liveController) {
         this.liveController = this.createLiveController({...this.currentConfig(), soulId: this.soulId}, {
@@ -871,13 +873,6 @@ export class SessionController {
       this.souls = identity.souls
       this.memuAvailable = true
     } catch (error) {
-      if (error instanceof OwnerMismatchError) {
-        this.config = undefined
-        this.soulId = ""
-        this.souls = []
-        this.soulConfirmed = false
-        this.recoverySoulId = null
-      }
       this.memuAvailable = false
       this.lastError = error instanceof Error ? error.message : String(error)
     }
