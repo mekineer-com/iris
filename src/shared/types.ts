@@ -9,12 +9,12 @@ export type OpenAlmaProfile = {
   baseUrl: string
   bearer: string
   userId: string
-  soulId: string
   deviceSessionId: string
 }
 
 export interface SessionSnapshot {
   configured: boolean
+  connectionProfile: Omit<OpenAlmaProfile, "bearer"> | null
   mode: SessionMode
   connection: ConnectionState
   soulId: string

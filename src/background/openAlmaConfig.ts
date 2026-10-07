@@ -2,9 +2,9 @@ import manifest from "../../miniapp.json"
 import type {OpenAlmaProfile} from "../shared/types"
 
 export const OPENALMA_PROFILE_KEY = "openalma.connection-profile"
-export const OPENALMA_PROFILE_CLEARED_KEY = "openalma.connection-profile-cleared"
 
 export type OpenAlmaConfig = OpenAlmaProfile & {
+  soulId: string
   packageName: string
   version: string
 }
@@ -31,7 +31,7 @@ export function parseOpenAlmaProfile(value: unknown): OpenAlmaConfig {
     baseUrl,
     bearer: typeof raw.bearer === "string" ? raw.bearer.trim() : "",
     userId: required("userId", raw.userId),
-    soulId: typeof raw.soulId === "string" ? raw.soulId.trim() : "",
+    soulId: "",
     deviceSessionId,
     packageName: manifest.packageName,
     version: manifest.version,
@@ -39,6 +39,6 @@ export function parseOpenAlmaProfile(value: unknown): OpenAlmaConfig {
 }
 
 export function serializeOpenAlmaProfile(config: OpenAlmaConfig): string {
-  const {baseUrl, bearer, userId, soulId, deviceSessionId} = config
-  return JSON.stringify({baseUrl, bearer, userId, soulId, deviceSessionId})
+  const {baseUrl, bearer, userId, deviceSessionId} = config
+  return JSON.stringify({baseUrl, bearer, userId, deviceSessionId})
 }

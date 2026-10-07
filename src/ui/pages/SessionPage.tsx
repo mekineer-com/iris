@@ -83,7 +83,6 @@ type PendingPhoto = {file: File; imageId: string; previewUrl: string | null}
 export default function SessionPage() {
   const snapshot = useChannel("openalma:update")
   const profileRpc = useRpc<Channels, "openalma:set-profile">("openalma:set-profile")
-  const clearProfileRpc = useRpc<Channels, "openalma:clear-profile">("openalma:clear-profile")
   const startRpc = useRpc<Channels, "openalma:start">("openalma:start")
   const stopRpc = useRpc<Channels, "openalma:stop">("openalma:stop")
   const soulRpc = useRpc<Channels, "openalma:set-soul">("openalma:set-soul")
@@ -114,16 +113,22 @@ export default function SessionPage() {
   const [imageStatus, setImageStatus] = useState<string | null>(null)
   const [rpcError, setRpcError] = useState<string | null>(null)
   const [profilePending, setProfilePending] = useState(false)
-  const [identityConfirmed, setIdentityConfirmed] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [editingConnection, setEditingConnection] = useState(false)
   const [profile, setProfile] = useState<OpenAlmaProfile>({
     baseUrl: "",
     bearer: "",
     userId: "",
-    soulId: "",
     deviceSessionId: "",
   })
   const startOwner = useRef(0)
   const imageOwner = useRef(0)
+
+  useEffect(() => {
+    if (settingsOpen && !editingConnection) {
+      document.getElementById("iris-settings")?.scrollIntoView({block: "nearest"})
+    }
+  }, [settingsOpen, editingConnection])
 
   useEffect(() => () => {
     if (pendingPhoto?.previewUrl) URL.revokeObjectURL(pendingPhoto.previewUrl)
@@ -182,13 +187,10 @@ export default function SessionPage() {
     }
   }
 
-  const clearProfile = async () => {
+  const editConnection = () => {
+    if (snapshot?.connectionProfile) setProfile({...profile, ...snapshot.connectionProfile})
     setRpcError(null)
-    try {
-      await clearProfileRpc({})
-    } catch (error) {
-      setRpcError(error instanceof Error ? error.message : String(error))
-    }
+    setEditingConnection(true)
   }
 
   const submitSoul = async (): Promise<void> => {
@@ -349,7 +351,8 @@ export default function SessionPage() {
     setProfilePending(true)
     setRpcError(null)
     try {
-      await profileRpc({...profile, confirmIdentity: identityConfirmed})
+      await profileRpc(profile)
+      setEditingConnection(false)
     } catch (error) {
       setRpcError(error instanceof Error ? error.message : String(error))
     } finally {
@@ -374,25 +377,22 @@ export default function SessionPage() {
   const voiceReady = visible === "listening" || visible === "speaking"
 
   if (!snapshot) return <main><p className="status">Loading Iris...</p></main>
-  if (!snapshot.configured) {
-    const field = (name: keyof OpenAlmaProfile, label: string, type = "text") => (
-      <label>{label}<input type={type} value={profile[name]} disabled={profilePending}
+  if (!snapshot.configured || editingConnection) {
+    const field = (name: keyof OpenAlmaProfile, label: string, type = "text", readOnly = false) => (
+      <label>{label}<input type={type} value={profile[name]} disabled={profilePending} readOnly={readOnly}
         onChange={(event) => setProfile({...profile, [name]: event.target.value})} /></label>
     )
     return (
       <main>
-        <header><p className="eyebrow">OpenAlma voice</p><h1>Iris setup</h1></header>
+        <header><p className="eyebrow">OpenAlma voice</p><h1>{snapshot.configured ? "Edit Connection" : "Iris setup"}</h1></header>
         <section className="soul-control" aria-label="OpenAlma connection setup">
           {field("baseUrl", "OpenAlma address")}
-          {field("bearer", "Connection key", "password")}
-          {field("userId", "Your name")}
-          {field("soulId", "Soul name")}
-          {field("deviceSessionId", "Phone ID")}
-          <label><input type="checkbox" checked={identityConfirmed} disabled={profilePending}
-            onChange={(event) => setIdentityConfirmed(event.target.checked)} /> Confirm new owner and Soul spellings</label>
-          <button type="button" disabled={profilePending} onClick={() => void saveProfile()}>
+          {field("userId", "Your name", "text", true)}
+          {field("deviceSessionId", "Installation ID", "text", true)}
+          <button type="button" disabled={profilePending || soulLocked} onClick={() => void saveProfile()}>
             {profilePending ? "Connecting..." : "Save and connect"}
           </button>
+          {snapshot.configured ? <button type="button" disabled={profilePending} onClick={() => setEditingConnection(false)}>Back</button> : null}
           {snapshot.lastError ? <p role="alert">{snapshot.lastError}</p> : null}
           {rpcError ? <p role="alert">{rpcError}</p> : null}
         </section>
@@ -413,7 +413,7 @@ export default function SessionPage() {
       {snapshot?.memuAvailable === false ? (
         <p className="memu-status" role="status">
           <img src={memuIcon} alt="" />
-          <span>memU is unavailable. Start memU, or <button type="button" onClick={() => void clearProfile()}>change connection</button>.</span>
+          <span>memU is unavailable. Start memU, or <button type="button" onClick={editConnection}>Edit Connection</button>.</span>
         </p>
       ) : null}
       <section className="soul-control" aria-label="Soul selection">
@@ -477,33 +477,6 @@ export default function SessionPage() {
         ) : null}
         {soulLocked ? <p>Finish this sitting before changing souls.</p> : null}
       </section>
-      <section className="mode-control" aria-label="Speech mode">
-        <span>Speech mode</span>
-        <div className="mode-options">
-          <button type="button" aria-pressed={mode === "continuous"} disabled={modeDisabled}
-            onClick={() => void onMode("continuous")}>Continuous</button>
-          <button type="button" aria-pressed={mode === "manual"} disabled={modeDisabled}
-            onClick={() => void onMode("manual")}>Manual</button>
-        </div>
-      </section>
-      <label className="preview-control">
-        <input
-          type="checkbox"
-          checked={microphoneEnabled}
-          disabled={capabilitiesPending || stopping}
-          onChange={(event) => void onCapability("microphoneEnabled", event.target.checked)}
-        />
-        Microphone enabled
-      </label>
-      <label className="preview-control">
-        <input
-          type="checkbox"
-          checked={cameraEnabled}
-          disabled={capabilitiesPending || stopping}
-          onChange={(event) => void onCapability("cameraEnabled", event.target.checked)}
-        />
-        Camera enabled
-      </label>
       <section className="controls" aria-label="Voice controls">
         <button
           type="button"
@@ -544,18 +517,6 @@ export default function SessionPage() {
           </div>
         ) : null}
       </section>
-      <label className="preview-control">
-        <input type="checkbox" checked={previewImages} onChange={(event) => setPreviewImages(event.target.checked)} />
-        Preview before send
-      </label>
-      <label className="preview-control">
-        <input
-          type="checkbox"
-          checked={speakPhotoDescriptions}
-          onChange={(event) => setSpeakPhotoDescriptions(event.target.checked)}
-        />
-        Speak photo descriptions
-      </label>
       <div className="image-actions">
         <label className="image-picker">
           <span>Take photo</span>
@@ -612,6 +573,51 @@ export default function SessionPage() {
         <p>Provider tokens: {snapshot.usageTotalTokens.toLocaleString()}</p>
       ) : null}
       {rpcError ? <p role="alert">{rpcError}</p> : null}
+      <section id="iris-settings" aria-label="Iris settings" hidden={!settingsOpen}>
+        <h2>Settings</h2>
+      <section className="mode-control" aria-label="Speech mode">
+        <span>Speech mode</span>
+        <div className="mode-options">
+          <button type="button" aria-pressed={mode === "continuous"} disabled={modeDisabled}
+            onClick={() => void onMode("continuous")}>Continuous</button>
+          <button type="button" aria-pressed={mode === "manual"} disabled={modeDisabled}
+            onClick={() => void onMode("manual")}>Manual</button>
+        </div>
+      </section>
+      <label className="preview-control">
+        <input
+          type="checkbox"
+          checked={microphoneEnabled}
+          disabled={capabilitiesPending || stopping}
+          onChange={(event) => void onCapability("microphoneEnabled", event.target.checked)}
+        />
+        Microphone enabled
+      </label>
+      <label className="preview-control">
+        <input
+          type="checkbox"
+          checked={cameraEnabled}
+          disabled={capabilitiesPending || stopping}
+          onChange={(event) => void onCapability("cameraEnabled", event.target.checked)}
+        />
+        Camera enabled
+      </label>
+      <label className="preview-control">
+        <input type="checkbox" checked={previewImages} onChange={(event) => setPreviewImages(event.target.checked)} />
+        Preview before send
+      </label>
+      <label className="preview-control">
+        <input
+          type="checkbox"
+          checked={speakPhotoDescriptions}
+          onChange={(event) => setSpeakPhotoDescriptions(event.target.checked)}
+        />
+        Speak photo descriptions
+      </label>
+        <button type="button" onClick={editConnection}>Edit Connection</button>
+      </section>
+      <button type="button" className="settings-toggle" aria-label="Settings" aria-controls="iris-settings"
+        aria-expanded={settingsOpen} onClick={() => setSettingsOpen((open) => !open)}>&#9881;</button>
     </main>
   )
 }

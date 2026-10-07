@@ -312,58 +312,20 @@ describe("SessionController", () => {
     expect(requests).toBe(0)
 
     await session.handlers["openalma:set-profile"](CONFIG)
-    expect(lastSnapshot(session)).toMatchObject({configured: true, soulId: CONFIG.soulId, memuAvailable: true})
+    expect(lastSnapshot(session)).toMatchObject({configured: true, soulId: "", memuAvailable: true})
     expect(JSON.parse(session.stored.get("openalma.connection-profile") ?? "")).toEqual({
       baseUrl: CONFIG.baseUrl,
-      bearer: CONFIG.bearer,
+      bearer: "",
       userId: CONFIG.userId,
-      soulId: CONFIG.soulId,
       deviceSessionId: CONFIG.deviceSessionId,
     })
     expect(requests).toBe(1)
-    await session.handlers["openalma:clear-profile"]({})
-    expect(lastSnapshot(session)?.configured).toBe(false)
-    expect(session.stored.get("openalma.connection-profile-cleared")).toBe("1")
-    expect(session.stored.has("openalma.soul-id")).toBe(false)
-  })
-
-  test("protects profile state when Clear Profile storage partially fails", async () => {
-    const profileKey = "openalma.connection-profile"
-    const markerKey = "openalma.connection-profile-cleared"
-    const soulKey = "openalma.soul-id"
-    const readyFetch = withOwnerDiscovery((async () => Response.json({souls: [CONFIG.soulId]})) as typeof fetch)
-
-    const markerFailure = new FakeSession()
-    markerFailure.stored.set(profileKey, JSON.stringify(CONFIG))
-    markerFailure.stored.set(soulKey, CONFIG.soulId)
-    const set = markerFailure.storage.set
-    markerFailure.storage.set = async (key, value) => {
-      if (key === markerKey) throw new Error("marker failed")
-      await set(key, value)
-    }
-    new SessionController(markerFailure as never, {config: CONFIG, fetchFn: readyFetch}).start()
-    await new Promise((resolve) => setTimeout(resolve, 0))
-
-    await expect(markerFailure.handlers["openalma:clear-profile"]({})).rejects.toThrow("marker failed")
-    expect(markerFailure.stored.has(profileKey)).toBe(true)
-    expect(markerFailure.stored.has(soulKey)).toBe(true)
-    expect(lastSnapshot(markerFailure)?.configured).toBe(true)
-
-    const deleteFailure = new FakeSession()
-    deleteFailure.stored.set(profileKey, JSON.stringify(CONFIG))
-    deleteFailure.stored.set(soulKey, CONFIG.soulId)
-    const deleteKey = deleteFailure.storage.delete
-    deleteFailure.storage.delete = async (key) => {
-      if (key === profileKey) throw new Error("delete failed")
-      await deleteKey(key)
-    }
-    new SessionController(deleteFailure as never, {config: CONFIG, fetchFn: readyFetch}).start()
-    await new Promise((resolve) => setTimeout(resolve, 0))
-
-    await expect(deleteFailure.handlers["openalma:clear-profile"]({})).rejects.toThrow("delete failed")
-    expect(deleteFailure.stored.get(markerKey)).toBe("1")
-    expect(deleteFailure.stored.has(profileKey)).toBe(true)
-    expect(lastSnapshot(deleteFailure)?.configured).toBe(true)
+    await session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"})
+    expect(lastSnapshot(session)).toMatchObject({connectionProfile: {
+      baseUrl: "http://changed.example", userId: CONFIG.userId, deviceSessionId: CONFIG.deviceSessionId,
+    }})
+    await expect(session.handlers["openalma:set-profile"]({...CONFIG, deviceSessionId: "other-installation"}))
+      .rejects.toThrow("cannot change the owner or installation ID")
   })
 
   test("leaves missing owner setup to the launcher", async () => {
@@ -387,6 +349,24 @@ describe("SessionController", () => {
     await expect(session.handlers["openalma:set-profile"](CONFIG)).rejects.toThrow("owner in the launcher")
     expect(requests.map(({method}) => method)).toEqual(["GET"])
     expect(session.stored.has("openalma.connection-profile")).toBe(false)
+  })
+
+  test("connection Save keeps Start locked during discovery", async () => {
+    let entered!: () => void, finish!: () => void
+    const waiting = new Promise<void>((resolve) => {entered = resolve})
+    const release = new Promise<void>((resolve) => {finish = resolve})
+    const h = setup({fetchFn: (async (url) => {
+      if (String(url).startsWith("http://changed.example")) {entered(); await release}
+      return Response.json({souls: [CONFIG.soulId]})
+    }) as typeof fetch})
+    const saving = h.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"})
+    await waiting
+    await expect(h.session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow("Wait for settings")
+    finish()
+    await saving
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(h.configs[0].baseUrl).toBe("http://changed.example")
+    await h.session.handlers["openalma:stop"]({})
   })
 
   test("seeds download defaults once without choosing a Soul or overwriting settings", async () => {
@@ -437,9 +417,6 @@ describe("SessionController", () => {
       session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: false}),
     ).rejects.toThrow("Set up")
 
-    await session.handlers["openalma:clear-profile"]({})
-    expect(session.stored.has("openalma.connection-profile")).toBe(false)
-    expect(session.stored.has("openalma.soul-id")).toBe(false)
   })
 
   test("direct Start waits for discovery and never starts an unavailable saved soul", async () => {
@@ -489,7 +466,7 @@ describe("SessionController", () => {
       : selecting) as typeof fetch})
     const selection = h.session.handlers["openalma:set-soul"]({soulId: "Next Soul", useExisting: false})
     await new Promise((resolve) => setTimeout(resolve, 0))
-    await expect(h.session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow("selection to finish")
+    await expect(h.session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow("settings to finish")
     await expect(h.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: false})).rejects.toThrow("Finish or recover")
     release(new Response(JSON.stringify({soul_id: "Next Soul", created: true})))
     await selection
@@ -583,6 +560,17 @@ describe("SessionController", () => {
       "Select or create this soul",
     )
     expect(lastSnapshot(harness.session).soulConfirmed).toBe(false)
+    const journal = JSON.stringify({version: 1,
+      scope: {userId: CONFIG.userId, soulId: "Recovery Soul", deviceSessionId: CONFIG.deviceSessionId},
+      resumption: {handle: "fictional-handle", updatedAt: Date.now()},
+    })
+    const locked = setup({stored: {"openalma:gemini-session-v1": journal},
+      fetchFn: (async () => new Response("unavailable", {status: 503})) as typeof fetch})
+    await expect(locked.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true}))
+      .rejects.toThrow("Finish or recover")
+    expect(lastSnapshot(locked.session)).toMatchObject({soulId: "Recovery Soul", soulLocked: true, memuAvailable: false})
+    await expect(locked.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"}))
+      .rejects.toThrow("Stop or recover")
   })
 
   test("keeps a recovered journal soul locked and binds each new sitting to its selected soul", async () => {
@@ -601,6 +589,8 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:set-soul"]({soulId: "First Soul", useExisting: false})
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     await harness.session.handlers["openalma:stop"]({})
+    await harness.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"})
+    expect(lastSnapshot(harness.session)?.soulId).toBe("First Soul")
     await harness.session.handlers["openalma:set-soul"]({soulId: "Second Soul", useExisting: false})
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     expect(harness.configs.map((config) => config.soulId)).toEqual(["First Soul", "Second Soul"])
@@ -907,6 +897,8 @@ describe("SessionController", () => {
     harness.session.onOpenCb?.()
     expect(harness.session.snapshots[0]).toEqual({
       configured: true,
+      connectionProfile: {baseUrl: CONFIG.baseUrl,
+        userId: CONFIG.userId, deviceSessionId: CONFIG.deviceSessionId},
       mode: "continuous",
       connection: "idle",
       soulId: "Test Soul",

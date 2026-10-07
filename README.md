@@ -33,9 +33,10 @@ collisions remain errors. Start waits for local preferences and discovery.
 A saved name missing from discovery requires explicit selection or creation.
 Selection stays locked during a sitting and while its Gemini journal remains;
 Start recovers that journal's original soul, then Stop completes finalization.
-An explicitly cleared profile is remembered: installer/updates will not reseed
-an identity the user chose to remove, and Clear Profile failures surface
-through the existing error UI.
+The bottom gear opens existing settings. **Edit Connection** preserves the
+installation identity and selected Soul; its Save is locked during a sitting or
+pending recovery. The owner and installation ID are read-only. There is no
+Clear Connection/reset path.
 
 While a sitting is active, **Take photo** and **Choose image** durably store a non-empty JPEG/PNG before sending it to Gemini. Immediate send is the default; optional preview provides Send/Retake. Files over 1 MB pause for a cost/latency warning that can be permanently dismissed. Gemini's spoken description is saved as the image caption only after its transcript is acknowledged.
 

@@ -15,7 +15,6 @@ import {GeminiLiveController, JOURNAL_KEY, journalSoulId} from "./GeminiLiveCont
 import type {GeminiCallbacks} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {
-  OPENALMA_PROFILE_CLEARED_KEY,
   OPENALMA_PROFILE_KEY,
   parseOpenAlmaProfile,
   serializeOpenAlmaProfile,
@@ -142,40 +141,30 @@ export class SessionController {
     this.unsubs.push(
       ui.handle("openalma:set-profile", async (payload) => {
         await this.preferencesLoaded
-        if (ACTIVE.has(this.connection) || this.connection === "stopping") {
-          throw new Error("Stop Iris before changing its connection")
+        if (this.soulLocked()) {
+          throw new Error("Stop or recover this sitting before changing its connection")
         }
-        const identity = await this.resolveProfileIdentity(parseOpenAlmaProfile(payload))
-        const config = identity.config
-        await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(config))
-        await this.session.storage.delete(OPENALMA_PROFILE_CLEARED_KEY)
-        this.config = config
-        this.soulId = config.soulId
-        this.soulLoading = true
-        this.memuAvailable = null
-        this.lastError = null
-        this.preferencesLoaded = this.loadPreferences(identity)
-        await this.preferencesLoaded
-        return {ok: true as const}
-      }),
-    )
-    this.unsubs.push(
-      ui.handle("openalma:clear-profile", async () => {
-        await this.preferencesLoaded
-        if (this.soulLocked()) throw new Error("Stop or recover this sitting before changing its connection")
-        await this.session.storage.set(OPENALMA_PROFILE_CLEARED_KEY, "1")
-        await Promise.all([
-          this.session.storage.delete(OPENALMA_PROFILE_KEY),
-          this.session.storage.delete(SOUL_ID_KEY),
-        ])
-        this.config = undefined
-        this.soulId = ""
-        this.souls = []
-        this.soulConfirmed = false
-        this.memuAvailable = null
-        this.lastError = null
+        const submitted = parseOpenAlmaProfile({...payload as OpenAlmaConfig, bearer: this.config?.bearer})
+        if (this.config && (submitted.deviceSessionId !== this.config.deviceSessionId || submitted.userId !== this.config.userId)) {
+          throw new Error("Connection edits cannot change the owner or installation ID")
+        }
+        this.soulSelecting = true
         this.pushSnapshot()
-        return {ok: true as const}
+        try {
+          const identity = await this.resolveProfileIdentity(submitted)
+          const config = identity.config
+          await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(config))
+          this.config = config
+          this.soulLoading = true
+          this.memuAvailable = null
+          this.lastError = null
+          this.preferencesLoaded = this.loadPreferences(identity)
+          await this.preferencesLoaded
+          return {ok: true as const}
+        } finally {
+          this.soulSelecting = false
+          this.pushSnapshot()
+        }
       }),
     )
     this.unsubs.push(
@@ -372,6 +361,8 @@ export class SessionController {
   private snapshot(): SessionSnapshot {
     return {
       configured: Boolean(this.config),
+      connectionProfile: this.config ? {baseUrl: this.config.baseUrl,
+        userId: this.config.userId, deviceSessionId: this.config.deviceSessionId} : null,
       mode: this.mode,
       connection: this.connection,
       soulId: this.soulId,
@@ -395,7 +386,7 @@ export class SessionController {
   }
 
   private async startSession(mode: SessionMode): Promise<void> {
-    if (this.soulSelecting) throw new Error("Wait for soul selection to finish")
+    if (this.soulSelecting) throw new Error("Wait for settings to finish")
     if (this.startInFlight || ACTIVE.has(this.connection) || this.connection === "stopping") {
       return
     }
@@ -864,15 +855,15 @@ export class SessionController {
         return
       }
       if (!this.config) this.config = parseOpenAlmaProfile(storedProfile)
-      const identity = resolvedIdentity ?? await this.resolveProfileIdentity(this.currentConfig())
-      const config = identity.config
-      this.config = config
+      const config = this.currentConfig()
       storedSoul = savedSoul
       this.microphoneEnabled = microphone !== "0"
       this.cameraEnabled = camera !== "0"
       this.soulId = storedSoul?.trim() || config.soulId
       this.recoverySoulId = journalSoulId(journal, config)
       if (this.recoverySoulId) this.soulId = this.recoverySoulId
+      const identity = resolvedIdentity ?? await this.resolveProfileIdentity(config)
+      this.config = identity.config
       this.souls = identity.souls
       this.memuAvailable = true
     } catch (error) {
