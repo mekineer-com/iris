@@ -14,7 +14,7 @@ in `mentra-os/.git/info/exclude`.
 
 The OpenAlma Mentra fork already commits `!miniapps/openalma` in its workspace list. An unmodified upstream MentraOS checkout may need that exclusion locally; do not send it upstream. Otherwise `bun install` here rewrites MentraOS `bun.lock` and links the in-tree SDK instead of the MiniApp's pinned npm dependency.
 
-The MiniApp connects OpenAlma's authenticated Mentra bootstrap to Gemini Live native audio and sitting-scoped durable transcripts. Continuous mode uses provider VAD. Manual mode records one memory-only take, then waits for `Send` or `Redo`; `Done` never sends by itself. Persistent Iris-local switches independently mute microphone capture or disable camera actions without ending the sitting. Temporary transcript-sync failure remains visible and retries without ending voice; a provider turn missing usable transcript text records a non-conversational gap marker before failing loud. Graceful Stop may play and persist one short first-person reflection after two completed user turns.
+The MiniApp connects OpenAlma's private-network Mentra bootstrap to Gemini Live native audio and sitting-scoped durable transcripts. Continuous mode uses provider VAD. Manual mode records one memory-only take, then waits for `Send` or `Redo`; `Done` never sends by itself. Persistent Iris-local switches independently mute microphone capture or disable camera actions without ending the sitting. Temporary transcript-sync failure remains visible and retries without ending voice; a provider turn missing usable transcript text records a non-conversational gap marker before failing loud. Graceful Stop may play and persist one short first-person reflection after two completed user turns.
 
 Before changing the Gemini wire or diagnosing provider behavior, read
 [`GEMINI_LIVE.md`](GEMINI_LIVE.md). It pins Iris's model-specific contract,
@@ -23,10 +23,10 @@ official sources, proven behavior, and local redacted fixtures.
 Iris stores its OpenAlma connection profile and selected soul in phone-local
 `session.storage`. With no profile it asks you to install Iris from the launcher
 and makes no OpenAlma or Gemini request. Discovery checks the one shared OpenAlma
-owner through the bearer-authenticated `/integration/mentra/owner` contract; a
+owner through the private-network `/integration/mentra/owner` contract; a
 saved profile whose user does not match that owner is kept for address repair,
 but Soul selection and Start refuse the mismatched owner.
-Existing soul suggestions come from authenticated
+Existing soul suggestions come from
 `GET /integration/mentra/souls?user_id=...`. Selection or creation uses `POST`
 on the same route with `user_id`, `soul_id`, and `use_existing`. Only a 409
 with `detail.reason: existing_exact` offers consent to reuse; sanitized-name
@@ -44,7 +44,9 @@ While a sitting is active, **Take photo** and **Choose image** durably store a n
 
 The MiniApp ZIP is generic and contains no endpoint, credential, user, soul, or
 phone identity. `.env.local` is used only by the private release wrapper for its
-WireGuard bind and installation-completion poll; it is never compiled into Iris.
+explicit address bind and installation-completion poll; it is never compiled into Iris.
+Use a trusted private VPN/connection: devices allowed to reach this endpoint can
+access the Soul's Iris data; trust the permitted devices and network access rules.
 
 A failed Memorize or consolidation pauses new activity for that Soul. Start
 reports launcher recovery; an active sitting learns the pause on its existing

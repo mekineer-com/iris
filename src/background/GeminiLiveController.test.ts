@@ -6,7 +6,6 @@ import {PHOTO_RETRY_MESSAGE} from "../shared/types"
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://127.0.0.1:9999",
-  bearer: "fictional-bearer",
   userId: "Test User",
   soulId: "Test Soul",
   deviceSessionId: "test-phone",
@@ -1032,7 +1031,7 @@ describe("GeminiLiveController", () => {
         device_session_id: "test-phone",
         mode: "continuous",
       },
-      authorization: "Bearer fictional-bearer",
+      authorization: null,
     })
     h.controller.sendAudio("AAAA")
     expect(JSON.parse(h.sockets[0].sent[1])).toEqual({
@@ -1040,6 +1039,8 @@ describe("GeminiLiveController", () => {
     })
     await h.controller.stop()
     expect(h.requests.filter((request) => request.url.endsWith("/sitting-1/end"))).toHaveLength(1)
+    expect(h.requests.every((request) => request.authorization === null)).toBe(true)
+    expect(new URL(h.socketUrls[0]).searchParams.get("access_token")).toBe("ephemeral/test")
   })
 
   test("sends one buffered Manual activity in order", async () => {
@@ -1185,7 +1186,7 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/recall")))
     const recall = h.requests.find((request) => request.url.endsWith("/recall"))!
     expect(recall.body).toEqual({user_id: "Test User", soul_id: "Test Soul", query: "beacon"})
-    expect(recall.authorization).toBe("Bearer fictional-bearer")
+    expect(recall.authorization).toBeNull()
 
     h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
     expect(h.audio).toEqual(["AAAAAA==", "AAAAAA=="])

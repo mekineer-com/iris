@@ -5,7 +5,6 @@ import type {OpenAlmaConfig} from "./openAlmaConfig"
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://10.77.0.1",
-  bearer: "fictional",
   userId: "Test User",
   soulId: "Test Soul",
   deviceSessionId: "test-phone",
@@ -38,6 +37,7 @@ describe("installation report", () => {
 
     expect(requests).toHaveLength(2)
     expect(requests[1].url).toBe("http://10.77.0.1/integration/mentra/installation/seen")
+    expect(requests[1].init?.headers).toEqual({"Content-Type": "application/json"})
     expect(JSON.parse(String(requests[1].init?.body))).toEqual({
       user_id: "Test User",
       soul_id: "Test Soul",

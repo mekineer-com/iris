@@ -142,7 +142,7 @@ export class SessionController {
         if (this.connectionLocked()) {
           throw new Error("Wait for settings or stop this sitting before changing its connection")
         }
-        const submitted = parseOpenAlmaProfile({...payload as OpenAlmaConfig, bearer: this.config?.bearer})
+        const submitted = parseOpenAlmaProfile(payload)
         if (this.config && (submitted.deviceSessionId !== this.config.deviceSessionId || submitted.userId !== this.config.userId)) {
           throw new Error("Connection edits cannot change the owner or installation ID")
         }
@@ -198,7 +198,7 @@ export class SessionController {
           const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
             method: "POST",
             signal: timeoutSignal(10_000),
-            headers: {Authorization: `Bearer ${config.bearer}`, "Content-Type": "application/json"},
+            headers: {"Content-Type": "application/json"},
             body: JSON.stringify({soul_id: soulId, use_existing: value.useExisting}),
           })
           if (response.status === 409) {
@@ -900,9 +900,7 @@ export class SessionController {
   private async resolveProfileIdentity(
     config: OpenAlmaConfig,
   ): Promise<{config: OpenAlmaConfig; souls: string[]}> {
-    const headers = {Authorization: `Bearer ${config.bearer}`}
     const ownerResponse = await this.fetchFn(`${config.baseUrl}/integration/mentra/owner`, {
-      headers,
       signal: timeoutSignal(10_000),
     })
     if (!ownerResponse.ok) throw new Error(`Owner discovery failed (${ownerResponse.status})`)
@@ -917,7 +915,6 @@ export class SessionController {
       throw new Error(`Connection user does not match OpenAlma owner "${userId}"`)
     }
     const soulsResponse = await this.fetchFn(`${config.baseUrl}/integration/mentra/souls`, {
-      headers,
       signal: timeoutSignal(10_000),
     })
     if (!soulsResponse.ok) throw new Error(`Soul discovery failed (${soulsResponse.status})`)

@@ -1652,7 +1652,6 @@ export class GeminiLiveController {
     return this.fetchFn(`${this.config.baseUrl}${path}`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${this.config.bearer}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),

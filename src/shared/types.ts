@@ -7,14 +7,13 @@ export const PHOTO_RETRY_MESSAGE = "Photo processing is unfinished. Retry or dis
 
 export type OpenAlmaProfile = {
   baseUrl: string
-  bearer: string
   userId: string
   deviceSessionId: string
 }
 
 export interface SessionSnapshot {
   configured: boolean
-  connectionProfile: Omit<OpenAlmaProfile, "bearer"> | null
+  connectionProfile: OpenAlmaProfile | null
   mode: SessionMode
   connection: ConnectionState
   soulId: string

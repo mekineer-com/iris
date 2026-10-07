@@ -13,7 +13,7 @@ import {
 } from "./release-private.mjs"
 
 describe("private release URI", () => {
-  test("binds the CLI directly to the fixed WireGuard address and port", () => {
+  test("binds the CLI directly to the configured address and fixed port", () => {
     const uri =
       "miniapp://release?url=http%3A%2F%2F10.77.0.1%3A6789&package=com.openalma.mentra&version=0.1.0&name=OpenAlma%20Iris"
     const release = new URL(findReleaseUri(`before\n${uri}\nafter`))
@@ -27,23 +27,27 @@ describe("private release URI", () => {
     expect(release.searchParams.get("version")).toBe("0.1.0")
   })
 
-  test("rejects a non-WireGuard listener or missing build setting", () => {
+  test("accepts configured addresses without an interface or connection key and validates settings", () => {
     const env = {
       MENTRA_PUBLIC_OPENALMA_BASE_URL: "http://10.77.0.1",
-      MENTRA_PUBLIC_OPENALMA_BEARER: "fictional",
       MENTRA_PUBLIC_OPENALMA_USER_ID: "Test User",
       MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID: "test-phone",
       MENTRA_RELEASE_HOST_PACKAGE: "com.mentra.mentra",
     }
-    const interfaces = {rdp: [{family: "IPv4", address: "10.77.0.1"}]}
-
-    expect(() => assertPrivateReleaseConfig("10.77.0.1", env, interfaces, ["rdp"])).not.toThrow()
-    expect(() => assertPrivateReleaseConfig("161.132.51.34", env, interfaces, ["rdp"])).toThrow(
-      "not a local WireGuard address",
+    for (const host of ["10.77.0.1", "100.64.0.2", "iris.example", "192.0.2.1", "[fd00::1]"]) {
+      expect(assertPrivateReleaseConfig({...env, MENTRA_PUBLIC_OPENALMA_BASE_URL: `http://${host}:8099`})).toBe(host)
+      expect(releaseArgs(host).slice(0, 5)).toEqual(["release", "--host", host, "--port", "6789"])
+    }
+    expect(() => assertPrivateReleaseConfig({...env, MENTRA_PUBLIC_OPENALMA_USER_ID: ""})).toThrow(
+      "MENTRA_PUBLIC_OPENALMA_USER_ID",
     )
-    expect(() => assertPrivateReleaseConfig("10.77.0.1", {...env, MENTRA_PUBLIC_OPENALMA_BEARER: ""}, interfaces, ["rdp"])).toThrow(
-      "MENTRA_PUBLIC_OPENALMA_BEARER",
+    expect(() => assertPrivateReleaseConfig({...env, MENTRA_RELEASE_HOST_PACKAGE: "unknown"})).toThrow(
+      "Unknown Mentra app installation",
     )
+    for (const baseUrl of ["invalid", "ftp://iris.example", "http://user@iris.example", "http://iris.example?q=1",
+      "http://iris.example#fragment", "http://iris.example:65536", "http://iris.example:bad"]) {
+      expect(() => assertPrivateReleaseConfig({...env, MENTRA_PUBLIC_OPENALMA_BASE_URL: baseUrl})).toThrow()
+    }
     expect(JSON.parse(releaseProfile(env))).toEqual({
       baseUrl: "http://10.77.0.1",
       userId: "Test User",

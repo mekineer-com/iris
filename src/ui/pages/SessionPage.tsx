@@ -117,7 +117,6 @@ export default function SessionPage() {
   const [editingConnection, setEditingConnection] = useState(false)
   const [profile, setProfile] = useState<OpenAlmaProfile>({
     baseUrl: "",
-    bearer: "",
     userId: "",
     deviceSessionId: "",
   })

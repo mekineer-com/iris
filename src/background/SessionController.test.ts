@@ -8,7 +8,6 @@ import type {SessionSnapshot as Snapshot} from "../shared/types"
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://127.0.0.1:9999",
-  bearer: "fictional",
   userId: "Test User",
   soulId: "Test Soul",
   deviceSessionId: "test-phone",
@@ -297,7 +296,6 @@ describe("SessionController", () => {
     expect(lastSnapshot(session)).toMatchObject({configured: true, soulId: "", memuAvailable: true})
     expect(JSON.parse(session.stored.get("openalma.connection-profile") ?? "")).toEqual({
       baseUrl: CONFIG.baseUrl,
-      bearer: "",
       userId: CONFIG.userId,
       deviceSessionId: CONFIG.deviceSessionId,
     })
@@ -509,7 +507,7 @@ describe("SessionController", () => {
     expect(lastSnapshot(h.session)).toMatchObject({soulId: "Next Soul", soulLocked: false})
   })
 
-  test("discovers, explicitly reuses, and persists a soul without exposing the bearer to UI", async () => {
+  test("discovers, explicitly reuses, and persists a soul over the keyless connection", async () => {
     const requests: Array<{url: string; init?: RequestInit}> = []
     const harness = setup({
       fetchFn: (async (url: string, init?: RequestInit) => {
@@ -538,14 +536,13 @@ describe("SessionController", () => {
 
     expect(requests[0]).toEqual({
       url: "http://127.0.0.1:9999/integration/mentra/souls",
-      init: {headers: {Authorization: "Bearer fictional"}, signal: expect.any(AbortSignal)},
+      init: {signal: expect.any(AbortSignal)},
     })
     expect(JSON.parse(String(requests.at(-1)?.init?.body))).toEqual({
       soul_id: "Existing Soul",
       use_existing: true,
     })
     expect(requests.at(-1)?.init?.headers).toEqual({
-      Authorization: "Bearer fictional",
       "Content-Type": "application/json",
     })
     expect(harness.session.stored.get("openalma.soul-id")).toBe("Existing Soul")
@@ -620,11 +617,11 @@ describe("SessionController", () => {
       .rejects.toThrow("Finish or recover")
     expect(lastSnapshot(locked.session)).toMatchObject({soulId: "Recovery Soul", soulLocked: true, connectionLocked: false, memuAvailable: false,
       microphoneEnabled: false, cameraEnabled: false})
-    await locked.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example", bearer: "replacement"})
+    await locked.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"})
     expect(lastSnapshot(locked.session)).toMatchObject({soulId: "Recovery Soul", soulLocked: true,
       connectionLocked: false, memuAvailable: true, microphoneEnabled: false, cameraEnabled: false})
     expect(JSON.parse(locked.session.stored.get("openalma.connection-profile")!)).toEqual({
-      baseUrl: "http://changed.example", bearer: CONFIG.bearer, userId: CONFIG.userId,
+      baseUrl: "http://changed.example", userId: CONFIG.userId,
       deviceSessionId: CONFIG.deviceSessionId,
     })
     expect(locked.session.stored.get("openalma.soul-id")).toBe(CONFIG.soulId)

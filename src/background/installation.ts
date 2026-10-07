@@ -24,7 +24,6 @@ export async function reportInstallation(
     method: "POST",
     signal: timeoutSignal(10_000),
     headers: {
-      Authorization: `Bearer ${config.bearer}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({

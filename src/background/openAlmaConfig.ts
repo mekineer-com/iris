@@ -29,7 +29,6 @@ export function parseOpenAlmaProfile(value: unknown): OpenAlmaConfig {
   }
   return {
     baseUrl,
-    bearer: typeof raw.bearer === "string" ? raw.bearer.trim() : "",
     userId: required("userId", raw.userId),
     soulId: "",
     deviceSessionId,
@@ -39,6 +38,6 @@ export function parseOpenAlmaProfile(value: unknown): OpenAlmaConfig {
 }
 
 export function serializeOpenAlmaProfile(config: OpenAlmaConfig): string {
-  const {baseUrl, bearer, userId, deviceSessionId} = config
-  return JSON.stringify({baseUrl, bearer, userId, deviceSessionId})
+  const {baseUrl, userId, deviceSessionId} = config
+  return JSON.stringify({baseUrl, userId, deviceSessionId})
 }
