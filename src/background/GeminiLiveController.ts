@@ -1205,6 +1205,7 @@ export class GeminiLiveController {
         soul_id: this.config.soulId,
         image_id: pending.imageId,
         caption: pending.caption,
+        caption_event_id: `${pending.sessionId}:${pending.assistantSequence}`,
       })
     } catch {
       await this.requestPhotoRetry(pending)
@@ -1350,6 +1351,11 @@ export class GeminiLiveController {
         await this.persistJournal()
         throw new Error("Local transcript backup has a sequence gap")
       }
+    }
+    if (this.pendingImage?.caption && this.pendingEvents.some(
+      (event) => event.event_id === `${this.pendingImage!.sessionId}:${this.pendingImage!.assistantSequence}`,
+    )) {
+      this.pendingImage.sessionId = this.sessionId
     }
     this.pendingEvents = this.pendingEvents.map((event) => ({
       ...event,

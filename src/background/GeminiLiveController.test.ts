@@ -80,6 +80,7 @@ class FakeStorage {
 
 function harness(
   options: {
+    config?: OpenAlmaConfig
     heartbeatMs?: number
     setupTimeoutMs?: number
     heartbeatStatus?: number
@@ -94,6 +95,8 @@ function harness(
     leaseSeconds?: number
     appendStatuses?: number[]
     appendGates?: Promise<void>[]
+    appendAckLost?: boolean
+    history?: Array<{event_id: string; role: string; event_kind: string; content: string}>
     snapshotStatus?: number
     snapshotGate?: Promise<void>
     replayGates?: Promise<void>[]
@@ -115,6 +118,7 @@ function harness(
   const errors: string[] = []
   const persistenceErrors: Array<string | null> = []
   const photoRetryChanges: boolean[] = []
+  const finalizations: Array<{ok: boolean; queued: boolean; discarded?: boolean}> = []
   const reconnecting: boolean[] = []
   const usage: number[] = []
   let durationWarnings = 0
@@ -172,12 +176,24 @@ function harness(
     }
     if (url.endsWith("/transcripts/append")) {
       await appendGates.shift()
+      const status = appendStatuses.shift() ?? 200
+      if (status === 200) {
+        options.history?.push(...body.events)
+        if (options.appendAckLost) throw new Error("fictional lost append acknowledgement")
+      }
       return Response.json(
         {ok: true, ack_sequence: body.events.at(-1)?.sequence ?? 0},
-        {status: appendStatuses.shift() ?? 200},
+        {status},
       )
     }
     if (url.endsWith("/snapshot/finalize")) {
+      if (options.history) {
+        const saved = options.history.some((event) => event.event_id === body.caption_event_id &&
+          event.role === "assistant" && event.event_kind === "transcript" && event.content === body.caption)
+        const result = saved ? {ok: true, queued: true} : {ok: true, queued: false, discarded: true}
+        finalizations.push(result)
+        return Response.json(result)
+      }
       return Response.json({ok: true}, {status: finalizeStatuses.shift() ?? 200})
     }
     if (url.endsWith("/snapshot/replay")) {
@@ -198,7 +214,7 @@ function harness(
     return Response.json({ok: true})
   }
   const controller = new GeminiLiveController(
-    CONFIG,
+    options.config ?? CONFIG,
     {
       onAudio: (data) => audio.push(data),
       onTurnComplete: (finalResponse) => events.push(finalResponse ? "turnComplete" : "toolBoundary"),
@@ -235,6 +251,7 @@ function harness(
     errors,
     persistenceErrors,
     photoRetryChanges,
+    finalizations,
     finalizeStatuses,
     reconnecting,
     usage,
@@ -334,8 +351,78 @@ describe("GeminiLiveController", () => {
       soul_id: "Test Soul",
       image_id: "image-1",
       caption: "A fictional blue square.",
+      caption_event_id: "sitting-1:42",
     })
     await h.controller.stop()
+  })
+
+  test("photo journal distinguishes discarded captions, lost ACKs and queued caption rekeys", async () => {
+    for (const recovery of ["discarded", "lost-ack", "rekey"] as const) {
+      const storage = new FakeStorage()
+      const history: NonNullable<Parameters<typeof harness>[0]>["history"] = []
+      const h = harness({
+        storage,
+        history,
+        appendStatuses: recovery === "lost-ack" ? [] : Array(100).fill(503),
+        appendAckLost: recovery === "lost-ack",
+      })
+      await start(h)
+      await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+      h.sockets[0].message({serverContent: {
+        outputTranscription: {text: "A fictional blue square."}, turnComplete: true,
+      }})
+      await h.controller.stop()
+      const journal = JSON.parse(storage.values.get("openalma:gemini-session-v1")!)
+      expect(journal.pendingImage.assistantSequence).toBe(42)
+      expect(journal.pendingImage.sessionId).toBe("sitting-1")
+      expect(journal.pendingTranscripts.some((event: any) => event.event_id === "sitting-1:42")).toBe(true)
+      expect(h.finalizations).toEqual([])
+
+      const replacementStart = {
+        session_id: "replacement-sitting",
+        next_transcript_sequence: recovery === "rekey" ? 41 : 45,
+        ephemeral_token: "ephemeral/test",
+        websocket: {
+          api_version: "v1alpha", method: "BidiGenerateContentConstrained",
+          input_audio_rate_hz: 16000, output_audio_rate_hz: 24000,
+        },
+        lease_seconds: 90,
+        session_warning_seconds: 0,
+      }
+      if (recovery !== "rekey") {
+        const otherPhone = harness({
+          config: {...CONFIG, deviceSessionId: "other-test-phone"},
+          history,
+          startBody: {...replacementStart, session_id: "other-phone-sitting",
+            next_transcript_sequence: recovery === "lost-ack" ? 43 : 41},
+        })
+        await start(otherPhone)
+        if (recovery === "discarded") completeTurn(otherPhone, "First fictional question", "First fictional answer")
+        completeTurn(otherPhone, "Another fictional question", "Another fictional answer")
+        await otherPhone.controller.stop()
+        expect(history.some((event) => event.event_id === "other-phone-sitting:44")).toBe(true)
+      }
+      const recovered = harness({storage, history, startBody: replacementStart})
+      await start(recovered)
+      await waitFor(() => recovered.finalizations.length === 1 &&
+        !storage.values.has("openalma:gemini-session-v1"))
+      const finalize = recovered.requests.find((request) => request.url.endsWith("/snapshot/finalize"))!
+      expect(finalize.url).toContain("/session/replacement-sitting/")
+      expect(finalize.body.caption_event_id).toBe(
+        recovery === "rekey" ? "replacement-sitting:42" : "sitting-1:42",
+      )
+      expect(recovered.finalizations).toEqual([
+        recovery === "discarded" ? {ok: true, queued: false, discarded: true} : {ok: true, queued: true},
+      ])
+      expect(recovered.requests.filter((request) => request.url.endsWith("/transcripts/append")))
+        .toHaveLength(recovery === "rekey" ? 1 : 0)
+      expect(recovered.requests.some((request) => request.url.endsWith("/snapshot/replay"))).toBe(false)
+      expect(recovered.photoRetryChanges.at(-1)).toBe(false)
+      expect(recovered.persistenceErrors.at(-1)).toBeNull()
+      expect(recovered.errors).toEqual([])
+      await recovered.controller.stop()
+      expect(recovered.finalizations).toHaveLength(1)
+    }
   })
 
   test("mutes photo descriptions by default and allows explicit playback", async () => {
