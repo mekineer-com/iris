@@ -98,11 +98,13 @@ function harness(
     history?: Array<{event_id: string; role: string; event_kind: string; content: string}>
     snapshotStatus?: number
     snapshotGate?: Promise<void>
+    snapshotResponse?: Response
     replayGates?: Promise<void>[]
     replayResponses?: Response[]
     replayStatuses?: number[]
     replayBodies?: unknown[]
     finalizeStatuses?: number[]
+    finalizeGates?: Promise<void>[]
     recallGate?: Promise<void>
     recallStatus?: number
     recallBody?: unknown
@@ -127,6 +129,7 @@ function harness(
   const startResults = [...(options.startResults ?? [])]
   const tokenStatuses = [...(options.tokenStatuses ?? [])]
   const finalizeStatuses = [...(options.finalizeStatuses ?? [])]
+  const finalizeGates = [...(options.finalizeGates ?? [])]
   const replayGates = [...(options.replayGates ?? [])]
   const replayResponses = [...(options.replayResponses ?? [])]
   const replayStatuses = [...(options.replayStatuses ?? [])]
@@ -188,6 +191,7 @@ function harness(
       )
     }
     if (url.endsWith("/snapshot/finalize")) {
+      if (finalizeGates.length) await finalizeGates.shift()
       if (options.history) {
         const saved = options.history.some((event) => event.event_id === body.caption_event_id &&
           event.role === "assistant" && event.event_kind === "transcript" && event.content === body.caption)
@@ -207,6 +211,7 @@ function harness(
     }
     if (url.endsWith("/snapshot")) {
       if (options.snapshotGate) await options.snapshotGate
+      if (options.snapshotResponse) return options.snapshotResponse
       const extension = body.mime_type === "image/jpeg" ? "jpg" : "png"
       return Response.json(
         {ok: true, media_ref: `mentra_media/test-phone/${body.image_id}.${extension}`},
@@ -255,6 +260,7 @@ function harness(
     photoRetryChanges,
     finalizations,
     finalizeStatuses,
+    finalizeGates,
     reconnecting,
     usage,
     get durationWarnings() {
@@ -611,6 +617,53 @@ describe("GeminiLiveController", () => {
     }
   })
 
+  test("Stop during snapshot body read cannot alter replacement recovery", async () => {
+    const storage = new FakeStorage()
+    let finishBody!: () => void
+    const bodyGate = new Promise<void>((resolve) => { finishBody = resolve })
+    const response = Response.json({ok: true, media_ref: "mentra_media/test-phone/image-1.png"})
+    let readingBody = false
+    spyOn(response, "json").mockImplementation(async () => {
+      readingBody = true
+      await bodyGate
+      return {ok: true, media_ref: "mentra_media/test-phone/image-1.png"}
+    })
+    const old = harness({storage, snapshotResponse: response})
+    await start(old)
+    const sending = old.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    await waitFor(() => readingBody)
+    await old.controller.stop()
+
+    const replacement = harness({storage, appendStatuses: Array(100).fill(503), startBody: {
+      session_id: "replacement-sitting", next_transcript_sequence: 41, ephemeral_token: "ephemeral/test",
+      websocket: {api_version: "v1alpha", method: "BidiGenerateContentConstrained",
+        input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
+      lease_seconds: 90, session_warning_seconds: 0,
+    }})
+    await start(replacement)
+    await replacement.controller.sendImage({imageId: "replacement-photo", mimeType: "image/png", data: "AQID"})
+    completeTurn(replacement, "A fictional replacement question.", "A fictional replacement caption.")
+    await waitFor(() => replacement.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
+    const journal = storage.values.get("openalma:gemini-session-v1")!
+    expect(JSON.parse(journal).pendingImage.imageId).toBe("replacement-photo")
+    expect(JSON.parse(journal).pendingTranscripts).toHaveLength(3)
+    const callbacks = [old.photoRetryChanges.length, old.persistenceErrors.length, old.errors.length]
+    const replacementCallbacks = [replacement.photoRetryChanges.length, replacement.persistenceErrors.length,
+      replacement.errors.length]
+    const requests = old.requests.length
+
+    finishBody()
+    await expect(sending).rejects.toThrow("Photo send cancelled")
+
+    expect(storage.values.get("openalma:gemini-session-v1")).toBe(journal)
+    expect([old.photoRetryChanges.length, old.persistenceErrors.length, old.errors.length]).toEqual(callbacks)
+    expect([replacement.photoRetryChanges.length, replacement.persistenceErrors.length,
+      replacement.errors.length]).toEqual(replacementCallbacks)
+    expect(old.requests).toHaveLength(requests)
+    expect(old.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(0)
+    await replacement.controller.stop()
+  })
+
   test("snapshot finishing after reconnect sends the photo on the replacement", async () => {
     let release!: () => void
     const snapshotGate = new Promise<void>((resolve) => {
@@ -752,6 +805,93 @@ describe("GeminiLiveController", () => {
     expect(h.photoRetryChanges.at(-1)).toBe(false)
     expect(h.persistenceErrors.at(-1)).toBeNull()
     await h.controller.stop()
+  })
+
+  for (const status of [200, 503, 400, "network"] as const) {
+    test(`caption-ready Retry finalization after Stop preserves replacement recovery (${status})`, async () => {
+      const storage = new FakeStorage()
+      const old = harness({storage, finalizeStatuses: [503]})
+      await start(old)
+      await old.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+      old.sockets[0].message({serverContent: {
+        outputTranscription: {text: "A fictional blue square."}, turnComplete: true,
+      }})
+      await waitFor(() => old.photoRetryChanges.at(-1) === true)
+      const captionJournal = JSON.parse(storage.values.get("openalma:gemini-session-v1")!)
+      expect(captionJournal.pendingImage.caption).toBe("A fictional blue square.")
+      expect(captionJournal.pendingImage.assistantSequence).toBe(42)
+      expect(captionJournal.pendingTranscripts).toEqual([])
+
+      let finishFinalize!: () => void
+      const finalizeGate = new Promise<void>((resolve, reject) => {
+        finishFinalize = status === "network" ? () => reject(new Error("fictional network miss")) : resolve
+      })
+      old.finalizeGates.push(finalizeGate)
+      old.finalizeStatuses.splice(0, old.finalizeStatuses.length, status === "network" ? 200 : status)
+      const attempts = old.requests.filter((request) => request.url.endsWith("/snapshot/finalize")).length
+      const retrying = old.controller.retryImage()
+      await waitFor(() => old.requests.filter((request) => request.url.endsWith("/snapshot/finalize"))
+        .length === attempts + 1)
+      expect(old.requests.at(-1)!.body.caption_event_id).toBe("sitting-1:42")
+      await old.controller.stop()
+
+      const replacement = harness({storage, appendStatuses: Array(100).fill(503), startBody: {
+        session_id: "replacement-sitting", next_transcript_sequence: 43, ephemeral_token: "ephemeral/test",
+        websocket: {api_version: "v1alpha", method: "BidiGenerateContentConstrained",
+          input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
+        lease_seconds: 90, session_warning_seconds: 0,
+      }})
+      await start(replacement)
+      completeTurn(replacement, "A fictional replacement question.", "A fictional replacement answer.")
+      await waitFor(() => replacement.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
+      const journal = storage.values.get("openalma:gemini-session-v1")!
+      expect(JSON.parse(journal).pendingImage.imageId).toBe("image-1")
+      expect(JSON.parse(journal).pendingTranscripts).toHaveLength(2)
+      const callbacks = [old.photoRetryChanges.length, old.persistenceErrors.length, old.errors.length]
+      const replacementCallbacks = [replacement.photoRetryChanges.length, replacement.persistenceErrors.length,
+        replacement.errors.length]
+      const requests = old.requests.length
+
+      finishFinalize()
+      await retrying
+
+      expect(storage.values.get("openalma:gemini-session-v1")).toBe(journal)
+      expect([old.photoRetryChanges.length, old.persistenceErrors.length, old.errors.length]).toEqual(callbacks)
+      expect([replacement.photoRetryChanges.length, replacement.persistenceErrors.length,
+        replacement.errors.length]).toEqual(replacementCallbacks)
+      expect(old.requests).toHaveLength(requests)
+      expect(old.errors).toEqual([])
+      await replacement.controller.stop()
+    })
+  }
+
+  test("normal Stop waits for caption finalization and clears photo recovery", async () => {
+    const storage = new FakeStorage()
+    let finishFinalize!: () => void
+    const finalizeGate = new Promise<void>((resolve) => { finishFinalize = resolve })
+    const h = harness({storage, finalizeGates: [finalizeGate]})
+    await start(h)
+    await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    h.sockets[0].message({serverContent: {
+      outputTranscription: {text: "A fictional blue square."}, turnComplete: true,
+    }})
+    let stopped = false
+    const stopping = h.controller.stop().then(() => { stopped = true })
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
+    expect(stopped).toBe(false)
+    expect(h.requests.some((request) => request.url.endsWith("/end"))).toBe(false)
+    expect(JSON.parse(storage.values.get("openalma:gemini-session-v1")!).pendingImage.caption)
+      .toBe("A fictional blue square.")
+
+    finishFinalize()
+    await stopping
+
+    expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
+    expect(h.photoRetryChanges.at(-1)).toBe(false)
+    expect(h.persistenceErrors.at(-1)).toBeNull()
+    expect(h.errors).toEqual([])
+    expect(h.requests.filter((request) => request.url.endsWith("/snapshot/finalize"))).toHaveLength(1)
+    expect(h.requests.some((request) => request.url.endsWith("/end"))).toBe(true)
   })
 
   test("Stop during a photo description reports the photo instead of transcript failure", async () => {

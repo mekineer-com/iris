@@ -353,13 +353,13 @@ export class GeminiLiveController {
       data: image.data,
     }, SNAPSHOT_TIMEOUT_MS)
     if (!response.ok) throw new Error(`OpenAlma snapshot failed (${response.status})`)
+    const result = (await response.json()) as {media_ref?: unknown}
     if (
       this.stopping || generation !== this.generation || sessionId !== this.sessionId
     ) {
       throw new Error("Photo send cancelled")
     }
     if (this.pendingImage !== pendingBeforeUpload) return
-    const result = (await response.json()) as {media_ref?: unknown}
     const mediaRef = typeof result.media_ref === "string" ? result.media_ref.trim() : ""
     if (!mediaRef.startsWith("mentra_media/") || mediaRef.includes("..")) {
       throw new Error("OpenAlma snapshot returned an invalid media reference")
@@ -1199,6 +1199,7 @@ export class GeminiLiveController {
     const pending = this.pendingImage
     if (!pending?.caption || (pending.retryRequested && !userRequested) || !pending.assistantSequence) return
     if (this.pendingEvents.some((event) => event.sequence <= pending.assistantSequence!)) return
+    const generation = this.generation
     let response: Response
     try {
       response = await this.request(`/integration/mentra/session/${this.sessionId}/snapshot/finalize`, {
@@ -1209,9 +1210,11 @@ export class GeminiLiveController {
         caption_event_id: `${pending.sessionId}:${pending.assistantSequence}`,
       })
     } catch {
+      if (generation !== this.generation || this.pendingImage !== pending) return
       await this.requestPhotoRetry(pending)
       return
     }
+    if (generation !== this.generation || this.pendingImage !== pending) return
     if (response.status >= 500) {
       await this.requestPhotoRetry(pending)
       return
