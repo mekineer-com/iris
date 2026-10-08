@@ -828,8 +828,8 @@ export class GeminiLiveController {
       this.providerAudioChunks += 1
     }
 
-    if (input) trace("provider.input_transcription", {text: input})
-    if (output) trace("provider.output_transcription", {text: output})
+    if (input) trace("provider.input_transcription", {length: input.length})
+    if (output) trace("provider.output_transcription", {length: output.length})
     if (this.reflecting) {
       if (input) throw new Error("Gemini returned input transcription during reflection")
       this.outputTranscript += output
@@ -1011,7 +1011,7 @@ export class GeminiLiveController {
 
   private async runRecall(id: string, query: string, pending: PendingToolCall): Promise<void> {
     const startedAt = Date.now()
-    trace("recall.begin", {id, query})
+    trace("recall.begin", {id, queryLength: query.length})
     let response: Response
     try {
       response = await this.request(
@@ -1055,7 +1055,7 @@ export class GeminiLiveController {
       return
     }
     this.completeRecall(id, pending, body.context.trim(), false)
-    trace("recall.end", {id, elapsedMs: Date.now() - startedAt, context: body.context.trim()})
+    trace("recall.end", {id, elapsedMs: Date.now() - startedAt, contextLength: body.context.trim().length})
   }
 
   private completeRecall(id: string, pending: PendingToolCall, result: string, failed: boolean): void {

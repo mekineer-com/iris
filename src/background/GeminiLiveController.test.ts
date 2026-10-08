@@ -294,6 +294,31 @@ function completeTurn(h: ReturnType<typeof harness>, input = "hello", output = "
 }
 
 describe("GeminiLiveController", () => {
+  test("production traces contain lengths, never transcripts or recalled memory", async () => {
+    const previousEnv = process.env.NODE_ENV
+    const logs = spyOn(console, "info").mockImplementation(() => {})
+    const h = harness({recallBody: {ok: true, context: "Private fictional memory", retrieve_ms: 1}})
+    try {
+      process.env.NODE_ENV = "production"
+      await start(h)
+      completeTurn(h, "Private fictional input", "Private fictional output")
+      h.sockets[0].message({toolCall: {
+        functionCalls: [{id: "trace-check", name: "recall_memory", args: {query: "Private fictional query"}}],
+      }})
+      await waitFor(() => logs.mock.calls.some(([event]) => String(event).endsWith("recall.end")))
+      const detail = (event: string) => logs.mock.calls.find(([line]) => String(line).endsWith(event))?.[1]
+      expect(detail("provider.input_transcription")).toEqual({length: "Private fictional input".length})
+      expect(detail("provider.output_transcription")).toEqual({length: "Private fictional output".length})
+      expect(detail("recall.begin")).toEqual({id: "trace-check", queryLength: "Private fictional query".length})
+      expect(detail("recall.end")).toMatchObject({contextLength: "Private fictional memory".length})
+      expect(JSON.stringify(logs.mock.calls)).not.toContain("Private fictional")
+    } finally {
+      await h.controller.stop(false)
+      if (previousEnv === undefined) delete process.env.NODE_ENV
+      else process.env.NODE_ENV = previousEnv
+      logs.mockRestore()
+    }
+  })
   test("rejects recovery belonging to another soul without sending its contents", async () => {
     const storage = new FakeStorage()
     storage.values.set("openalma:gemini-session-v1", JSON.stringify({
