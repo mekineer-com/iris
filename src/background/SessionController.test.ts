@@ -356,9 +356,16 @@ describe("SessionController", () => {
     await h.session.handlers["openalma:stop"]({})
   })
 
-  test("seeds download defaults once without choosing a Soul or overwriting settings", async () => {
+  test("seeds fork defaults once without choosing a Soul or overwriting settings; stock requires a ticket", async () => {
     const session = new FakeSession()
     const installationDefaults = {baseUrl: CONFIG.baseUrl, userId: CONFIG.userId, deviceSessionId: CONFIG.deviceSessionId}
+    session.stored.set("openalma.host", JSON.stringify({host_package: "com.mentra.mentra.openalma",
+      host_version: "3.2.1", deviceSessionId: CONFIG.deviceSessionId}))
+    const stock = new FakeSession()
+    new SessionController(stock as never, {installationDefaults}).start()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(stock.stored.has("openalma.connection-profile")).toBe(false)
+    expect(lastSnapshot(stock)?.lastError).toContain("installationTicket")
     const wrong = new FakeSession()
     wrong.stored.set("openalma.host", JSON.stringify({host_package: "com.mentra.mentra.openalma",
       host_version: "3.2.1", deviceSessionId: "other-installation"}))
@@ -381,6 +388,165 @@ describe("SessionController", () => {
     new SessionController(session as never, {installationDefaults, fetchFn}).start()
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(JSON.parse(session.stored.get("openalma.connection-profile") ?? "").baseUrl).toBe("http://changed.example")
+  })
+
+  test("saves a fresh candidate and exchanges its ticket before discovery or readiness", async () => {
+    const session = new FakeSession()
+    const installationDefaults = {baseUrl: CONFIG.baseUrl, userId: CONFIG.userId, installationTicket: "ticket-fresh"}
+    const requests: Array<{url: string; body: Record<string, unknown> | null}> = []
+    let entered!: () => void, finish!: () => void
+    const waiting = new Promise<void>((resolve) => {entered = resolve})
+    const release = new Promise<void>((resolve) => {finish = resolve})
+    const fetchFn = (async (url, init) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : null
+      requests.push({url: String(url), body})
+      if (init?.method) {
+        const saved = JSON.parse(session.stored.get("openalma.connection-profile")!)
+        expect(saved).toMatchObject({installationTicket: "ticket-fresh", installationConfirmed: false,
+          deviceSessionId: body.device_session_id})
+        expect(body).toMatchObject({installation_ticket: "ticket-fresh", soul_id: null})
+        expect(body.device_session_id).not.toBe(CONFIG.deviceSessionId)
+        entered()
+        await release
+        return Response.json({ok: true})
+      }
+      expect(JSON.parse(session.stored.get("openalma.connection-profile")!).installationConfirmed).toBe(true)
+      return Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: []})
+    }) as typeof fetch
+    new SessionController(session as never, {installationDefaults, fetchFn}).start()
+    await waiting
+    session.onOpenCb?.()
+    expect(lastSnapshot(session)).toMatchObject({configured: true, soulLoading: true, soulConfirmed: false, soulLocked: true})
+    expect(lastSnapshot(session)?.connectionProfile).not.toHaveProperty("installationTicket")
+    expect(requests).toHaveLength(1)
+    finish()
+    await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+    const saved = session.stored.get("openalma.connection-profile")!
+    expect(lastSnapshot(session)).toMatchObject({configured: true, soulLoading: false, memuAvailable: true, soulConfirmed: false})
+    expect(requests.map(({url}) => url.split("/").at(-1))).toEqual(["seen", "owner", "souls"])
+    new SessionController(session as never, {installationDefaults, fetchFn}).start()
+    await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+    expect(session.stored.get("openalma.connection-profile")).toBe(saved)
+    expect(requests.filter(({body}) => body)).toHaveLength(1)
+  })
+
+  test("pending exchange failure stays editable and address repair reuses its ID and ticket", async () => {
+    const previous = process.env.NODE_ENV
+    process.env.NODE_ENV = "production"
+    try {
+      const session = new FakeSession()
+      const installationDefaults = {baseUrl: CONFIG.baseUrl, userId: CONFIG.userId, installationTicket: "ticket-repair"}
+      const reports: Record<string, unknown>[] = []
+      let starts = 0
+      const fetchFn = (async (url, init) => {
+        if (init?.method) {
+          reports.push(JSON.parse(String(init.body)))
+          return String(url).startsWith(CONFIG.baseUrl)
+            ? Response.json({detail: "Installation ticket already used"}, {status: 409})
+            : Response.json({ok: true})
+        }
+        return Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: [CONFIG.soulId]})
+      }) as typeof fetch
+      new SessionController(session as never, {installationDefaults, fetchFn,
+        createLiveController: (_config, callbacks) => {starts += 1; return new FakeLive(callbacks) as never},
+      }).start()
+      await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+      const pending = JSON.parse(session.stored.get("openalma.connection-profile")!)
+      expect(lastSnapshot(session)).toMatchObject({configured: true, connectionLocked: false,
+        soulLocked: true, soulConfirmed: false, memuAvailable: false,
+        lastError: "Installation report failed (409): Installation ticket already used"})
+      expect(lastSnapshot(session)?.connectionProfile).toMatchObject({baseUrl: CONFIG.baseUrl, deviceSessionId: pending.deviceSessionId})
+      await expect(session.handlers["openalma:set-soul"]({soulId: CONFIG.soulId, useExisting: true})).rejects.toThrow("Finish or recover")
+      await expect(session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow("Installation is not confirmed")
+      expect(starts).toBe(0)
+      expect(reports).toHaveLength(1)
+      await session.handlers["openalma:set-profile"]({...pending, baseUrl: "http://repaired.example",
+        installationTicket: "forged-ticket", installationConfirmed: true})
+      expect(JSON.parse(session.stored.get("openalma.connection-profile")!)).toEqual({...pending,
+        baseUrl: "http://repaired.example", installationConfirmed: true})
+      expect(reports[1]).toMatchObject({device_session_id: pending.deviceSessionId, installation_ticket: "ticket-repair"})
+      expect(reports[2]).toMatchObject({device_session_id: pending.deviceSessionId})
+      expect(reports[2]).not.toHaveProperty("installation_ticket")
+      expect(lastSnapshot(session)).toMatchObject({memuAvailable: true, soulLocked: false})
+    } finally {
+      process.env.NODE_ENV = previous
+    }
+  })
+
+  test("failed candidate/confirmation writes or lost reply cannot admit a sitting; reopen retries the saved ID", async () => {
+    for (const failure of ["candidate", "confirmation", "reply"]) {
+      const session = new FakeSession()
+      session.stored.set("openalma.soul-id", CONFIG.soulId)
+      const installationDefaults = {baseUrl: CONFIG.baseUrl, userId: CONFIG.userId, installationTicket: "ticket-retry"}
+      const save = session.storage.set
+      let profileWrites = 0, failing = true, starts = 0
+      session.storage.set = async (key, value) => {
+        if (key === "openalma.connection-profile") {
+          profileWrites += 1
+          if (failing && ((failure === "candidate" && profileWrites === 1) || (failure === "confirmation" && profileWrites === 2))) {
+            throw new Error("Profile write failed")
+          }
+        }
+        await save(key, value)
+      }
+      const ids: string[] = []
+      const fetchFn = (async (url, init) => {
+        if (init?.method) {
+          const body = JSON.parse(String(init.body))
+          expect(body.installation_ticket).toBe("ticket-retry")
+          ids.push(body.device_session_id)
+          if (failing && failure === "reply") throw new Error("Response lost")
+          return Response.json({ok: true})
+        }
+        return Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: [CONFIG.soulId]})
+      }) as typeof fetch
+      const options = {installationDefaults, fetchFn,
+        createLiveController: (_config: OpenAlmaConfig, callbacks: GeminiCallbacks) => {starts += 1; return new FakeLive(callbacks) as never}}
+      new SessionController(session as never, options).start()
+      await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+      expect(lastSnapshot(session)).toMatchObject({soulConfirmed: false, soulLocked: true, memuAvailable: false})
+      await expect(session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow("Installation is not confirmed")
+      expect(starts).toBe(0)
+      if (failure === "candidate") expect(ids).toHaveLength(0)
+      else expect(JSON.parse(session.stored.get("openalma.connection-profile")!).installationConfirmed).toBe(false)
+      failing = false
+      new SessionController(session as never, options).start()
+      await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+      if (failure !== "candidate") expect(ids[1]).toBe(ids[0])
+      expect(lastSnapshot(session)).toMatchObject({soulConfirmed: true, memuAvailable: true})
+      expect(JSON.parse(session.stored.get("openalma.connection-profile")!).installationConfirmed).toBe(true)
+    }
+  })
+
+  test("stock Update keeps the saved connection, ID and Soul; a fresh copy cannot claim its target", async () => {
+    const session = new FakeSession()
+    const saved = {...CONFIG, baseUrl: "http://saved.example", installationTicket: "old-ticket", installationConfirmed: true}
+    session.stored.set("openalma.connection-profile", JSON.stringify(saved))
+    session.stored.set("openalma.soul-id", CONFIG.soulId)
+    const installationDefaults = {baseUrl: "http://download.example", userId: "Other User", installationTicket: "ticket-update"}
+    const reports: Record<string, unknown>[] = []
+    const fetchFn = (async (url, init) => {
+      if (init?.method) {
+        const body = JSON.parse(String(init.body))
+        reports.push(body)
+        return body.device_session_id === CONFIG.deviceSessionId ? Response.json({ok: true})
+          : Response.json({detail: "Installation ticket target mismatch"}, {status: 409})
+      }
+      expect(String(url).startsWith(saved.baseUrl)).toBe(true)
+      return Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: [CONFIG.soulId]})
+    }) as typeof fetch
+    new SessionController(session as never, {installationDefaults, fetchFn}).start()
+    await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+    expect(reports[0]).toMatchObject({user_id: CONFIG.userId, device_session_id: CONFIG.deviceSessionId,
+      soul_id: CONFIG.soulId, installation_ticket: "ticket-update"})
+    expect(lastSnapshot(session)).toMatchObject({soulId: CONFIG.soulId, soulConfirmed: true,
+      connectionProfile: {baseUrl: saved.baseUrl, userId: CONFIG.userId, deviceSessionId: CONFIG.deviceSessionId}})
+    const fresh = new FakeSession()
+    new SessionController(fresh as never, {installationDefaults, fetchFn}).start()
+    await fresh.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+    expect(reports[1].device_session_id).not.toBe(CONFIG.deviceSessionId)
+    expect(lastSnapshot(fresh)).toMatchObject({soulLocked: true, soulConfirmed: false, memuAvailable: false})
+    await expect(fresh.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow("Installation is not confirmed")
   })
 
   test("rejects a profile user that differs from the discovered owner", async () => {

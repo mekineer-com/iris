@@ -385,7 +385,7 @@ export default function SessionPage() {
     </main>
   )
   if (editingConnection) {
-    const field = (name: keyof OpenAlmaProfile, label: string, type = "text", readOnly = false) => (
+    const field = (name: "baseUrl" | "userId" | "deviceSessionId", label: string, type = "text", readOnly = false) => (
       <label>{label}<input type={type} value={profile[name]} disabled={profilePending} readOnly={readOnly}
         onChange={(event) => setProfile({...profile, [name]: event.target.value})} /></label>
     )

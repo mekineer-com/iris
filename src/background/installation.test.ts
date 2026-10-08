@@ -46,4 +46,23 @@ describe("installation report", () => {
       version: "0.1.0",
     })
   })
+
+  test("exchanges a pending ticket with the permanent ID, then reports without the ticket", async () => {
+    const bodies: Record<string, unknown>[] = []
+    const fetchFn = (async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body)))
+      return Response.json({ok: true})
+    }) as typeof fetch
+    const config = {...CONFIG, installationTicket: "ticket-test", installationConfirmed: false}
+    await reportInstallation(config, fetchFn)
+    await reportInstallation({...config, installationConfirmed: true}, fetchFn)
+    expect(bodies[0]).toMatchObject({device_session_id: CONFIG.deviceSessionId, installation_ticket: "ticket-test"})
+    expect(bodies[1]).toMatchObject({device_session_id: CONFIG.deviceSessionId})
+    expect(bodies[1]).not.toHaveProperty("installation_ticket")
+  })
+
+  test("shows the server's used-ticket refusal", async () => {
+    await expect(reportInstallation(CONFIG, (async () => Response.json({detail: "Installation ticket already used"},
+      {status: 409})) as typeof fetch)).rejects.toThrow("Installation report failed (409): Installation ticket already used")
+  })
 })

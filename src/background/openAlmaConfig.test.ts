@@ -27,4 +27,16 @@ describe("OpenAlma profile", () => {
       deviceSessionId: "bad id",
     })).toThrow("deviceSessionId")
   })
+
+  test("round-trips the internal pending and confirmed ticket", () => {
+    for (const installationConfirmed of [false, true]) {
+      const config = parseOpenAlmaProfile({baseUrl: "https://example.com", userId: "Test User",
+        deviceSessionId: "test-phone", installationTicket: "ticket-test", installationConfirmed})
+      expect(parseOpenAlmaProfile(serializeOpenAlmaProfile(config))).toEqual(config)
+    }
+    const profile = {baseUrl: "https://example.com", userId: "Test User", deviceSessionId: "test-phone"}
+    expect(() => parseOpenAlmaProfile({...profile, installationTicket: " "})).toThrow("installationTicket")
+    expect(() => parseOpenAlmaProfile({...profile, installationTicket: "ticket", installationConfirmed: "true"}))
+      .toThrow("installationConfirmed")
+  })
 })

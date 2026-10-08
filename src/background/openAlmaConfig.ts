@@ -27,17 +27,22 @@ export function parseOpenAlmaProfile(value: unknown): OpenAlmaConfig {
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(deviceSessionId)) {
     throw new Error("deviceSessionId has an invalid format")
   }
+  const installationTicket = raw.installationTicket === undefined ? undefined : required("installationTicket", raw.installationTicket)
+  if (raw.installationConfirmed !== undefined && typeof raw.installationConfirmed !== "boolean") {
+    throw new Error("installationConfirmed must be a boolean")
+  }
   return {
     baseUrl,
     userId: required("userId", raw.userId),
     soulId: "",
     deviceSessionId,
+    ...(installationTicket ? {installationTicket, installationConfirmed: raw.installationConfirmed === true} : {}),
     packageName: manifest.packageName,
     version: manifest.version,
   }
 }
 
 export function serializeOpenAlmaProfile(config: OpenAlmaConfig): string {
-  const {baseUrl, userId, deviceSessionId} = config
-  return JSON.stringify({baseUrl, userId, deviceSessionId})
+  const {baseUrl, userId, deviceSessionId, installationTicket, installationConfirmed} = config
+  return JSON.stringify({baseUrl, userId, deviceSessionId, installationTicket, installationConfirmed})
 }

@@ -9,6 +9,8 @@ export type OpenAlmaProfile = {
   baseUrl: string
   userId: string
   deviceSessionId: string
+  installationTicket?: string
+  installationConfirmed?: boolean
 }
 
 export interface SessionSnapshot {

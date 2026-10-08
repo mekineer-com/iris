@@ -30,10 +30,15 @@ export async function reportInstallation(
       user_id: config.userId,
       soul_id: config.soulId.trim() || null,
       device_session_id: config.deviceSessionId,
+      ...(config.installationTicket && !config.installationConfirmed ? {installation_ticket: config.installationTicket} : {}),
       package_name: config.packageName,
       version: config.version,
       ...(host ? {host_package: host.host_package, host_version: host.host_version} : {}),
     }),
   })
-  if (!response.ok) throw new Error(`Installation report failed (${response.status})`)
+  if (!response.ok) {
+    const result = await response.json().catch(() => null) as {detail?: string | {message?: string}} | null
+    const detail = typeof result?.detail === "string" ? result.detail : result?.detail?.message
+    throw new Error(`Installation report failed (${response.status})${typeof detail === "string" && detail ? `: ${detail}` : ""}`)
+  }
 }

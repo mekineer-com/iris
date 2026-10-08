@@ -32,6 +32,7 @@ describe("private release URI", () => {
       MENTRA_PUBLIC_OPENALMA_BASE_URL: "http://10.77.0.1",
       MENTRA_PUBLIC_OPENALMA_USER_ID: "Test User",
       MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID: "test-phone",
+      MENTRA_PUBLIC_OPENALMA_INSTALLATION_TICKET: "test-ticket",
       MENTRA_RELEASE_HOST_PACKAGE: "com.mentra.mentra",
     }
     for (const host of ["10.77.0.1", "100.64.0.2", "iris.example", "192.0.2.1", "[fd00::1]"]) {
@@ -56,8 +57,18 @@ describe("private release URI", () => {
     expect(JSON.parse(releaseProfile(env))).toEqual({
       baseUrl: "http://10.77.0.1",
       userId: "Test User",
-      deviceSessionId: "test-phone",
+      installationTicket: "test-ticket",
     })
+    expect(assertPrivateReleaseConfig({...env, MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID: ""})).toBe("10.77.0.1")
+    expect(() => assertPrivateReleaseConfig({...env, MENTRA_PUBLIC_OPENALMA_INSTALLATION_TICKET: ""}))
+      .toThrow("MENTRA_PUBLIC_OPENALMA_INSTALLATION_TICKET")
+    const fork = {...env, MENTRA_RELEASE_HOST_PACKAGE: "com.mentra.mentra.openalma"}
+    expect(JSON.parse(releaseProfile(fork))).toEqual({
+      baseUrl: "http://10.77.0.1", userId: "Test User", deviceSessionId: "test-phone",
+    })
+    expect(assertPrivateReleaseConfig({...fork, MENTRA_PUBLIC_OPENALMA_INSTALLATION_TICKET: ""})).toBe("10.77.0.1")
+    expect(() => assertPrivateReleaseConfig({...fork, MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID: ""}))
+      .toThrow("MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID")
   })
 
   test("writes installer status atomically", () => {
@@ -71,20 +82,31 @@ describe("private release URI", () => {
 
   test("completes only a fresh exact stock installation report", () => {
     const offer = {
-      deviceSessionId: "test-phone",
+      installationTicket: "test-ticket",
       packageName: "com.openalma.mentra",
       version: "0.1.1",
       startedAt: 100,
     }
-    const status = {
-      installed_device: "test-phone",
-      installed_package: "com.openalma.mentra",
-      installed_version: "0.1.1",
-      installed_seen_at: 101,
+    const record = {
+      device_session_id: "permanent-phone",
+      installation_ticket: "test-ticket",
+      package_name: "com.openalma.mentra",
+      version: "0.1.1",
+      seen_at: 101,
     }
+    const status = {installations: [record]}
     expect(installationCompletesOffer(status, offer)).toBe(true)
-    expect(installationCompletesOffer({...status, installed_device: "other-phone"}, offer)).toBe(false)
-    expect(installationCompletesOffer({...status, installed_seen_at: 100}, offer)).toBe(false)
-    expect(installationCompletesOffer({...status, host: {host_package: "com.mentra.mentra.openalma"}}, offer)).toBe(false)
+    for (const override of [
+      {installation_ticket: "other-ticket"}, {installation_ticket: undefined},
+      {seen_at: 100}, {seen_at: undefined}, {package_name: "wrong-package"}, {version: "0.1.0"},
+      {host: {host_package: "com.mentra.mentra.openalma"}},
+    ]) {
+      expect(installationCompletesOffer({installations: [{...record, ...override}]}, offer)).toBe(false)
+    }
+    expect(installationCompletesOffer({}, offer)).toBe(false)
+    expect(installationCompletesOffer(status, {...offer, installationTicket: ""})).toBe(false)
+    expect(installationCompletesOffer({installations: [
+      {...record, installation_ticket: "other-ticket"}, record,
+    ]}, offer)).toBe(true)
   })
 })

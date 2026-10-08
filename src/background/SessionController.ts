@@ -1,4 +1,5 @@
 import type {AudioChunkData, MiniappSession, UnsubscribeFn} from "@mentra/miniapp/background"
+import {makeRequestId} from "@mentra/miniapp"
 
 import type {Channels} from "../shared/channels"
 import type {ImageRequest} from "../shared/channels"
@@ -142,15 +143,16 @@ export class SessionController {
         if (this.connectionLocked()) {
           throw new Error("Wait for settings or stop this sitting before changing its connection")
         }
-        const submitted = parseOpenAlmaProfile(payload)
+        let submitted = parseOpenAlmaProfile(payload)
         if (this.config && (submitted.deviceSessionId !== this.config.deviceSessionId || submitted.userId !== this.config.userId)) {
           throw new Error("Connection edits cannot change the owner or installation ID")
         }
+        if (this.config) submitted = {...this.config, baseUrl: submitted.baseUrl}
         this.soulSelecting = true
         this.pushSnapshot()
         try {
-          const identity = await this.resolveProfileIdentity(submitted)
-          const config = identity.config
+          const identity = this.installationPending() ? undefined : await this.resolveProfileIdentity(submitted)
+          const config = identity?.config ?? submitted
           await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(config))
           this.config = config
           this.soulLoading = true
@@ -158,6 +160,7 @@ export class SessionController {
           this.lastError = null
           this.preferencesLoaded = this.loadPreferences(identity)
           await this.preferencesLoaded
+          if (this.installationPending()) throw new Error(this.lastError || "Installation is not confirmed")
           return {ok: true as const}
         } finally {
           this.soulSelecting = false
@@ -411,6 +414,7 @@ export class SessionController {
     try {
       await this.preferencesLoaded
       if (generation !== this.startGeneration) return
+      this.currentConfig()
       if (!this.soulId) throw new Error("Choose a soul before starting Iris")
       if (!this.soulConfirmed && !this.recoverySoulId) {
         throw new Error("Select or create this soul before starting Iris")
@@ -626,7 +630,7 @@ export class SessionController {
   }
 
   private async reportSelectedSoul(): Promise<void> {
-    if (process.env.NODE_ENV !== "production" || !this.config) return
+    if (process.env.NODE_ENV !== "production" || !this.config || this.installationPending()) return
     try {
       const host = installationHost(await this.session.storage.get(OPENALMA_HOST_KEY))
       await reportInstallation({...this.currentConfig(), soulId: this.soulId}, this.fetchFn, host)
@@ -857,14 +861,17 @@ export class SessionController {
         this.session.storage.get(SOUL_ID_KEY),
         this.session.storage.get(JOURNAL_KEY),
       ])
+      const host = installationHost(await this.session.storage.get(OPENALMA_HOST_KEY))
       if (!this.config && storedProfile === null && this.installationDefaults !== undefined) {
-        const defaults = parseOpenAlmaProfile(this.installationDefaults)
-        const host = installationHost(await this.session.storage.get(OPENALMA_HOST_KEY))
+        const raw = this.installationDefaults as Partial<OpenAlmaConfig> | null
+        const defaults = parseOpenAlmaProfile(host ? raw : {...raw,
+          deviceSessionId: makeRequestId(), installationTicket: raw?.installationTicket ?? "", installationConfirmed: false})
         if (host && defaults.deviceSessionId !== host.deviceSessionId) {
           throw new Error("Install Iris from its OpenAlma Mentra row in the launcher")
         }
         storedProfile = serializeOpenAlmaProfile(defaults)
-        await this.session.storage.set(OPENALMA_PROFILE_KEY, storedProfile)
+        if (defaults.installationTicket) this.config = defaults
+        else await this.session.storage.set(OPENALMA_PROFILE_KEY, storedProfile)
       }
       if (!this.config && storedProfile === null) {
         this.soulLoading = false
@@ -872,13 +879,24 @@ export class SessionController {
         return
       }
       if (!this.config) this.config = parseOpenAlmaProfile(storedProfile)
-      const config = this.currentConfig()
+      const ticket = (this.installationDefaults as Partial<OpenAlmaConfig> | null)?.installationTicket
+      if (!host && ticket !== undefined && ticket !== this.config.installationTicket) {
+        this.config = parseOpenAlmaProfile({...this.config, installationTicket: ticket, installationConfirmed: false})
+      }
+      let config = this.config
       storedSoul = savedSoul
       this.microphoneEnabled = microphone !== "0"
       this.cameraEnabled = camera !== "0"
       this.soulId = storedSoul?.trim() || config.soulId
       this.recoverySoulId = journalSoulId(journal, config)
       if (this.recoverySoulId) this.soulId = this.recoverySoulId
+      if (this.installationPending()) {
+        await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(config))
+        await reportInstallation({...config, soulId: this.soulId}, this.fetchFn, host)
+        const confirmed = {...config, installationConfirmed: true}
+        await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(confirmed))
+        this.config = config = confirmed
+      }
       const identity = resolvedIdentity ?? await this.resolveProfileIdentity(config)
       this.config = identity.config
       this.souls = identity.souls
@@ -887,7 +905,7 @@ export class SessionController {
       this.memuAvailable = false
       this.lastError = error instanceof Error ? error.message : String(error)
     }
-    this.soulConfirmed = Boolean(this.recoverySoulId || (storedSoul?.trim() && this.souls.includes(this.soulId)))
+    this.soulConfirmed = !this.installationPending() && Boolean(this.recoverySoulId || (storedSoul?.trim() && this.souls.includes(this.soulId)))
     this.soulLoading = false
     this.pushSnapshot()
     await this.reportSelectedSoul()
@@ -895,7 +913,12 @@ export class SessionController {
 
   private currentConfig(): OpenAlmaConfig {
     if (!this.config) throw new Error("Set up the OpenAlma connection first")
+    if (this.installationPending()) throw new Error("Installation is not confirmed; edit the connection or reopen Iris to retry")
     return this.config
+  }
+
+  private installationPending(): boolean {
+    return Boolean(this.config?.installationTicket && !this.config.installationConfirmed)
   }
 
   private async resolveProfileIdentity(
@@ -933,10 +956,11 @@ export class SessionController {
   }
 
   private soulLocked(): boolean {
-    return this.connectionLocked() || this.recoverySoulId !== null
+    return this.connectionLocked() || this.installationPending() || this.recoverySoulId !== null
   }
 
   private async refreshRecoveryLock(): Promise<void> {
+    if (this.installationPending()) return
     try {
       this.recoverySoulId = journalSoulId(await this.session.storage.get(JOURNAL_KEY), this.currentConfig())
     } catch {

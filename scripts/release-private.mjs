@@ -19,12 +19,13 @@ export function findReleaseUri(output) {
 const requiredBuildEnv = [
   "MENTRA_PUBLIC_OPENALMA_BASE_URL",
   "MENTRA_PUBLIC_OPENALMA_USER_ID",
-  "MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID",
   "MENTRA_RELEASE_HOST_PACKAGE",
 ]
 
 export function assertPrivateReleaseConfig(env) {
-  const missing = requiredBuildEnv.filter((name) => !env[name]?.trim())
+  const identity = env.MENTRA_RELEASE_HOST_PACKAGE === "com.mentra.mentra"
+    ? "MENTRA_PUBLIC_OPENALMA_INSTALLATION_TICKET" : "MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID"
+  const missing = [...requiredBuildEnv, identity].filter((name) => !env[name]?.trim())
   if (missing.length) throw new Error(`Missing required build settings: ${missing.join(", ")}`)
   const url = new URL(env.MENTRA_PUBLIC_OPENALMA_BASE_URL)
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
@@ -49,7 +50,9 @@ export function releaseProfile(env) {
   return JSON.stringify({
     baseUrl: env.MENTRA_PUBLIC_OPENALMA_BASE_URL.replace(/\/+$/, ""),
     userId: decodeURIComponent(env.MENTRA_PUBLIC_OPENALMA_USER_ID),
-    deviceSessionId: env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID,
+    ...(env.MENTRA_RELEASE_HOST_PACKAGE === "com.mentra.mentra"
+      ? {installationTicket: env.MENTRA_PUBLIC_OPENALMA_INSTALLATION_TICKET}
+      : {deviceSessionId: env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID}),
   })
 }
 
@@ -69,11 +72,12 @@ export function writeReleaseStatus(path, value) {
 }
 
 export function installationCompletesOffer(status, offer) {
-  return status?.installed_device === offer.deviceSessionId &&
-    status?.installed_package === offer.packageName &&
-    status?.installed_version === offer.version &&
-    Number(status?.installed_seen_at) > offer.startedAt &&
-    !status?.host
+  return !!offer.installationTicket && (status?.installations ?? []).some((record) =>
+    record.installation_ticket === offer.installationTicket &&
+    record.package_name === offer.packageName &&
+    record.version === offer.version &&
+    Number(record.seen_at) > offer.startedAt &&
+    !record.host)
 }
 
 export function run() {
@@ -108,7 +112,8 @@ export function run() {
       shutdown()
       return
     }
-    const deviceSessionId = process.env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID
+    const deviceSessionId = process.env.MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID || ""
+    const installationTicket = process.env.MENTRA_PUBLIC_OPENALMA_INSTALLATION_TICKET || ""
     const qrPath = join(root, "build", `openalma-${version}-private-qr.png`)
     try {
       writeReleaseStatus(statusPath, {
@@ -116,6 +121,7 @@ export function run() {
         package_name: packageName,
         version,
         device_session_id: deviceSessionId,
+        installation_ticket: installationTicket,
         host_package: process.env.MENTRA_RELEASE_HOST_PACKAGE,
         pid: process.pid,
         started_at: startedAt,
@@ -131,17 +137,16 @@ export function run() {
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), 2000)
       try {
-        const query = new URLSearchParams({device_session_id: deviceSessionId})
         const response = await fetch(
-          `${process.env.MENTRA_PUBLIC_OPENALMA_BASE_URL.replace(/\/+$/, "")}/integration/mentra/status?${query}`,
+          `${process.env.MENTRA_PUBLIC_OPENALMA_BASE_URL.replace(/\/+$/, "")}/integration/mentra/status`,
           {signal: controller.signal},
         )
         if (!response.ok) return
         const status = await response.json()
         if (installationCompletesOffer(status, {
-          deviceSessionId, packageName, version, startedAt,
+          installationTicket, packageName, version, startedAt,
         })) {
-          console.log(`Iris ${version} reported installed on ${deviceSessionId}; stopping installer`)
+          console.log(`Iris ${version} reported installed for this ticket; stopping installer`)
           shutdown()
         }
       } catch {
