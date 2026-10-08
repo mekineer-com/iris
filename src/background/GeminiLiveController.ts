@@ -383,6 +383,7 @@ export class GeminiLiveController {
     this.pendingImage = pending
     await this.persistJournal()
     if (this.journalUnavailable) throw new Error("Local image journal unavailable")
+    if (this.pendingImage !== pending || generation !== this.generation) throw new Error("Photo send cancelled")
     if (pending.providerSent) return
 
     const activeSocket = this.socket
@@ -390,12 +391,14 @@ export class GeminiLiveController {
       await this.requestPhotoRetry(pending)
       return
     }
+    let sent: boolean
     try {
-      this.sendImageTurn(activeSocket, image.mimeType, image.data)
+      sent = this.sendImageTurn(activeSocket, image.mimeType, image.data)
     } catch {
       if (this.activityPauseReason) await this.requestPhotoRetry(pending)
       throw new Error(this.activityPauseReason || "Gemini image send failed")
     }
+    if (!sent) throw new Error("Photo send cancelled")
     pending.providerSent = true
     if (pending.imageSequence === undefined) {
       const event = this.enqueueEvent("image", "user", "Shared a photo.", undefined, mediaRef)
@@ -429,8 +432,9 @@ export class GeminiLiveController {
     this.callbacks.onPersistenceError(null)
   }
 
-  private sendImageTurn(socket: SocketLike, mimeType: "image/jpeg" | "image/png", data: string): void {
+  private sendImageTurn(socket: SocketLike, mimeType: "image/jpeg" | "image/png", data: string): boolean {
     if (this.activityPauseReason) throw new Error(this.activityPauseReason)
+    if (this.stopping || this.reflecting || !this.ready || this.socket !== socket || socket.readyState !== WS_OPEN) return false
     socket.send(JSON.stringify({
       clientContent: {
         turns: [{
@@ -440,6 +444,7 @@ export class GeminiLiveController {
         turnComplete: true,
       },
     }))
+    return true
   }
 
   private async retryPendingImage(userRequested = false): Promise<void> {
@@ -490,7 +495,7 @@ export class GeminiLiveController {
         return
       }
       try {
-        this.sendImageTurn(socket, mimeType, data)
+        if (!this.sendImageTurn(socket, mimeType, data)) return
       } catch {
         this.reportError(new Error("Gemini image replay send failed"))
         return
@@ -828,8 +833,6 @@ export class GeminiLiveController {
       this.providerAudioChunks += 1
     }
 
-    if (input) trace("provider.input_transcription", {length: input.length})
-    if (output) trace("provider.output_transcription", {length: output.length})
     if (this.reflecting) {
       if (input) throw new Error("Gemini returned input transcription during reflection")
       this.outputTranscript += output

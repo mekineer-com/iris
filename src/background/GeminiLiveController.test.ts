@@ -307,8 +307,8 @@ describe("GeminiLiveController", () => {
       }})
       await waitFor(() => logs.mock.calls.some(([event]) => String(event).endsWith("recall.end")))
       const detail = (event: string) => logs.mock.calls.find(([line]) => String(line).endsWith(event))?.[1]
-      expect(detail("provider.input_transcription")).toEqual({length: "Private fictional input".length})
-      expect(detail("provider.output_transcription")).toEqual({length: "Private fictional output".length})
+      expect(detail("provider.input_transcription")).toBeUndefined()
+      expect(detail("provider.output_transcription")).toBeUndefined()
       expect(detail("recall.begin")).toEqual({id: "trace-check", queryLength: "Private fictional query".length})
       expect(detail("recall.end")).toMatchObject({contextLength: "Private fictional memory".length})
       expect(JSON.stringify(logs.mock.calls)).not.toContain("Private fictional")
@@ -2006,21 +2006,35 @@ describe("GeminiLiveController", () => {
     expect(events.slice(-2).map((event: any) => event.status)).toEqual(["interrupted", "interrupted"])
   })
 
-  test("graceful Stop plays and persists one bounded reflection", async () => {
+  test.each(["snapshot", "journal", "replay"])("graceful Stop preserves reflection during late photo %s", async (phase) => {
     let finishSnapshot!: () => void
     const snapshotGate = new Promise<void>((resolve) => { finishSnapshot = resolve })
-    const h = harness({snapshotGate, storage: new FakeStorage()})
+    const storage = new FakeStorage()
+    if (phase === "replay") storage.values.set("openalma:gemini-session-v1", JSON.stringify({
+      version: 1, scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+      resumption: {handle: "", updatedAt: 0}, pendingTranscripts: [],
+      pendingImage: {imageId: "late-photo", mediaRef: "mentra_media/test-phone/late-photo.png",
+        providerSent: false, captureAfterCurrent: false, generation: 1, sessionId: "old-sitting", retryRequested: true},
+    }))
+    const h = harness({snapshotGate: phase === "snapshot" ? snapshotGate : undefined,
+      replayGates: phase === "replay" ? [snapshotGate] : [], storage})
     await start(h)
     completeTurn(h, "one", "answer one")
     completeTurn(h, "two", "answer two")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
 
-    const sending = h.controller.sendImage({imageId: "late-photo", mimeType: "image/png", data: "AQID"})
-    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot")))
+    const writes = storage.setCalls
+    if (phase === "journal") storage.setGate = snapshotGate
+    const sending = phase === "replay" ? h.controller.retryImage()
+      : h.controller.sendImage({imageId: "late-photo", mimeType: "image/png", data: "AQID"})
+    await waitFor(() => phase === "journal" ? storage.setCalls > writes
+      : h.requests.some((request) => request.url.endsWith(phase === "replay" ? "/snapshot/replay" : "/snapshot")))
     const stopping = h.controller.stop(true)
     await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
     finishSnapshot()
-    await expect(sending).rejects.toThrow("Photo send cancelled")
+    storage.setGate = null
+    if (phase === "replay") await sending
+    else await expect(sending).rejects.toThrow("Photo send cancelled")
     expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
     h.sockets[0].message({
       serverContent: {
