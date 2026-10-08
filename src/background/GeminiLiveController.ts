@@ -355,7 +355,7 @@ export class GeminiLiveController {
     if (!response.ok) throw new Error(`OpenAlma snapshot failed (${response.status})`)
     const result = (await response.json()) as {media_ref?: unknown}
     if (
-      this.stopping || generation !== this.generation || sessionId !== this.sessionId
+      this.stopping || this.reflecting || generation !== this.generation || sessionId !== this.sessionId
     ) {
       throw new Error("Photo send cancelled")
     }

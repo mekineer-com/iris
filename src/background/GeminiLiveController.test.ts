@@ -1990,14 +1990,21 @@ describe("GeminiLiveController", () => {
   })
 
   test("graceful Stop plays and persists one bounded reflection", async () => {
-    const h = harness()
+    let finishSnapshot!: () => void
+    const snapshotGate = new Promise<void>((resolve) => { finishSnapshot = resolve })
+    const h = harness({snapshotGate, storage: new FakeStorage()})
     await start(h)
     completeTurn(h, "one", "answer one")
     completeTurn(h, "two", "answer two")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
 
+    const sending = h.controller.sendImage({imageId: "late-photo", mimeType: "image/png", data: "AQID"})
+    await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot")))
     const stopping = h.controller.stop(true)
     await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    finishSnapshot()
+    await expect(sending).rejects.toThrow("Photo send cancelled")
+    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
     h.sockets[0].message({
       serverContent: {
         modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
