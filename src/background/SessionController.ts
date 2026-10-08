@@ -632,6 +632,7 @@ export class SessionController {
       await reportInstallation({...this.currentConfig(), soulId: this.soulId}, this.fetchFn, host)
     } catch (error) {
       console.error("[OpenAlma] installation report failed:", error)
+      this.lastError ??= error instanceof Error ? error.message : String(error)
       this.reportInstallationError()
     }
   }

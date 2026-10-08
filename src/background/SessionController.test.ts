@@ -702,6 +702,7 @@ describe("SessionController", () => {
     process.env.NODE_ENV = "production"
     const reports: string[] = []
     const hostVersions: string[] = []
+    let reportStatus = 200
     try {
       const h = setup({stored: {"openalma.soul-id": "Stored Soul",
         "openalma.host": JSON.stringify({host_package: "com.mentra.mentra.openalma", host_version: "3.2.0", deviceSessionId: CONFIG.deviceSessionId})}, fetchFn: (async (url, init) => {
@@ -710,7 +711,7 @@ describe("SessionController", () => {
         if (String(url).endsWith("/installation/seen")) {
           reports.push(body.soul_id)
           hostVersions.push(body.host_version)
-          return Response.json({ok: true})
+          return Response.json({ok: true}, {status: reportStatus})
         }
         return Response.json({soul_id: body.soul_id, created: true})
       }) as typeof fetch})
@@ -719,6 +720,15 @@ describe("SessionController", () => {
       await h.session.handlers["openalma:set-soul"]({soulId: "Selected Soul", useExisting: false})
       expect(reports).toEqual(["Stored Soul", "Selected Soul"])
       expect(hostVersions).toEqual(["3.2.0", "3.2.1"])
+      reportStatus = 503
+      await h.session.handlers["openalma:set-soul"]({soulId: "Selected Soul", useExisting: true})
+      expect(lastSnapshot(h.session)).toMatchObject({memuAvailable: false,
+        soulId: "Selected Soul", lastError: "Installation report failed (503)"})
+      reportStatus = 200
+      h.session.stored.set("openalma.host", "{}")
+      await h.session.handlers["openalma:set-soul"]({soulId: "Selected Soul", useExisting: true})
+      expect(lastSnapshot(h.session)).toMatchObject({memuAvailable: false,
+        lastError: "Invalid Mentra host marker"})
     } finally {
       process.env.NODE_ENV = previous
     }

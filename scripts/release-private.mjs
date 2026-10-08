@@ -30,6 +30,11 @@ export function assertPrivateReleaseConfig(env) {
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
     throw new Error("Iris base URL must be an http or https URL without credentials, query, or fragment")
   }
+  const hostname = url.hostname.replace(/\.$/, "")
+  if (hostname === "localhost" || hostname.endsWith(".localhost") ||
+      /^(?:127\.|\[::1\]$|\[::ffff:7f[0-9a-f]{2}:)/.test(hostname)) {
+    throw new Error("Iris base URL must be phone-reachable, not localhost or loopback")
+  }
   if (!["com.mentra.mentra", "com.mentra.mentra.openalma"].includes(env.MENTRA_RELEASE_HOST_PACKAGE)) {
     throw new Error("Unknown Mentra app installation")
   }

@@ -38,6 +38,11 @@ describe("private release URI", () => {
       expect(assertPrivateReleaseConfig({...env, MENTRA_PUBLIC_OPENALMA_BASE_URL: `http://${host}:8099`})).toBe(host)
       expect(releaseArgs(host).slice(0, 5)).toEqual(["release", "--host", host, "--port", "6789"])
     }
+    for (const host of ["localhost", "LOCALHOST.", "phone.localhost", "127.0.0.1", "127.8.9.10",
+      "127.1", "2130706433", "[::1]", "[0:0:0:0:0:0:0:1]", "[::ffff:127.0.0.1]"]) {
+      expect(() => assertPrivateReleaseConfig({...env, MENTRA_PUBLIC_OPENALMA_BASE_URL: `http://${host}:8099`}))
+        .toThrow("phone-reachable")
+    }
     expect(() => assertPrivateReleaseConfig({...env, MENTRA_PUBLIC_OPENALMA_USER_ID: ""})).toThrow(
       "MENTRA_PUBLIC_OPENALMA_USER_ID",
     )

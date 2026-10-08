@@ -1348,14 +1348,14 @@ export class GeminiLiveController {
   }
 
   private async reconcileJournal(): Promise<void> {
-    this.pendingEvents = this.pendingEvents.filter((event) => event.sequence >= this.nextTranscriptSequence)
-    for (let index = 0; index < this.pendingEvents.length; index += 1) {
-      if (this.pendingEvents[index].sequence !== this.nextTranscriptSequence + index) {
-        this.pendingEvents = []
-        await this.persistJournal()
+    const pendingEvents = this.pendingEvents.filter((event) => event.sequence >= this.nextTranscriptSequence)
+    for (let index = 0; index < pendingEvents.length; index += 1) {
+      if (pendingEvents[index].sequence !== this.nextTranscriptSequence + index) {
+        this.persistenceFatal = true
         throw new Error("Local transcript backup has a sequence gap")
       }
     }
+    this.pendingEvents = pendingEvents
     if (this.pendingImage?.caption && this.pendingEvents.some(
       (event) => event.event_id === `${this.pendingImage!.sessionId}:${this.pendingImage!.assistantSequence}`,
     )) {

@@ -1792,6 +1792,7 @@ describe("GeminiLiveController", () => {
         ],
       }),
     )
+    const savedJournal = storage.values.get("openalma:gemini-session-v1")!
     const h = harness({
       storage,
       startBody: {
@@ -1831,6 +1832,22 @@ describe("GeminiLiveController", () => {
     })
     await h.controller.stop(true)
     expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
+
+    const recovery = JSON.parse(savedJournal)
+    recovery.pendingImage = {imageId: "pending-photo", mediaRef: "mentra_media/TestSoul/photo.png",
+      providerSent: false, captureAfterCurrent: false, generation: 1, sessionId: "old-sitting"}
+    storage.values.set("openalma:gemini-session-v1", JSON.stringify(recovery))
+    const gap = harness({storage, startBody: {
+      session_id: "different-history", next_transcript_sequence: 39, ephemeral_token: "ephemeral/test",
+      websocket: {api_version: "v1alpha", method: "BidiGenerateContentConstrained",
+        input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
+      lease_seconds: 90, session_warning_seconds: 0,
+    }})
+    await expect(gap.controller.start()).rejects.toThrow("Local transcript backup has a sequence gap")
+    expect(JSON.parse(storage.values.get("openalma:gemini-session-v1")!)).toEqual(recovery)
+    expect(gap.sockets).toHaveLength(0)
+    expect(gap.requests.some((request) => request.url.endsWith("/transcripts/append"))).toBe(false)
+    expect(gap.requests.some((request) => request.url.endsWith("/different-history/end"))).toBe(true)
   })
 
   test("ignores a resumption handle older than the measured token window", async () => {
