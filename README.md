@@ -20,6 +20,13 @@ Before changing the Gemini wire or diagnosing provider behavior, read
 [`GEMINI_LIVE.md`](GEMINI_LIVE.md). It pins Iris's model-specific contract,
 official sources, proven behavior, and local redacted fixtures.
 
+Soul Presence is fixed at Start: narrative self, both identity anchors, the flat
+**My Categories** list, and recent conversations. Working thoughts and intentions
+stay live instead: Gemini can read their current state, save a working thought,
+and complete or let go of an intention through server tools. Lost write results
+are uncertain; Iris never automatically repeats those writes. Connection renewal
+keeps the original entry context.
+
 Iris stores its OpenAlma connection profile and selected soul in phone-local
 `session.storage`. With no profile it asks you to install Iris from the launcher
 and makes no OpenAlma or Gemini request. Discovery checks the one shared OpenAlma

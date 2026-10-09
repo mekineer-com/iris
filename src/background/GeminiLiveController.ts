@@ -68,9 +68,10 @@ type SessionJournal = {
 }
 
 type PendingToolCall = {
+  name: string
   generation: number
   sessionId: string
-  response?: string
+  response?: string | Record<string, unknown>
 }
 
 function trace(event: string, detail: Record<string, unknown> = {}): void {
@@ -96,7 +97,9 @@ export type GeminiLiveControllerOptions = {
 const WS_OPEN = 1
 const REQUEST_TIMEOUT_MS = 10_000
 const SNAPSHOT_TIMEOUT_MS = 120_000
-const RECALL_TIMEOUT_MS = 30_000
+const TOOL_TIMEOUT_MS = 30_000
+const WRITE_UNCERTAINTY_MESSAGE =
+  "Write outcome is uncertain; it may have saved. Read current working state before deciding whether to try again."
 const REFLECTION_TIMEOUT_MS = 8_000
 const RECONNECT_SETUP_ATTEMPTS = 6
 const GO_AWAY_MARGIN_MS = 2_000
@@ -970,36 +973,63 @@ export class GeminiLiveController {
     if (!Array.isArray(calls) || !calls.length) {
       throw new Error("Gemini returned malformed tool call")
     }
-    const parsed: Array<{id: string; query: string}> = []
+    const parsed: Array<{id: string; name: string; args: Record<string, unknown>}> = []
     const ids = new Set<string>()
     for (const call of calls) {
       const id = typeof call?.id === "string" ? call.id.trim() : ""
       const name = typeof call?.name === "string" ? call.name : ""
       const args = call?.args
-      const query = args && typeof args === "object" && !Array.isArray(args)
-        ? (args as {query?: unknown}).query
-        : undefined
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        throw new Error("Gemini returned malformed tool arguments")
+      }
+      let keys: string[]
+      let valid: boolean
+      switch (name) {
+        case "recall_memory":
+          keys = ["query"]
+          valid = typeof args.query === "string" && !!args.query.trim()
+          break
+        case "read_working_state":
+          keys = []
+          valid = true
+          break
+        case "save_working_thought":
+          keys = ["thought"]
+          valid = typeof args.thought === "string" && !!args.thought.trim()
+          break
+        case "annul_intention":
+          keys = ["intention_id", "status", "note"]
+          valid = typeof args.intention_id === "string" && !!args.intention_id.trim() &&
+            (args.status === "completed" || args.status === "deleted") &&
+            (args.note === undefined || typeof args.note === "string")
+          break
+        default:
+          throw new Error("Gemini returned unknown tool call")
+      }
       if (
         !id ||
-        name !== "recall_memory" ||
-        typeof query !== "string" ||
-        !query.trim() ||
-        Object.keys(args as object).some((key) => key !== "query") ||
+        !valid ||
+        Object.keys(args).some((key) => !keys.includes(key)) ||
         ids.has(id) ||
-        this.pendingToolCalls.has(id)
+        this.pendingToolCalls.has(id) ||
+        this.deliveredToolResultIds.has(id)
       ) {
-        throw new Error("Gemini returned malformed recall_memory call")
+        throw new Error(`Gemini returned malformed ${name} call`)
       }
       ids.add(id)
-      parsed.push({id, query: query.trim()})
+      parsed.push({id, name, args: Object.fromEntries(Object.entries(args).map(([key, value]) =>
+        [key, typeof value === "string" ? value.trim() : value],
+      ))})
     }
-    for (const {id, query} of parsed) {
+    for (const {id, name, args} of parsed) {
       const pending: PendingToolCall = {
+        name,
         generation: this.generation,
         sessionId: this.sessionId,
       }
       this.pendingToolCalls.set(id, pending)
-      void this.runRecall(id, query, pending)
+      if (name === "recall_memory") void this.runRecall(id, args.query as string, pending)
+      else void this.runWorkingTool(id, args, pending)
     }
   }
 
@@ -1009,7 +1039,13 @@ export class GeminiLiveController {
     if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string" || !id.trim())) {
       throw new Error("Gemini returned malformed tool cancellation")
     }
-    for (const id of ids) this.pendingToolCalls.delete(id)
+    for (const id of ids) {
+      const pending = this.pendingToolCalls.get(id)
+      if (pending?.name === "save_working_thought" || pending?.name === "annul_intention") {
+        this.callbacks.onPersistenceError(WRITE_UNCERTAINTY_MESSAGE)
+      }
+      this.pendingToolCalls.delete(id)
+    }
   }
 
   private async runRecall(id: string, query: string, pending: PendingToolCall): Promise<void> {
@@ -1018,32 +1054,34 @@ export class GeminiLiveController {
     let response: Response
     try {
       response = await this.request(
-        `/integration/mentra/session/${this.sessionId}/recall`,
+        `/integration/mentra/session/${pending.sessionId}/recall`,
         {user_id: this.config.userId, soul_id: this.config.soulId, query},
-        RECALL_TIMEOUT_MS,
+        TOOL_TIMEOUT_MS,
       )
     } catch {
       trace("recall.network_failure", {id, elapsedMs: Date.now() - startedAt})
-      this.completeRecall(id, pending, "Memory recall is temporarily unavailable.", true)
+      this.completeToolCall(id, pending, "Memory recall is temporarily unavailable.", true)
       return
     }
+    if (!this.isCurrentToolCall(id, pending)) return
     if (response.status === 409) {
       const body = await response.clone().json().catch(() => null)
+      if (!this.isCurrentToolCall(id, pending)) return
       if (body?.detail?.code === "soul_paused") {
         this.activityPauseReason = body.detail.message
         this.callbacks.onPersistenceError(this.activityPauseReason)
-        this.completeRecall(id, pending, "Memory recall is paused; recovery is in OpenAlma launcher.", false)
+        this.completeToolCall(id, pending, "Memory recall is paused; recovery is in OpenAlma launcher.", false)
         return
       }
     }
     if ([400, 401, 403, 404, 409, 422, 503].includes(response.status)) {
       trace("recall.fatal", {id, status: response.status, elapsedMs: Date.now() - startedAt})
-      this.failRecall(id, pending, `OpenAlma memory recall failed (${response.status})`)
+      this.failToolCall(id, pending, `OpenAlma memory recall failed (${response.status})`)
       return
     }
     if (!response.ok) {
       trace("recall.temporary_failure", {id, status: response.status, elapsedMs: Date.now() - startedAt})
-      this.completeRecall(id, pending, "Memory recall is temporarily unavailable.", true)
+      this.completeToolCall(id, pending, "Memory recall is temporarily unavailable.", true)
       return
     }
     const body = await response.json().catch(() => null) as {context?: unknown; retrieve_ms?: unknown} | null
@@ -1054,22 +1092,72 @@ export class GeminiLiveController {
       (body.retrieve_ms !== null && body.retrieve_ms !== undefined &&
         (typeof body.retrieve_ms !== "number" || !Number.isFinite(body.retrieve_ms)))
     ) {
-      this.failRecall(id, pending, "OpenAlma memory recall returned an invalid response")
+      this.failToolCall(id, pending, "OpenAlma memory recall returned an invalid response")
       return
     }
-    this.completeRecall(id, pending, body.context.trim(), false)
+    this.completeToolCall(id, pending, body.context.trim(), false)
     trace("recall.end", {id, elapsedMs: Date.now() - startedAt, contextLength: body.context.trim().length})
   }
 
-  private completeRecall(id: string, pending: PendingToolCall, result: string, failed: boolean): void {
-    if (this.pendingToolCalls.get(id) !== pending) return
+  private async runWorkingTool(id: string, args: Record<string, unknown>, pending: PendingToolCall): Promise<void> {
+    const endpoint = pending.name === "read_working_state" ? "working-state" :
+      pending.name === "save_working_thought" ? "working-thought" : "annul-intention"
+    const writing = pending.name !== "read_working_state"
+    const unavailable = writing
+      ? WRITE_UNCERTAINTY_MESSAGE
+      : "Working state is temporarily unavailable."
+    let response: Response
+    try {
+      response = await this.request(
+        `/integration/mentra/session/${pending.sessionId}/${endpoint}`,
+        {user_id: this.config.userId, soul_id: this.config.soulId, ...args},
+        TOOL_TIMEOUT_MS,
+      )
+    } catch {
+      this.completeToolCall(id, pending, {ok: false, status: writing ? "uncertain" : "unavailable", message: unavailable}, true)
+      return
+    }
+    if (!this.isCurrentToolCall(id, pending)) return
+    const body = await response.json().catch(() => null)
+    if (!this.isCurrentToolCall(id, pending)) return
+    if (body?.ok === false && body.status === "busy" && body.message === "busy, not saved") {
+      this.completeToolCall(id, pending, body, false)
+      return
+    }
+    if (response.status === 409 && body?.detail?.code === "soul_paused") {
+      this.activityPauseReason = body.detail.message
+      this.callbacks.onPersistenceError(this.activityPauseReason)
+      this.completeToolCall(id, pending, {ok: false, status: "paused", message: "Working state is paused; recovery is in OpenAlma launcher."}, false)
+      return
+    }
+    if ([400, 401, 403, 404, 409, 422].includes(response.status)) {
+      this.failToolCall(id, pending, `OpenAlma working-state tool failed (${response.status})`)
+      return
+    }
+    if (!response.ok || !body || typeof body.ok !== "boolean") {
+      this.completeToolCall(id, pending, {ok: false, status: writing ? "uncertain" : "unavailable", message: unavailable}, true)
+      return
+    }
+    this.completeToolCall(id, pending, body, false)
+  }
+
+  private isCurrentToolCall(id: string, pending: PendingToolCall): boolean {
+    return this.pendingToolCalls.get(id) === pending &&
+      pending.generation === this.generation && pending.sessionId === this.sessionId &&
+      !this.stopping && !this.reflecting
+  }
+
+  private completeToolCall(id: string, pending: PendingToolCall, result: string | Record<string, unknown>, failed: boolean): void {
+    if (!this.isCurrentToolCall(id, pending)) return
     pending.response = result
-    if (failed) this.callbacks.onPersistenceError("Memory recall unavailable; voice is continuing")
+    if (failed) this.callbacks.onPersistenceError(pending.name === "recall_memory"
+      ? "Memory recall unavailable; voice is continuing"
+      : typeof result === "object" ? String(result.message) : result)
     this.flushToolResponses()
   }
 
-  private failRecall(id: string, pending: PendingToolCall, message: string): void {
-    if (this.pendingToolCalls.get(id) !== pending) return
+  private failToolCall(id: string, pending: PendingToolCall, message: string): void {
+    if (!this.isCurrentToolCall(id, pending)) return
     this.pendingToolCalls.delete(id)
     this.reportError(new Error(message))
   }
@@ -1077,12 +1165,7 @@ export class GeminiLiveController {
   private flushToolResponses(): void {
     for (const [id, pending] of this.pendingToolCalls) {
       if (!pending.response) continue
-      if (
-        pending.generation !== this.generation ||
-        pending.sessionId !== this.sessionId ||
-        this.stopping ||
-        this.reflecting
-      ) {
+      if (!this.isCurrentToolCall(id, pending)) {
         this.pendingToolCalls.delete(id)
         continue
       }
@@ -1091,8 +1174,8 @@ export class GeminiLiveController {
         toolResponse: {
           functionResponses: [{
             id,
-            name: "recall_memory",
-            response: {result: pending.response},
+            name: pending.name,
+            response: typeof pending.response === "string" ? {result: pending.response} : pending.response,
             scheduling: "SILENT",
           }],
         },
@@ -1595,20 +1678,24 @@ export class GeminiLiveController {
   }
 
   private async heartbeat(): Promise<void> {
+    const generation = this.generation
+    const sessionId = this.sessionId
     trace("provider.heartbeat", {audioFramesSent: this.audioFramesSent})
     try {
-      const response = await this.request(`/integration/mentra/session/${this.sessionId}/heartbeat`, {
+      const response = await this.request(`/integration/mentra/session/${sessionId}/heartbeat`, {
         user_id: this.config.userId,
         soul_id: this.config.soulId,
       })
+      if (!this.reconnectOwned(generation, sessionId)) return
       if (response.status === 404) {
         this.reportError(new Error("OpenAlma heartbeat failed (404)"))
       } else if (!response.ok) {
         trace("provider.heartbeat.missed", {status: response.status})
         this.expireMissedHeartbeat()
       } else {
-        this.lastHeartbeatSuccessAt = Date.now()
         const body = await response.json().catch(() => null)
+        if (!this.reconnectOwned(generation, sessionId)) return
+        this.lastHeartbeatSuccessAt = Date.now()
         const previousPause = this.activityPauseReason
         this.activityPauseReason = typeof body?.pause_reason === "string" && body.pause_reason
           ? `${this.config.soulId} is paused. Retry in OpenAlma launcher.` : null
@@ -1623,6 +1710,7 @@ export class GeminiLiveController {
         }
       }
     } catch (error) {
+      if (!this.reconnectOwned(generation, sessionId)) return
       trace("provider.heartbeat.missed", {
         error: error instanceof Error ? error.message : String(error),
       })

@@ -85,6 +85,7 @@ function harness(
     heartbeatStatus?: number
     heartbeatThrows?: boolean
     heartbeatBody?: unknown
+    heartbeatGate?: Promise<void>
     startGate?: Promise<void>
     startStatus?: number
     startBody?: unknown
@@ -108,6 +109,10 @@ function harness(
     recallGate?: Promise<void>
     recallStatus?: number
     recallBody?: unknown
+    workingGate?: Promise<void>
+    workingStatus?: number
+    workingBodies?: unknown[]
+    workingThrows?: boolean
     storage?: FakeStorage
     warningSeconds?: number
   } = {},
@@ -134,6 +139,7 @@ function harness(
   const replayResponses = [...(options.replayResponses ?? [])]
   const replayStatuses = [...(options.replayStatuses ?? [])]
   const replayBodies = [...(options.replayBodies ?? [])]
+  const workingBodies = [...(options.workingBodies ?? [])]
   let refreshedTokens = 0
   const fetchFn = async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input)
@@ -168,6 +174,7 @@ function harness(
       )
     }
     if (url.endsWith("/heartbeat")) {
+      if (options.heartbeatGate) await options.heartbeatGate
       if (options.heartbeatThrows) throw new Error("fictional network miss")
       return Response.json(options.heartbeatBody ?? {ok: true}, {status: options.heartbeatStatus ?? 200})
     }
@@ -177,6 +184,11 @@ function harness(
         options.recallBody ?? {ok: true, context: "A compact fictional memory.", retrieve_ms: 123},
         {status: options.recallStatus ?? 200},
       )
+    }
+    if (["/working-state", "/working-thought", "/annul-intention"].some((path) => url.endsWith(path))) {
+      if (options.workingGate) await options.workingGate
+      if (options.workingThrows) throw new Error("fictional lost write acknowledgement")
+      return Response.json(workingBodies.shift() ?? {ok: true, status: "saved"}, {status: options.workingStatus ?? 200})
     }
     if (url.endsWith("/transcripts/append")) {
       await appendGates.shift()
@@ -1449,6 +1461,199 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("mixed live tools preserve names, scopes, fresh state and explicit outcomes", async () => {
+    const outcomes = [
+      {ok: true, working_thoughts: ["Fictional beacon"], intentions: [{id: "intent-1", text: "Sketch the beacon"}]},
+      {ok: true, status: "saved"},
+      {ok: true, status: "removed", memory_ids: ["completion-memory"]},
+      {ok: false, status: "not_found", message: "intention not found"},
+      {ok: true, working_thoughts: ["Fictional beacon updated"], intentions: []},
+    ]
+    const h = harness({workingBodies: outcomes})
+    await start(h)
+    const calls = [
+      {id: "read-1", name: "read_working_state", args: {}},
+      {id: "thought-1", name: "save_working_thought", args: {thought: " Fictional beacon updated "}},
+      {id: "annul-1", name: "annul_intention", args: {intention_id: "intent-1", status: "completed", note: " Done "}},
+      {id: "annul-2", name: "annul_intention", args: {intention_id: "intent-2", status: "deleted"}},
+      {id: "read-2", name: "read_working_state", args: {}},
+      {id: "recall-mixed", name: "recall_memory", args: {query: "beacon"}},
+    ]
+    h.sockets[0].message({toolCall: {functionCalls: calls}})
+    await waitFor(() => h.sockets[0].sent.filter(value => JSON.parse(value).toolResponse).length === calls.length)
+    const responses = h.sockets[0].sent.flatMap(value => JSON.parse(value).toolResponse?.functionResponses ?? [])
+    for (const [index, call] of calls.entries()) {
+      expect(responses.find(response => response.id === call.id)).toEqual({
+        id: call.id, name: call.name, scheduling: "SILENT",
+        response: outcomes[index] ?? {result: "A compact fictional memory."},
+      })
+    }
+    const requests = h.requests.filter(request => /\/(working-state|working-thought|annul-intention)$/.test(request.url))
+    expect(requests.map(request => request.url)).toEqual([
+      "working-state", "working-thought", "annul-intention", "annul-intention", "working-state",
+    ].map(path => `${CONFIG.baseUrl}/integration/mentra/session/sitting-1/${path}`))
+    expect(requests.map(request => request.body)).toEqual([
+      {}, {thought: "Fictional beacon updated"},
+      {intention_id: "intent-1", status: "completed", note: "Done"},
+      {intention_id: "intent-2", status: "deleted"}, {},
+    ].map(args => ({user_id: CONFIG.userId, soul_id: CONFIG.soulId, ...args})))
+    expect(requests.every(request => request.authorization === null)).toBe(true)
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("working tools pass busy outcomes without retries or ending voice", async () => {
+    for (const status of [200, 409]) {
+      const busy = {ok: false, status: "busy", message: "busy, not saved"}
+      const h = harness({workingStatus: status, workingBodies: [busy]})
+      await start(h)
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "busy-write", name: "save_working_thought", args: {thought: "beacon"}},
+      ]}})
+      await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
+      const response = JSON.parse(h.sockets[0].sent.find(value => JSON.parse(value).toolResponse)!)
+      expect(response.toolResponse.functionResponses[0]).toMatchObject({response: busy, scheduling: "SILENT"})
+      expect(h.requests.filter(request => request.url.endsWith("/working-thought"))).toHaveLength(1)
+      expect(h.errors).toEqual([])
+      await h.controller.stop()
+    }
+  })
+
+  test("lost, failed or malformed write outcomes are uncertain and never automatically retried", async () => {
+    for (const options of [
+      {workingThrows: true}, {workingStatus: 500}, {workingStatus: 503}, {workingBodies: [{}]},
+    ]) {
+      const h = harness(options)
+      await start(h)
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "lost-write", name: "annul_intention", args: {intention_id: "intent-1", status: "completed"}},
+      ]}})
+      await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
+      const response = JSON.parse(h.sockets[0].sent.find(value => JSON.parse(value).toolResponse)!)
+      expect(response.toolResponse.functionResponses[0]).toMatchObject({
+        name: "annul_intention", response: {ok: false, status: "uncertain"}, scheduling: "SILENT",
+      })
+      expect(response.toolResponse.functionResponses[0].response.message).toContain("may have saved")
+      expect(h.requests.filter(request => request.url.endsWith("/annul-intention"))).toHaveLength(1)
+      expect(h.errors).toEqual([])
+      await h.controller.stop()
+    }
+  })
+
+  test("working tools validate the entire batch before admitting a write", async () => {
+    for (const call of [
+      {name: "read_working_state", args: {user_id: "Other User"}},
+      {name: "save_working_thought", args: {thought: " "}},
+      {name: "save_working_thought", args: {thought: 1}},
+      {name: "annul_intention", args: {intention_id: " ", status: "completed"}},
+      {name: "annul_intention", args: {intention_id: "intent-1", status: "active"}},
+      {name: "annul_intention", args: {intention_id: "intent-1", status: "deleted", note: null}},
+      {name: "read_working_state", args: []},
+    ]) {
+      const h = harness()
+      await start(h)
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "valid-first", name: "save_working_thought", args: {thought: "beacon"}},
+        {id: "invalid", ...call},
+      ]}})
+      expect(h.errors).toHaveLength(1)
+      expect(h.requests.some(request => /\/(working-state|working-thought|annul-intention)$/.test(request.url))).toBe(false)
+      await h.controller.stop()
+    }
+  })
+
+  test("cancelled and stopped writes discard late responses without undo or replay", async () => {
+    for (const action of ["cancel", "stop", "restart"] as const) {
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      const h = harness({workingGate: gate})
+      await start(h)
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "late-write", name: "save_working_thought", args: {thought: "beacon"}},
+      ]}})
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/working-thought")))
+      if (action === "cancel") h.sockets[0].message({toolCallCancellation: {ids: ["late-write"]}})
+      else await h.controller.stop()
+      if (action === "cancel") expect(h.persistenceErrors.some(message => message?.includes("may have saved"))).toBe(true)
+      if (action === "restart") {
+        const starting = h.controller.start()
+        await waitFor(() => h.sockets.length === 2)
+        h.sockets[1].open()
+        h.sockets[1].message({setupComplete: {}})
+        await starting
+      }
+      release()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(h.sockets.some(socket => socket.sent.some(value => JSON.parse(value).toolResponse))).toBe(false)
+      expect(h.requests.filter(request => request.url.endsWith("/working-thought"))).toHaveLength(1)
+      expect(h.errors).toEqual([])
+      await h.controller.stop()
+    }
+  })
+
+  test("pending write result follows socket replacement without replaying the HTTP write", async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const h = harness({workingGate: gate})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "fictional-handle"}})
+    h.sockets[0].message({toolCall: {functionCalls: [
+      {id: "replacement-write", name: "save_working_thought", args: {thought: "beacon"}},
+    ]}})
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/working-thought")))
+    h.sockets[0].error()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    h.sockets[1].message({setupComplete: {}})
+    release()
+    await waitFor(() => h.sockets[1].sent.some(value => JSON.parse(value).toolResponse))
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).toolResponse)).toBe(false)
+    expect(h.requests.filter(request => request.url.endsWith("/working-thought"))).toHaveLength(1)
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("working reads fail closed for an ended sitting and respect pause", async () => {
+    for (const status of [404, 409]) {
+      const h = harness({workingStatus: status, workingBodies: [{detail: {
+        code: "soul_paused", message: "Fictional Soul is paused. Retry in OpenAlma launcher.",
+      }}]})
+      await start(h)
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "read-admission", name: "read_working_state", args: {}},
+      ]}})
+      if (status === 404) {
+        await waitFor(() => h.errors.length > 0)
+        expect(h.errors).toEqual(["OpenAlma working-state tool failed (404)"])
+        expect(h.sockets[0].sent.some(value => JSON.parse(value).toolResponse)).toBe(false)
+      } else {
+        await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
+        expect(h.controller.activityPauseReason).toContain("paused")
+        expect(h.errors).toEqual([])
+      }
+      await h.controller.stop()
+    }
+  })
+
+  test("pending writes do not block provider audio or tool-boundary speech", async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const h = harness({workingGate: gate})
+    await start(h)
+    h.sockets[0].message({
+      serverContent: {inputTranscription: {text: "Remember the beacon"}, turnComplete: true},
+      toolCall: {functionCalls: [{id: "audio-write", name: "save_working_thought", args: {thought: "beacon"}}]},
+    })
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/working-thought")))
+    h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
+    expect(h.audio).toEqual(["AAAAAA=="])
+    release()
+    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "The beacon matters"}, turnComplete: true}})
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
   test("temporary recall failure is SILENT and nonfatal", async () => {
     for (const status of [429, 500, 502]) {
       const h = harness({recallStatus: status, recallBody: {detail: "private upstream detail"}})
@@ -1488,6 +1693,36 @@ describe("GeminiLiveController", () => {
     await h.controller.stop(true)
     expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
     expect(h.requests.some(request => request.url.endsWith('/end'))).toBe(true)
+  })
+
+  test("a discarded recall cannot pause a replacement sitting", async () => {
+    for (const action of ["cancel", "restart"] as const) {
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      const h = harness({recallGate: gate, recallStatus: 409, recallBody: {detail: {
+        code: "soul_paused", message: "Old sitting pause",
+      }}})
+      await start(h)
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "old-recall", name: "recall_memory", args: {query: "beacon"}},
+      ]}})
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/recall")))
+      if (action === "cancel") h.sockets[0].message({toolCallCancellation: {ids: ["old-recall"]}})
+      else {
+        await h.controller.stop()
+        const starting = h.controller.start()
+        await waitFor(() => h.sockets.length === 2)
+        h.sockets[1].open()
+        h.sockets[1].message({setupComplete: {}})
+        await starting
+      }
+      release()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(h.controller.activityPauseReason).toBeNull()
+      expect(h.persistenceErrors.filter(message => message === "Old sitting pause")).toEqual([])
+      expect(h.errors).toEqual([])
+      await h.controller.stop()
+    }
   })
 
   test("recall scope, internal, and config failures are fatal without exposing the query", async () => {
@@ -1630,7 +1865,7 @@ describe("GeminiLiveController", () => {
     unknown.sockets[0].message({
       toolCall: {functionCalls: [{id: "call-x", name: "other_tool", args: {query: "x"}}]},
     })
-    expect(unknown.errors).toEqual(["Gemini returned malformed recall_memory call"])
+    expect(unknown.errors).toEqual(["Gemini returned unknown tool call"])
     await unknown.controller.stop()
 
     let release!: () => void
@@ -2558,6 +2793,33 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.errors.length === 1)
     expect(h.errors).toEqual(["OpenAlma heartbeat failed (404)"])
     await h.controller.stop()
+  })
+
+  test("an old heartbeat cannot fail or pause a replacement sitting", async () => {
+    for (const options of [
+      {heartbeatStatus: 404},
+      {heartbeatThrows: true},
+      {heartbeatBody: {ok: true, pause_reason: "Old sitting pause"}},
+    ]) {
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      const h = harness({heartbeatMs: 60_000, heartbeatGate: gate, ...options})
+      await start(h)
+      const pending = Reflect.get(h.controller, "heartbeat").call(h.controller)
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/heartbeat")))
+      await h.controller.stop()
+      const starting = h.controller.start()
+      await waitFor(() => h.sockets.length === 2)
+      h.sockets[1].open()
+      h.sockets[1].message({setupComplete: {}})
+      await starting
+      release()
+      await pending
+      expect(h.controller.activityPauseReason).toBeNull()
+      expect(h.errors).toEqual([])
+      expect(h.sockets[1].readyState).toBe(1)
+      await h.controller.stop()
+    }
   })
 
   test("heartbeat surfaces a background image-memory failure", async () => {
