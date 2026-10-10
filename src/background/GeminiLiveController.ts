@@ -57,7 +57,6 @@ type StorageLike = {
   get(key: string): Promise<string | null>
   keys(): Promise<string[]>
   set(key: string, value: string): Promise<void>
-  delete(key: string): Promise<void>
 }
 
 type SessionJournal = {
@@ -110,6 +109,38 @@ export const RECOVERED_CHATS_KEY = "openalma:recovered-chats"
 const RESUMPTION_MAX_AGE_MS = 30 * 60 * 1000
 export const SITTING_REFLECTION_PROMPT =
   "Reflect briefly in first person on the emotional tone, subtext, or meaningful shift in this sitting that the literal transcript may not preserve. Do not recap the conversation. Respond with one or two natural sentences, or exactly NO_SUMMARY if nothing worthwhile would be added."
+
+function selectJournalKey(keys: string[], fresh = false): string {
+  const prefix = `${JOURNAL_KEY}:`
+  let generation = 0
+  for (const key of keys) {
+    const suffix = key.slice(prefix.length)
+    const value = Number(suffix)
+    if (key.startsWith(prefix) && Number.isSafeInteger(value) && String(value) === suffix && value > generation) {
+      generation = value
+    }
+  }
+  generation += Number(fresh)
+  return generation ? `${prefix}${generation}` : JOURNAL_KEY
+}
+
+async function readJournalValue(storage: Pick<StorageLike, "get" | "keys">, key: string, keys?: string[]): Promise<string | null> {
+  const raw = await storage.get(key)
+  if (raw === null && (keys ?? await storage.keys()).includes(key)) throw new Error("Local transcript backup could not be read")
+  return raw
+}
+
+export async function readSessionJournal(storage: Pick<StorageLike, "get" | "keys">) {
+  let keys: string[]
+  try { keys = await storage.keys() } catch { return {key: null, raw: null, unreadable: true} }
+  const key = selectJournalKey(keys)
+  try {
+    const raw = await readJournalValue(storage, key, keys)
+    return {key, raw: raw || null, unreadable: false}
+  } catch {
+    return {key: selectJournalKey(keys, true), raw: null, unreadable: true}
+  }
+}
 
 export function journalSoulId(raw: string | null, config: Pick<OpenAlmaConfig, "userId" | "deviceSessionId">): string | null {
   try {
@@ -175,6 +206,7 @@ export class GeminiLiveController {
   private appendTail: Promise<void> = Promise.resolve()
   private journalTail: Promise<void> = Promise.resolve()
   private journalLoaded = false
+  private journalKey: string | null = JOURNAL_KEY
   private loadedJournal: string | null = null
   private persistenceFatal = false
   private journalUnavailable = false
@@ -1368,17 +1400,14 @@ export class GeminiLiveController {
       this.journalLoaded = true
       return
     }
-    let raw: string | null
-    try {
-      raw = await this.readJournalValue(JOURNAL_KEY)
-    } catch {
-      if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
-      this.journalUnavailable = true
-      this.callbacks.onPersistenceError("Local transcript backup unavailable")
-      throw new Error("Local transcript backup unavailable")
-    }
+    const selected = await readSessionJournal(this.storage)
     if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
+    this.journalKey = selected.key
+    const raw = selected.raw
     this.loadedJournal = raw
+    if (selected.unreadable) {
+      this.callbacks.onPersistenceError("Previous local backup kept aside; starting a fresh backup")
+    }
     if (raw === null) {
       this.journalLoaded = true
       return
@@ -1400,11 +1429,10 @@ export class GeminiLiveController {
       !this.validPendingEvents(journal.pendingTranscripts) ||
       !this.validPendingImage(journal.pendingImage)
     ) {
-      await this.archiveJournal(raw)
-      if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
+      await this.preserveJournal(raw, generation)
       this.journalLoaded = true
       this.callbacks.onPhotoRetryChange(false)
-      this.callbacks.onPersistenceError("Local conversation backup saved in recovered chats on this device")
+      this.callbacks.onPersistenceError("Original conversation backup kept on this device")
       return
     }
     this.pendingEvents = journal.pendingTranscripts.map((event) => ({...event}))
@@ -1499,8 +1527,7 @@ export class GeminiLiveController {
     const photoOutsideHistory = [this.pendingImage?.imageSequence, this.pendingImage?.assistantSequence]
       .some(sequence => sequence !== undefined && sequence >= this.nextTranscriptSequence + keep)
     if (this.loadedJournal !== null && (keep !== this.pendingEvents.length || photoOutsideHistory)) {
-      await this.archiveJournal(this.loadedJournal)
-      if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
+      await this.preserveJournal(this.loadedJournal, generation)
     }
     if (keep !== pendingEvents.length || photoOutsideHistory) {
       this.resumptionHandle = ""
@@ -1534,12 +1561,9 @@ export class GeminiLiveController {
     const write = this.journalTail.then(async () => {
       if (!this.storage || !this.journalLoaded) return
       try {
-        if (!this.resumptionHandle && !this.pendingEvents.length && !this.pendingImage) {
-          await this.storage.delete(JOURNAL_KEY)
-          this.journalUnavailable = false
-          return
-        }
-        await this.storage.set(JOURNAL_KEY, this.journalSnapshot())
+        this.journalKey ??= selectJournalKey(await this.storage.keys(), true)
+        const empty = !this.resumptionHandle && !this.pendingEvents.length && !this.pendingImage
+        await this.storage.set(this.journalKey, empty ? "" : this.journalSnapshot())
         this.journalUnavailable = false
       } catch {
         this.journalUnavailable = true
@@ -1569,7 +1593,7 @@ export class GeminiLiveController {
 
   private archiveJournal(raw: string): Promise<void> {
     const write = this.journalTail.then(async () => {
-      const previous = await this.readJournalValue(RECOVERED_CHATS_KEY)
+      const previous = await readJournalValue(this.storage!, RECOVERED_CHATS_KEY)
       let recovered: unknown
       try { recovered = JSON.parse(previous ?? "[]") } catch { recovered = null }
       // ponytail: one rare-recovery list; split entries into keys only if its size becomes a problem.
@@ -1584,10 +1608,13 @@ export class GeminiLiveController {
     return write
   }
 
-  private async readJournalValue(key: string): Promise<string | null> {
-    const raw = await this.storage!.get(key)
-    if (raw === null && (await this.storage!.keys()).includes(key)) throw new Error("Local transcript backup could not be read")
-    return raw
+  private async preserveJournal(raw: string, generation: number): Promise<void> {
+    try { await this.archiveJournal(raw) } catch {
+      if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
+      this.journalKey = this.journalKey === null ? null : selectJournalKey([this.journalKey], true)
+    }
+    if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
+    this.loadedJournal = null
   }
 
   private requestReflection(): Promise<string | null> {

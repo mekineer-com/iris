@@ -1,7 +1,7 @@
 import {describe, expect, test} from "bun:test"
 
 import type {GeminiCallbacks} from "./GeminiLiveController"
-import {GeminiLiveController} from "./GeminiLiveController"
+import {GeminiLiveController, JOURNAL_KEY} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {SessionController} from "./SessionController"
 import type {SessionSnapshot as Snapshot} from "../shared/types"
@@ -146,6 +146,7 @@ class FakeSession {
 
   storage = {
     get: async (key: string) => this.stored.get(key) ?? null,
+    keys: async () => [...this.stored.keys()],
     set: async (key: string, value: string) => {
       this.stored.set(key, value)
     },
@@ -233,11 +234,19 @@ function setup(
     responseWatchdogMs?: number
     startGate?: Promise<void>
     stored?: Record<string, string>
+    unreadableJournal?: boolean
     fetchFn?: typeof fetch
   } = {},
 ) {
   const session = new FakeSession()
   for (const [key, value] of Object.entries(options.stored ?? {})) session.stored.set(key, value)
+  if (options.unreadableJournal) {
+    const get = session.storage.get
+    session.storage.get = async key => {
+      if (key === JOURNAL_KEY) throw new Error("Fictional journal read failure")
+      return get(key)
+    }
+  }
   if (!session.stored.has("openalma.soul-id")) session.stored.set("openalma.soul-id", CONFIG.soulId)
   let live!: FakeLive
   const configs: OpenAlmaConfig[] = []
@@ -1045,11 +1054,23 @@ describe("SessionController", () => {
       scope: {userId: "Test User", soulId: "Recovery Soul", deviceSessionId: "test-phone"},
       resumption: {handle: "fictional-handle", updatedAt: Date.now()},
     })
-    const locked = setup({stored: {"openalma:gemini-session-v1": journal}})
+    const locked = setup({stored: {[JOURNAL_KEY]: "Preserved unreadable original",
+      [`${JOURNAL_KEY}:2`]: journal.replace("Recovery Soul", "Older Soul"), [`${JOURNAL_KEY}:10`]: journal}})
     await expect(locked.session.handlers["openalma:set-soul"]({soulId: "New Soul", useExisting: false})).rejects.toThrow(
       "Finish or recover",
     )
     expect(lastSnapshot(locked.session)).toMatchObject({soulId: "Recovery Soul", soulLocked: true})
+    await locked.session.handlers["openalma:start"]({mode: "continuous"})
+    const keys = locked.session.storage.keys
+    locked.session.storage.keys = async () => {throw new Error("Fictional key enumeration failure")}
+    await locked.session.handlers["openalma:stop"]({})
+    expect(lastSnapshot(locked.session)).toMatchObject({soulId: "Recovery Soul", soulLocked: true})
+    await locked.session.handlers["openalma:set-profile"](CONFIG)
+    expect(lastSnapshot(locked.session)).toMatchObject({soulId: "Recovery Soul", soulLocked: true})
+    locked.session.storage.keys = keys
+    locked.session.stored.set(`${JOURNAL_KEY}:10`, "")
+    await locked.session.handlers["openalma:set-profile"](CONFIG)
+    expect(lastSnapshot(locked.session)).toMatchObject({soulId: CONFIG.soulId, soulLocked: false})
 
     const harness = setup()
     await harness.session.handlers["openalma:set-soul"]({soulId: "First Soul", useExisting: false})
@@ -1060,6 +1081,16 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:set-soul"]({soulId: "Second Soul", useExisting: false})
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     expect(harness.configs.map((config) => config.soulId)).toEqual(["First Soul", "Second Soul"])
+  })
+
+  test("an unreadable backup does not mark the server unavailable or prevent Start", async () => {
+    const raw = "Unreadable fictional original"
+    const h = setup({stored: {[JOURNAL_KEY]: raw}, unreadableJournal: true})
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(lastSnapshot(h.session)).toMatchObject({memuAvailable: true, soulId: CONFIG.soulId})
+    expect(h.configs).toHaveLength(1)
+    await h.session.handlers["openalma:stop"]({})
+    expect(h.session.stored.get(JOURNAL_KEY)).toBe(raw)
   })
 
   test("empty or expired recovery does not pin a soul", async () => {

@@ -12,7 +12,7 @@ import type {
   SessionSnapshot,
 } from "../shared/types"
 import {approxBase64ByteLength, normalizePcm16Audio} from "./audioHelpers"
-import {GeminiLiveController, JOURNAL_KEY, journalSoulId} from "./GeminiLiveController"
+import {GeminiLiveController, journalSoulId, readSessionJournal} from "./GeminiLiveController"
 import type {GeminiCallbacks} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {
@@ -865,7 +865,7 @@ export class SessionController {
         this.session.storage.get(MICROPHONE_ENABLED_KEY),
         this.session.storage.get(CAMERA_ENABLED_KEY),
         this.session.storage.get(SOUL_ID_KEY),
-        this.session.storage.get(JOURNAL_KEY),
+        readSessionJournal(this.session.storage),
       ])
       const host = installationHost(await this.session.storage.get(OPENALMA_HOST_KEY))
       if (!this.config && storedProfile === null && this.installationDefaults !== undefined) {
@@ -895,7 +895,7 @@ export class SessionController {
       this.microphoneEnabled = microphone !== "0"
       this.cameraEnabled = camera !== "0"
       this.soulId = storedSoul?.trim() || config.soulId
-      this.recoverySoulId = journalSoulId(journal, config)
+      if (!journal.unreadable) this.recoverySoulId = journalSoulId(journal.raw, config)
       if (this.recoverySoulId) this.soulId = this.recoverySoulId
       if (config.installationTicket && !config.installationConfirmed) {
         // An existing app's saved ID already permits lost-response replay; keep its confirmed profile until success.
@@ -987,7 +987,8 @@ export class SessionController {
   private async refreshRecoveryLock(): Promise<void> {
     if (this.installationPending()) return
     try {
-      this.recoverySoulId = journalSoulId(await this.session.storage.get(JOURNAL_KEY), this.currentConfig())
+      const journal = await readSessionJournal(this.session.storage)
+      if (!journal.unreadable) this.recoverySoulId = journalSoulId(journal.raw, this.currentConfig())
     } catch {
       this.lastError = "Local recovery state unavailable; reopen Iris to retry"
     }

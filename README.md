@@ -50,8 +50,11 @@ Clear Connection/reset path.
 If the phone's conversation backup cannot match the server, Iris keeps its exact
 original in phone-local **Recovered Chats** (`openalma:recovered-chats`) before
 starting fresh. Original line numbers and photo references are retained there,
-not automatically replayed or memorized. Failed reads or recovery writes leave
-the active backup untouched.
+not automatically replayed or memorized. If the backup cannot be read or copied,
+its old key stays untouched and Iris starts a fresh numbered backup. Both readers
+use the newest key; an empty marker after Stop prevents older backups resurfacing.
+Backup trouble never blocks Start. If phone storage itself is unavailable, server
+transcript saving stays enabled with a visible local-backup warning.
 
 While a sitting is active, **Take photo** and **Choose image** durably store a non-empty JPEG/PNG before sending it to Gemini. Immediate send is the default; optional preview provides Send/Retake. Files over 1 MB pause for a cost/latency warning that can be permanently dismissed. Gemini's spoken description is saved as the image caption only after its transcript is acknowledged.
 

@@ -455,7 +455,7 @@ describe("GeminiLiveController", () => {
       const recovered = harness({storage, history, startBody: replacementStart})
       await start(recovered)
       await waitFor(() => recovered.finalizations.length === 1 &&
-        !storage.values.has("openalma:gemini-session-v1") && recovered.photoRetryChanges.at(-1) === false)
+        storage.values.get("openalma:gemini-session-v1") === "" && recovered.photoRetryChanges.at(-1) === false)
       const finalize = recovered.requests.find((request) => request.url.endsWith("/snapshot/finalize"))!
       expect(finalize.url).toContain("/session/replacement-sitting/")
       expect(finalize.body.caption_event_id).toBe(
@@ -764,14 +764,16 @@ describe("GeminiLiveController", () => {
   test("reconnect during journal write sends one photo", async () => {
     let release!: () => void
     const storage = new FakeStorage()
-    storage.setGate = new Promise<void>((resolve) => {
+    const gate = new Promise<void>((resolve) => {
       release = resolve
     })
     const h = harness({storage})
     await start(h)
+    const before = storage.setCalls
+    storage.setGate = gate
     h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
     const sending = h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
-    await waitFor(() => storage.setCalls > 0)
+    await waitFor(() => storage.setCalls > before)
     h.sockets[0].close()
     await waitFor(() => h.sockets.length === 2)
     h.sockets[1].open()
@@ -928,7 +930,7 @@ describe("GeminiLiveController", () => {
     finishFinalize()
     await stopping
 
-    expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
+    expect(storage.values.get("openalma:gemini-session-v1")).toBe("")
     expect(h.photoRetryChanges.at(-1)).toBe(false)
     expect(h.persistenceErrors.at(-1)).toBeNull()
     expect(h.errors).toEqual([])
@@ -1990,13 +1992,15 @@ describe("GeminiLiveController", () => {
   test("writes the existing outbox journal before transcript append", async () => {
     let release!: () => void
     const storage = new FakeStorage()
-    storage.setGate = new Promise<void>((resolve) => {
+    const gate = new Promise<void>((resolve) => {
       release = resolve
     })
     const h = harness({storage})
     await start(h)
+    const before = storage.setCalls
+    storage.setGate = gate
     completeTurn(h)
-    await waitFor(() => storage.setCalls === 1)
+    await waitFor(() => storage.setCalls === before + 1)
     expect(h.requests.some((request) => request.url.endsWith("/transcripts/append"))).toBe(false)
     release()
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
@@ -2022,49 +2026,67 @@ describe("GeminiLiveController", () => {
     let release!: () => void
     const gate = new Promise<void>(resolve => {release = resolve})
     const storage = new FakeStorage()
-    let deletes = 0
-    const remove = storage.delete.bind(storage)
-    storage.delete = async key => {deletes += 1; await remove(key)}
     const h = harness({storage})
     await start(h)
-    const before = deletes
+    const before = storage.setCalls
     storage.setGate = gate
     const sending = h.controller.sendImage({imageId: "serial-photo", mimeType: "image/png", data: "AQID"})
     void sending.catch(() => {})
-    await waitFor(() => storage.setCalls === 1)
+    await waitFor(() => storage.setCalls === before + 1)
     const discard = h.controller.discardImage()
     await new Promise(resolve => setTimeout(resolve, 0))
-    expect(deletes).toBe(before)
+    expect(storage.setCalls).toBe(before + 1)
     release()
     await discard
     await expect(sending).rejects.toThrow("Photo send cancelled")
-    expect(storage.values.has(JOURNAL_KEY)).toBe(false)
+    expect(storage.values.get(JOURNAL_KEY)).toBe("")
     expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
     await h.controller.stop()
   })
 
-  test.each(["read", "archive"])("a failed %s preserves the original backup through Start cleanup", async failure => {
+  test.each(["read", "archive"])("a failed %s preserves the original backup while a fresh sitting saves separately", async failure => {
     const storage = new FakeStorage()
     const raw = "{unreadable original backup"
     storage.values.set(JOURNAL_KEY, raw)
-    if (failure === "read") storage.get = async () => {throw new Error("Read failed")}
-    else storage.set = async () => {throw new Error("Archive failed")}
-    const h = harness({storage})
-    await expect(h.controller.start()).rejects.toThrow(failure === "read" ? "Local transcript backup unavailable" : "Archive failed")
+    const read = storage.get.bind(storage)
+    const save = storage.set.bind(storage)
+    let oldReads = 0
+    storage.get = async key => {
+      if (key === JOURNAL_KEY) {oldReads += 1; if (failure === "read") throw new Error("Read failed")}
+      return read(key)
+    }
+    storage.set = async (key, value) => {
+      if (failure === "archive" && key === RECOVERED_CHATS_KEY) throw new Error("Archive failed")
+      await save(key, value)
+    }
+    const h = harness({storage, appendStatuses: Array(100).fill(503)})
+    await start(h)
+    completeTurn(h, "Fresh fictional speech", "A fresh reply")
+    await waitFor(() => [...storage.values].some(([key, value]) => key !== JOURNAL_KEY && value.includes("Fresh fictional speech")))
     expect(storage.values.get(JOURNAL_KEY)).toBe(raw)
     expect(storage.values.has(RECOVERED_CHATS_KEY)).toBe(false)
-    expect(h.requests).toHaveLength(0)
+    await h.controller.stop()
+    const oldReadsBeforeReopen = oldReads
+    const reopened = harness({storage})
+    await start(reopened)
+    await reopened.controller.stop()
+    const again = harness({storage})
+    await start(again)
+    await again.controller.stop()
+    expect(oldReads).toBe(oldReadsBeforeReopen)
+    expect(storage.values.get(JOURNAL_KEY)).toBe(raw)
   })
 
   test("a host returning null for an existing unreadable key cannot erase its backup", async () => {
     const storage = new FakeStorage()
     const raw = "existing backup behind a failed host read"
     storage.values.set(JOURNAL_KEY, raw)
-    storage.get = async () => null
+    const read = storage.get.bind(storage)
+    storage.get = async key => key === JOURNAL_KEY ? null : read(key)
     const h = harness({storage})
-    await expect(h.controller.start()).rejects.toThrow("Local transcript backup unavailable")
+    await start(h)
+    await h.controller.stop()
     expect(storage.values.get(JOURNAL_KEY)).toBe(raw)
-    expect(h.requests).toHaveLength(0)
   })
 
   test("a masked failed read of recovered chats cannot overwrite either backup", async () => {
@@ -2074,35 +2096,60 @@ describe("GeminiLiveController", () => {
     const read = storage.get.bind(storage)
     storage.get = async key => key === RECOVERED_CHATS_KEY ? null : read(key)
     const h = harness({storage})
-    await expect(h.controller.start()).rejects.toThrow("Local transcript backup could not be read")
+    await start(h)
+    await h.controller.stop()
     expect(storage.values.get(JOURNAL_KEY)).toBe("unreadable active backup")
     expect(storage.values.get(RECOVERED_CHATS_KEY)).toBe("existing recovered backup")
-    expect(h.requests).toHaveLength(0)
   })
 
-  test.each(["valid", "invalid", "failed"])("Stop during a pending %s journal read cannot mutate it or bootstrap", async outcome => {
+  test.each(["valid", "invalid", "failed", "keys", "archive"])("Stop during pending %s journal I/O preserves the original and cannot bootstrap", async outcome => {
     let release!: () => void
     const gate = new Promise<void>(resolve => {release = resolve})
     const storage = new FakeStorage()
-    const raw = outcome === "invalid" ? "not JSON" : JSON.stringify({version: 1,
+    const raw = outcome === "invalid" || outcome === "archive" ? "not JSON" : JSON.stringify({version: 1,
       scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
       resumption: null, pendingTranscripts: []})
     storage.values.set(JOURNAL_KEY, raw)
     let reading = false
-    storage.get = async () => {reading = true; await gate; if (outcome === "failed") throw new Error("Read failed"); return raw}
+    if (outcome === "keys") storage.keys = async () => {reading = true; await gate; return [...storage.values.keys()]}
+    else if (outcome === "archive") storage.set = async () => {reading = true; await gate; throw new Error("Archive failed")}
+    else storage.get = async () => {reading = true; await gate; if (outcome === "failed") throw new Error("Read failed"); return raw}
     const h = harness({storage})
     const starting = h.controller.start()
     void starting.catch(() => {})
     await waitFor(() => reading)
-    await h.controller.stop()
+    const stopping = h.controller.stop()
+    if (outcome !== "archive") await stopping
     release()
+    await stopping
     await expect(starting).rejects.toThrow("Gemini start cancelled")
     expect(storage.values.get(JOURNAL_KEY)).toBe(raw)
     expect(storage.values.has(RECOVERED_CHATS_KEY)).toBe(false)
     expect(h.requests).toHaveLength(0)
   })
 
-  test("preserves malformed recovery-area bytes and deduplicates a lost archive acknowledgement", async () => {
+  test("unavailable local storage cannot block Start or server transcript saving and can recover", async () => {
+    const storage = new FakeStorage()
+    const raw = "Preserved fictional original"
+    storage.values.set(JOURNAL_KEY, raw)
+    const keys = storage.keys.bind(storage)
+    storage.keys = async () => {throw new Error("Storage unavailable")}
+    const history: NonNullable<Parameters<typeof harness>[0]>["history"] = []
+    const h = harness({storage, history})
+    await start(h)
+    completeTurn(h, "Speech while local storage is off", "First reply")
+    await waitFor(() => history.length === 2)
+    expect(h.persistenceErrors.at(-1)).toBe("Local transcript backup unavailable")
+    storage.keys = keys
+    completeTurn(h, "Speech after storage returns", "Second reply")
+    await waitFor(() => history.length === 4 && h.persistenceErrors.at(-1) === null)
+    await h.controller.stop()
+    expect(storage.values.get(JOURNAL_KEY)).toBe(raw)
+    expect(storage.values.get(`${JOURNAL_KEY}:1`)).toBe("")
+    expect(h.errors).toEqual([])
+  })
+
+  test("preserves malformed recovery-area bytes and survives a lost archive acknowledgement", async () => {
     const storage = new FakeStorage()
     const raw = "unreadable journal"
     const older = "unreadable recovered chats"
@@ -2114,13 +2161,14 @@ describe("GeminiLiveController", () => {
       await save(key, value)
       if (key === RECOVERED_CHATS_KEY && loseAck) {loseAck = false; throw new Error("Archive acknowledgement lost")}
     }
-    const failed = harness({storage})
-    await expect(failed.controller.start()).rejects.toThrow("Archive acknowledgement lost")
+    const first = harness({storage})
+    await start(first)
+    await first.controller.stop()
     expect(storage.values.get(JOURNAL_KEY)).toBe(raw)
     const restarted = harness({storage})
     await start(restarted)
     expect(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)).toEqual([older, raw])
-    expect(storage.values.has(JOURNAL_KEY)).toBe(false)
+    expect(storage.values.get(JOURNAL_KEY)).toBe(raw)
     await restarted.controller.stop()
   })
 
@@ -2173,7 +2221,7 @@ describe("GeminiLiveController", () => {
     const archived = JSON.parse(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)[0])
     expect(archived.pendingImage.caption).toBe("A retained old description")
     expect(archived.pendingImage.assistantSequence).toBe(40)
-    expect(storage.values.has(JOURNAL_KEY)).toBe(false)
+    expect(storage.values.get(JOURNAL_KEY)).toBe("")
     expect(h.finalizations).toEqual([{ok: true, queued: false, discarded: true}])
     await h.controller.stop()
   })
@@ -2330,7 +2378,7 @@ describe("GeminiLiveController", () => {
       return Boolean(raw && JSON.parse(raw).pendingTranscripts.length === 0)
     })
     await h.controller.stop(true)
-    expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
+    expect(storage.values.get("openalma:gemini-session-v1")).toBe("")
 
     const recovery = JSON.parse(savedJournal)
     recovery.pendingImage = {imageId: "pending-photo", mediaRef: "mentra_media/TestSoul/photo.png",
@@ -2344,7 +2392,7 @@ describe("GeminiLiveController", () => {
     }})
     await start(gap)
     expect(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)).toContain(JSON.stringify(recovery))
-    expect(storage.values.has(JOURNAL_KEY)).toBe(false)
+    expect(storage.values.get(JOURNAL_KEY)).toBe("")
     expect(JSON.parse(gap.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
     expect(gap.requests.some((request) => request.url.endsWith("/transcripts/append"))).toBe(false)
     await gap.controller.stop()
@@ -2388,7 +2436,7 @@ describe("GeminiLiveController", () => {
     expect(JSON.parse(h.sockets[1].sent[0])).toEqual({setup: {sessionResumption: {}}})
     h.sockets[1].message({setupComplete: {}})
     await starting
-    expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
+    expect(storage.values.get("openalma:gemini-session-v1")).toBe("")
     await h.controller.stop(true)
   })
 
@@ -2435,7 +2483,7 @@ describe("GeminiLiveController", () => {
     const h = harness({storage})
     await start(h)
     expect(JSON.parse(h.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
-    expect(storage.values.has("openalma:gemini-session-v1")).toBe(false)
+    expect(storage.values.get("openalma:gemini-session-v1")).toBe("")
     expect(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)[0]).toContain("blank status is invalid")
     await h.controller.stop()
   })
