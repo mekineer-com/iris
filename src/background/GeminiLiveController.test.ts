@@ -2239,6 +2239,30 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("successful photo replay cannot hide failed speech sync", async () => {
+    const storage = new FakeStorage()
+    storage.values.set(JOURNAL_KEY, JSON.stringify({version: 1,
+      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+      resumption: null,
+      pendingTranscripts: [42, 43].map(sequence => ({event_id: `old:${sequence}`, sequence,
+        event_kind: "transcript", role: "user", status: "complete", content: "Retained fictional speech"})),
+      pendingImage: {imageId: "retained-photo", mediaRef: "mentra_media/test-phone/retained-photo.png",
+        providerSent: false, captureAfterCurrent: false, generation: 1, sessionId: "old", imageSequence: 41}}))
+    let release!: () => void
+    const gate = new Promise<void>(resolve => {release = resolve})
+    const h = harness({storage, startSequence: 42, appendStatuses: [503, 503], appendGates: [Promise.resolve(), gate]})
+    try {
+      await start(h)
+      await waitFor(() => h.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
+      await h.controller.retryImage()
+      expect(h.photoRetryChanges.at(-1)).toBe(false)
+      expect(h.persistenceErrors.at(-1)).not.toBeNull()
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
   test("hydrates and rebases only the unacknowledged transcript suffix", async () => {
     const storage = new FakeStorage()
     storage.values.set(
@@ -3065,15 +3089,26 @@ describe("GeminiLiveController", () => {
     }
   })
 
-  test("heartbeat surfaces a background image-memory failure", async () => {
+  test("heartbeat clears a background image-memory failure without hiding failed speech sync", async () => {
     const message = "Photo memory processing failed; the original remains saved."
     const heartbeatBody: {ok: boolean; background_error?: string} = {ok: true, background_error: message}
-    const h = harness({heartbeatMs: 5, heartbeatBody})
+    const h = harness({heartbeatMs: 60_000, heartbeatBody, appendStatuses: [503]})
     await start(h)
-    await waitFor(() => h.persistenceErrors.includes(message))
-    const seen = h.persistenceErrors.length
+    const heartbeat = () => Reflect.get(h.controller, "heartbeat").call(h.controller)
+    await heartbeat()
+    expect(h.persistenceErrors.at(-1)).toBe(message)
     delete heartbeatBody.background_error
-    await waitFor(() => h.persistenceErrors.slice(seen).includes(null))
+    await heartbeat()
+    expect(h.persistenceErrors.at(-1)).toBeNull()
+    heartbeatBody.background_error = message
+    await heartbeat()
+    completeTurn(h)
+    await waitFor(() => h.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
+    delete heartbeatBody.background_error
+    await heartbeat()
+    expect(h.persistenceErrors.at(-1)).toBe("Transcript sync failed; retrying")
+    completeTurn(h)
+    await waitFor(() => h.persistenceErrors.at(-1) === null)
     await h.controller.stop()
   })
 

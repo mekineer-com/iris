@@ -448,7 +448,7 @@ export class GeminiLiveController {
       await this.persistJournal()
     }
     this.callbacks.onPhotoRetryChange(false)
-    if (!this.pendingEvents.length && !this.journalUnavailable) this.callbacks.onPersistenceError(null)
+    this.clearPersistenceErrorIfSynced()
   }
 
   private sendImageTurn(socket: SocketLike, mimeType: "image/jpeg" | "image/png", data: string): boolean {
@@ -530,7 +530,7 @@ export class GeminiLiveController {
       await this.persistJournal()
       this.scheduleAppend()
       this.callbacks.onPhotoRetryChange(false)
-      this.callbacks.onPersistenceError(null)
+      this.clearPersistenceErrorIfSynced()
     } finally {
       this.imageRetrying = false
       if (retryOnReplacement) void this.retryPendingImage()
@@ -1292,9 +1292,11 @@ export class GeminiLiveController {
       await this.finalizePendingImage()
     }
     await this.finalizePendingImage()
-    if (!this.pendingEvents.length && !this.pendingImage && !this.journalUnavailable) {
-      this.callbacks.onPersistenceError(null)
-    }
+    if (!this.pendingImage) this.clearPersistenceErrorIfSynced()
+  }
+
+  private clearPersistenceErrorIfSynced(): void {
+    if (!this.pendingEvents.length && !this.journalUnavailable) this.callbacks.onPersistenceError(null)
   }
 
   private async requestPhotoRetry(pending: PendingImage): Promise<void> {
@@ -1346,7 +1348,7 @@ export class GeminiLiveController {
     this.pendingImage = null
     await this.persistJournal()
     this.callbacks.onPhotoRetryChange(false)
-    if (!this.pendingEvents.length && !this.journalUnavailable) this.callbacks.onPersistenceError(null)
+    this.clearPersistenceErrorIfSynced()
   }
 
   private async archivePendingImage(pending: PendingImage, generation: number): Promise<boolean> {
@@ -1793,7 +1795,7 @@ export class GeminiLiveController {
           this.callbacks.onPersistenceError(body.background_error)
         } else if (this.backgroundImageErrorVisible || previousPause) {
           this.backgroundImageErrorVisible = false
-          this.callbacks.onPersistenceError(null)
+          this.clearPersistenceErrorIfSynced()
         }
       }
     } catch (error) {
