@@ -55,6 +55,7 @@ type PendingImage = {
 
 type StorageLike = {
   get(key: string): Promise<string | null>
+  keys(): Promise<string[]>
   set(key: string, value: string): Promise<void>
   delete(key: string): Promise<void>
 }
@@ -96,6 +97,7 @@ export type GeminiLiveControllerOptions = {
 
 const WS_OPEN = 1
 const REQUEST_TIMEOUT_MS = 10_000
+const TRANSCRIPT_CONTENT_LIMIT = 16_000
 const SNAPSHOT_TIMEOUT_MS = 120_000
 const TOOL_TIMEOUT_MS = 30_000
 const WRITE_UNCERTAINTY_MESSAGE =
@@ -104,6 +106,7 @@ const REFLECTION_TIMEOUT_MS = 8_000
 const RECONNECT_SETUP_ATTEMPTS = 6
 const GO_AWAY_MARGIN_MS = 2_000
 export const JOURNAL_KEY = "openalma:gemini-session-v1"
+export const RECOVERED_CHATS_KEY = "openalma:recovered-chats"
 const RESUMPTION_MAX_AGE_MS = 30 * 60 * 1000
 export const SITTING_REFLECTION_PROMPT =
   "Reflect briefly in first person on the emotional tone, subtext, or meaningful shift in this sitting that the literal transcript may not preserve. Do not recap the conversation. Respond with one or two natural sentences, or exactly NO_SUMMARY if nothing worthwhile would be added."
@@ -170,6 +173,9 @@ export class GeminiLiveController {
   private pendingImage: PendingImage | null = null
   private imageRetrying = false
   private appendTail: Promise<void> = Promise.resolve()
+  private journalTail: Promise<void> = Promise.resolve()
+  private journalLoaded = false
+  private loadedJournal: string | null = null
   private persistenceFatal = false
   private journalUnavailable = false
   private reflecting = false
@@ -201,6 +207,8 @@ export class GeminiLiveController {
   async start(mode: SessionMode = "continuous"): Promise<void> {
     trace("provider.start.begin")
     const generation = ++this.generation
+    await this.journalTail
+    if (generation !== this.generation) throw new Error("Gemini start cancelled")
     this.stopping = false
     this.activityPauseReason = null
     this.ready = false
@@ -222,6 +230,8 @@ export class GeminiLiveController {
     this.appendTail = Promise.resolve()
     this.persistenceFatal = false
     this.journalUnavailable = false
+    this.journalLoaded = false
+    this.loadedJournal = null
     this.reflecting = false
     this.reflectionResolve = null
     this.stopPromise = null
@@ -234,8 +244,13 @@ export class GeminiLiveController {
     this.clearDurationWarning()
     this.clearGoAway()
     try {
-      await this.hydrateJournal()
+      await this.hydrateJournal(generation)
+      if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
       const response = await this.requestStart(mode)
+      if (this.stopping || generation !== this.generation) {
+        await this.endLease()
+        throw new Error("Gemini start cancelled")
+      }
       await this.reconcileJournal()
       trace("provider.bootstrap.ready")
       this.token = response.ephemeral_token
@@ -362,7 +377,7 @@ export class GeminiLiveController {
     ) {
       throw new Error("Photo send cancelled")
     }
-    if (this.pendingImage !== pendingBeforeUpload) return
+    if (this.pendingImage !== pendingBeforeUpload) throw new Error("Photo send cancelled")
     const mediaRef = typeof result.media_ref === "string" ? result.media_ref.trim() : ""
     if (!mediaRef.startsWith("mentra_media/") || mediaRef.includes("..")) {
       throw new Error("OpenAlma snapshot returned an invalid media reference")
@@ -392,7 +407,7 @@ export class GeminiLiveController {
     const activeSocket = this.socket
     if (!this.ready || !activeSocket || activeSocket.readyState !== WS_OPEN) {
       await this.requestPhotoRetry(pending)
-      return
+      throw new Error("Photo send cancelled")
     }
     let sent: boolean
     try {
@@ -427,12 +442,13 @@ export class GeminiLiveController {
   }
 
   async discardImage(): Promise<void> {
+    if (!this.journalLoaded) throw new Error("Wait for local recovery to finish before discarding the photo")
     if (this.pendingImage) {
       this.pendingImage = null
       await this.persistJournal()
     }
     this.callbacks.onPhotoRetryChange(false)
-    this.callbacks.onPersistenceError(null)
+    if (!this.pendingEvents.length && !this.journalUnavailable) this.callbacks.onPersistenceError(null)
   }
 
   private sendImageTurn(socket: SocketLike, mimeType: "image/jpeg" | "image/png", data: string): boolean {
@@ -473,8 +489,7 @@ export class GeminiLiveController {
         return
       }
       if (!response.ok) {
-        await this.discardImage()
-        this.reportError(new Error(`OpenAlma snapshot replay failed (${response.status})`))
+        await this.requestPhotoRetry(pending)
         return
       }
       const replay = await response.json().catch(() => null) as {mime_type?: unknown; data?: unknown} | null
@@ -485,8 +500,7 @@ export class GeminiLiveController {
         (mimeType !== "image/jpeg" && mimeType !== "image/png") || typeof data !== "string" ||
         !data
       ) {
-        await this.discardImage()
-        this.reportError(new Error("OpenAlma snapshot replay returned invalid image data"))
+        await this.requestPhotoRetry(pending)
         return
       }
       if (this.activityPauseReason) {
@@ -562,11 +576,15 @@ export class GeminiLiveController {
       trace("provider.transcript_queue.drained")
       if (!this.persistenceFatal) await this.flushPendingEvents()
       if (this.pendingEvents.length) {
-        this.callbacks.onPersistenceError("Transcript sync failed; pending turns remain saved on this device")
+        this.callbacks.onPersistenceError(!this.storage || this.journalUnavailable
+          ? "Transcript sync failed; local transcript backup unavailable"
+          : "Transcript sync failed; pending turns remain saved on this device")
       }
     } catch (error) {
       this.persistenceFatal = true
-      this.callbacks.onPersistenceError("Transcript sync failed; pending turns remain saved on this device")
+      this.callbacks.onPersistenceError(!this.storage || this.journalUnavailable
+        ? "Transcript sync failed; local transcript backup unavailable"
+        : "Transcript sync failed; pending turns remain saved on this device")
       this.reportError(error instanceof Error ? error : new Error(String(error)))
     } finally {
       this.generation += 1
@@ -1217,17 +1235,22 @@ export class GeminiLiveController {
     status?: TranscriptEvent["status"],
     mediaRef?: string,
   ): TranscriptEvent {
-    const sequence = this.nextTranscriptSequence++
-    const event: TranscriptEvent = {
-      event_id: `${this.sessionId}:${sequence}`,
-      sequence,
-      event_kind: eventKind,
-      role,
-      content,
-      ...(status ? {status} : {}),
-      ...(mediaRef ? {media_ref: mediaRef} : {}),
+    const characters = Array.from(content)
+    let event!: TranscriptEvent
+    for (let offset = 0; offset < characters.length; offset += TRANSCRIPT_CONTENT_LIMIT) {
+      const sequence = this.nextTranscriptSequence++
+      event = {
+        event_id: `${this.sessionId}:${sequence}`,
+        sequence,
+        event_kind: eventKind,
+        role,
+        content: characters.slice(offset, offset + TRANSCRIPT_CONTENT_LIMIT).join(""),
+        ...(status ? {status} : {}),
+        ...(mediaRef ? {media_ref: mediaRef} : {}),
+      }
+      this.pendingEvents.push(event)
     }
-    this.pendingEvents.push(event)
+    this.queueJournalWrite()
     return event
   }
 
@@ -1239,9 +1262,10 @@ export class GeminiLiveController {
   }
 
   private async flushPendingEvents(): Promise<void> {
+    if (!this.journalLoaded) return
     while (this.pendingEvents.length && !this.persistenceFatal) {
-      await this.persistJournal()
       const batch = this.pendingEvents.slice(0, 16)
+      await this.persistJournal()
       let response: Response
       try {
         response = await this.request(`/integration/mentra/session/${this.sessionId}/transcripts/append`, {
@@ -1286,6 +1310,13 @@ export class GeminiLiveController {
     if (!pending?.caption || (pending.retryRequested && !userRequested) || !pending.assistantSequence) return
     if (this.pendingEvents.some((event) => event.sequence <= pending.assistantSequence!)) return
     const generation = this.generation
+    if (Array.from(pending.caption).length > TRANSCRIPT_CONTENT_LIMIT) {
+      if (!await this.archivePendingImage(pending, generation)) return
+      this.pendingImage = null
+      await this.persistJournal()
+      this.callbacks.onPhotoRetryChange(false)
+      return
+    }
     let response: Response
     try {
       response = await this.request(`/integration/mentra/session/${this.sessionId}/snapshot/finalize`, {
@@ -1301,46 +1332,65 @@ export class GeminiLiveController {
       return
     }
     if (generation !== this.generation || this.pendingImage !== pending) return
-    if (response.status >= 500) {
+    if (!response.ok) {
       await this.requestPhotoRetry(pending)
       return
     }
-    if (!response.ok) throw new Error(`OpenAlma snapshot finalization failed (${response.status})`)
+    const result = await response.json().catch(() => null) as {ok?: boolean; discarded?: boolean} | null
+    if (generation !== this.generation || this.pendingImage !== pending) return
+    if (result?.ok !== true) {
+      await this.requestPhotoRetry(pending)
+      return
+    }
+    if (result.discarded === true && !await this.archivePendingImage(pending, generation)) return
     this.pendingImage = null
     await this.persistJournal()
     this.callbacks.onPhotoRetryChange(false)
-    this.callbacks.onPersistenceError(null)
+    if (!this.pendingEvents.length && !this.journalUnavailable) this.callbacks.onPersistenceError(null)
+  }
+
+  private async archivePendingImage(pending: PendingImage, generation: number): Promise<boolean> {
+    try { await this.archiveJournal(this.journalSnapshot()) } catch {
+      if (generation === this.generation && this.pendingImage === pending) await this.requestPhotoRetry(pending)
+      return false
+    }
+    return generation === this.generation && this.pendingImage === pending
   }
 
   private queueJournalWrite(): void {
-    this.appendTail = this.appendTail.then(() => this.persistJournal())
+    void this.persistJournal()
   }
 
-  private async hydrateJournal(): Promise<void> {
-    if (!this.storage) return
-    let raw: string | null
-    try {
-      raw = await this.storage.get(JOURNAL_KEY)
-    } catch {
-      this.journalUnavailable = true
-      this.callbacks.onPersistenceError("Local transcript backup unavailable")
+  private async hydrateJournal(generation: number): Promise<void> {
+    if (!this.storage) {
+      this.journalLoaded = true
       return
     }
-    if (!raw) return
+    let raw: string | null
+    try {
+      raw = await this.readJournalValue(JOURNAL_KEY)
+    } catch {
+      if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
+      this.journalUnavailable = true
+      this.callbacks.onPersistenceError("Local transcript backup unavailable")
+      throw new Error("Local transcript backup unavailable")
+    }
+    if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
+    this.loadedJournal = raw
+    if (raw === null) {
+      this.journalLoaded = true
+      return
+    }
     let value: unknown
     try {
       value = JSON.parse(raw)
     } catch {
-      await this.deleteJournal()
-      return
+      value = null
     }
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      await this.deleteJournal()
-      return
-    }
-    const journal = value as Partial<SessionJournal>
-    const scope = journal.scope
+    const journal = value && typeof value === "object" && !Array.isArray(value) ? value as Partial<SessionJournal> : null
+    const scope = journal?.scope
     if (
+      !journal ||
       journal.version !== 1 ||
       scope?.userId !== this.config.userId ||
       scope.soulId !== this.config.soulId ||
@@ -1348,8 +1398,11 @@ export class GeminiLiveController {
       !this.validPendingEvents(journal.pendingTranscripts) ||
       !this.validPendingImage(journal.pendingImage)
     ) {
-      this.callbacks.onPersistenceError("Saved recovery data did not match this session or was invalid and was discarded.")
-      await this.deleteJournal()
+      await this.archiveJournal(raw)
+      if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
+      this.journalLoaded = true
+      this.callbacks.onPhotoRetryChange(false)
+      this.callbacks.onPersistenceError("Local conversation backup saved in recovered chats on this device")
       return
     }
     this.pendingEvents = journal.pendingTranscripts.map((event) => ({...event}))
@@ -1374,7 +1427,6 @@ export class GeminiLiveController {
   private validPendingEvents(value: unknown): value is TranscriptEvent[] {
     return (
       Array.isArray(value) &&
-      value.length <= 512 &&
       value.every((event) => {
         if (!event || typeof event !== "object") return false
         const keys = Object.keys(event)
@@ -1389,9 +1441,8 @@ export class GeminiLiveController {
           !Number.isSafeInteger(event.sequence) ||
           event.sequence < 1 ||
           typeof event.content !== "string" ||
-          event.content !== event.content.trim() ||
           event.content.length < 1 ||
-          event.content.length > 16_000
+          Array.from(event.content).length > TRANSCRIPT_CONTENT_LIMIT
         ) {
           return false
         }
@@ -1426,22 +1477,37 @@ export class GeminiLiveController {
       parts.length === 3 && parts[0] === "mentra_media" && !parts.includes("..") &&
       typeof image.providerSent === "boolean" && typeof image.captureAfterCurrent === "boolean" &&
       Number.isSafeInteger(image.generation) && typeof image.sessionId === "string" &&
-      (image.imageSequence === undefined || Number.isSafeInteger(image.imageSequence)) &&
+      (image.imageSequence === undefined || (Number.isSafeInteger(image.imageSequence) && image.imageSequence > 0)) &&
       (image.caption === undefined || (typeof image.caption === "string" && image.caption.length > 0)) &&
-      (image.assistantSequence === undefined || Number.isSafeInteger(image.assistantSequence)) &&
+      (image.assistantSequence === undefined || (Number.isSafeInteger(image.assistantSequence) && image.assistantSequence > 0)) &&
       (image.retryRequested === undefined || typeof image.retryRequested === "boolean") &&
       (image.speakDescription === undefined || typeof image.speakDescription === "boolean")
   }
 
   private async reconcileJournal(): Promise<void> {
+    const generation = this.generation
     const pendingEvents = this.pendingEvents.filter((event) => event.sequence >= this.nextTranscriptSequence)
+    let keep = pendingEvents.length
     for (let index = 0; index < pendingEvents.length; index += 1) {
       if (pendingEvents[index].sequence !== this.nextTranscriptSequence + index) {
-        this.persistenceFatal = true
-        throw new Error("Local transcript backup has a sequence gap")
+        keep = index
+        break
       }
     }
-    this.pendingEvents = pendingEvents
+    const photoOutsideHistory = [this.pendingImage?.imageSequence, this.pendingImage?.assistantSequence]
+      .some(sequence => sequence !== undefined && sequence >= this.nextTranscriptSequence + keep)
+    if (this.loadedJournal !== null && (keep !== this.pendingEvents.length || photoOutsideHistory)) {
+      await this.archiveJournal(this.loadedJournal)
+      if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
+    }
+    if (keep !== pendingEvents.length || photoOutsideHistory) {
+      this.resumptionHandle = ""
+      this.resumptionUpdatedAt = 0
+      this.pendingImage = null
+      this.callbacks.onPhotoRetryChange(false)
+    }
+    this.pendingEvents = pendingEvents.slice(0, keep)
+    this.journalLoaded = true
     if (this.pendingImage?.caption && this.pendingEvents.some(
       (event) => event.event_id === `${this.pendingImage!.sessionId}:${this.pendingImage!.assistantSequence}`,
     )) {
@@ -1462,43 +1528,64 @@ export class GeminiLiveController {
     await this.persistJournal()
   }
 
-  private async persistJournal(): Promise<void> {
-    if (!this.storage) return
-    try {
-      if (!this.resumptionHandle && !this.pendingEvents.length && !this.pendingImage) {
-        await this.storage.delete(JOURNAL_KEY)
+  private persistJournal(): Promise<void> {
+    const write = this.journalTail.then(async () => {
+      if (!this.storage || !this.journalLoaded) return
+      try {
+        if (!this.resumptionHandle && !this.pendingEvents.length && !this.pendingImage) {
+          await this.storage.delete(JOURNAL_KEY)
+          this.journalUnavailable = false
+          return
+        }
+        await this.storage.set(JOURNAL_KEY, this.journalSnapshot())
         this.journalUnavailable = false
-        return
+      } catch {
+        this.journalUnavailable = true
+        this.callbacks.onPersistenceError("Local transcript backup unavailable")
       }
-      const journal: SessionJournal = {
-        version: 1,
-        scope: {
-          userId: this.config.userId,
-          soulId: this.config.soulId,
-          deviceSessionId: this.config.deviceSessionId,
-        },
-        resumption: this.resumptionHandle
-          ? {handle: this.resumptionHandle, updatedAt: this.resumptionUpdatedAt}
-          : null,
-        pendingTranscripts: this.pendingEvents,
-        pendingImage: this.pendingImage,
-      }
-      await this.storage.set(JOURNAL_KEY, JSON.stringify(journal))
-      this.journalUnavailable = false
-    } catch {
-      this.journalUnavailable = true
-      this.callbacks.onPersistenceError("Local transcript backup unavailable")
-    }
+    })
+    this.journalTail = write
+    return write
   }
 
-  private async deleteJournal(): Promise<void> {
-    try {
-      await this.storage?.delete(JOURNAL_KEY)
-      this.journalUnavailable = false
-    } catch {
-      this.journalUnavailable = true
-      this.callbacks.onPersistenceError("Local transcript backup unavailable")
+  private journalSnapshot(): string {
+    const journal: SessionJournal = {
+      version: 1,
+      scope: {
+        userId: this.config.userId,
+        soulId: this.config.soulId,
+        deviceSessionId: this.config.deviceSessionId,
+      },
+      resumption: this.resumptionHandle
+        ? {handle: this.resumptionHandle, updatedAt: this.resumptionUpdatedAt}
+        : null,
+      pendingTranscripts: this.pendingEvents,
+      pendingImage: this.pendingImage,
     }
+    return JSON.stringify(journal)
+  }
+
+  private archiveJournal(raw: string): Promise<void> {
+    const write = this.journalTail.then(async () => {
+      const previous = await this.readJournalValue(RECOVERED_CHATS_KEY)
+      let recovered: unknown
+      try { recovered = JSON.parse(previous ?? "[]") } catch { recovered = null }
+      // ponytail: one rare-recovery list; split entries into keys only if its size becomes a problem.
+      const valid = Array.isArray(recovered) && recovered.every(value => typeof value === "string")
+      const entries: string[] = valid ? recovered as string[] : previous === null ? [] : [previous]
+      if (!valid || !entries.includes(raw)) {
+        if (!entries.includes(raw)) entries.push(raw)
+        await this.storage!.set(RECOVERED_CHATS_KEY, JSON.stringify(entries))
+      }
+    })
+    this.journalTail = write.catch(() => {})
+    return write
+  }
+
+  private async readJournalValue(key: string): Promise<string | null> {
+    const raw = await this.storage!.get(key)
+    if (raw === null && (await this.storage!.keys()).includes(key)) throw new Error("Local transcript backup could not be read")
+    return raw
   }
 
   private requestReflection(): Promise<string | null> {
