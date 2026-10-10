@@ -428,7 +428,7 @@ export default function SessionPage() {
       {snapshot?.memuAvailable === false ? (
         <p className="memu-status" role="status">
           <img src={memuIcon} alt="" />
-          <span>memU is unavailable. Start memU, or <button type="button" onClick={editConnection}>Edit Connection</button>.</span>
+          <span>{snapshot.lastError || "memU is unavailable. Start memU or check its address."} <button type="button" onClick={editConnection}>Edit Connection</button>.</span>
         </p>
       ) : null}
       <section className="soul-control" aria-label="Soul selection">

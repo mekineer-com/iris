@@ -1,7 +1,10 @@
 import {describe, expect, test} from "bun:test"
-import {mkdtempSync, readFileSync} from "node:fs"
+import {spawn} from "node:child_process"
+import {once} from "node:events"
+import {copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync} from "node:fs"
 import {tmpdir} from "node:os"
 import {join} from "node:path"
+import {fileURLToPath} from "node:url"
 
 import {
   assertPrivateReleaseConfig,
@@ -78,6 +81,63 @@ describe("private release URI", () => {
       package_name: "com.openalma.mentra",
       version: "0.1.0",
     })
+  })
+
+  test("run clears its child and status on malformed output or fatal stdout failure", async () => {
+    for (const fatalOutput of [false, true]) {
+      const root = mkdtempSync(join(tmpdir(), "iris-release-run-test-"))
+      const statusPath = join(root, "build", "release-private-status.json")
+      let wrapper
+      try {
+        mkdirSync(join(root, "scripts"))
+        mkdirSync(join(root, "node_modules", ".bin"), {recursive: true})
+        for (const name of ["release-private.mjs", "load-env-local.mjs"]) {
+          copyFileSync(fileURLToPath(new URL(name, import.meta.url)), join(root, "scripts", name))
+        }
+        symlinkSync(fileURLToPath(new URL("../node_modules/qrcode", import.meta.url)), join(root, "node_modules", "qrcode"))
+        writeReleaseStatus(statusPath, {device_session_id: "test-phone"})
+        const uri = fatalOutput
+          ? "miniapp://release?url=http://[&package=com.openalma.mentra&version=0.1.0"
+          : "miniapp://release?url=invalid"
+        writeFileSync(join(root, "node_modules", ".bin", "mentra-miniapp"), `#!/usr/bin/env node
+import {writeFileSync} from "node:fs"
+writeFileSync("child.pid", String(process.pid))
+process.on("SIGTERM", () => {
+  writeFileSync("child.stopped", "SIGTERM")
+  process.exit(0)
+})
+setInterval(() => {}, 1000)
+console.log(${JSON.stringify(uri)})
+`, {mode: 0o755})
+        wrapper = spawn("node", [join(root, "scripts", "release-private.mjs")], {
+          cwd: root,
+          env: {
+            ...process.env,
+            MENTRA_PUBLIC_OPENALMA_BASE_URL: "http://192.0.2.1",
+            MENTRA_PUBLIC_OPENALMA_USER_ID: "Test User",
+            MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID: "test-phone",
+            MENTRA_RELEASE_HOST_PACKAGE: "com.mentra.mentra.openalma",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        })
+        let stderr = ""
+        wrapper.stderr.on("data", (chunk) => { stderr += chunk })
+        if (fatalOutput) wrapper.stdout.destroy()
+        else wrapper.stdout.resume()
+        const [code, signal] = await once(wrapper, "close", {signal: AbortSignal.timeout(2000)})
+        expect(code).toBe(fatalOutput ? 1 : 0)
+        expect(signal).toBeNull()
+        expect(stderr).toContain(fatalOutput ? "EPIPE" : "missing package identity")
+        expect(existsSync(statusPath)).toBe(false)
+        expect(readFileSync(join(root, "child.stopped"), "utf8")).toBe("SIGTERM")
+      } finally {
+        wrapper?.kill("SIGKILL")
+        if (!existsSync(join(root, "child.stopped")) && existsSync(join(root, "child.pid"))) {
+          try { process.kill(Number(readFileSync(join(root, "child.pid"), "utf8")), "SIGKILL") } catch {}
+        }
+        rmSync(root, {recursive: true, force: true})
+      }
+    }
   })
 
   test("completes only a fresh exact stock installation report", () => {

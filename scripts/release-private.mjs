@@ -183,6 +183,7 @@ export function run() {
 
   process.on("SIGINT", shutdown)
   process.on("SIGTERM", shutdown)
+  process.once("exit", shutdown)
   miniapp.on("exit", (code, signal) => {
     cleanup()
     process.exit(code ?? (shutdownRequested ? 0 : signal ? 1 : 0))

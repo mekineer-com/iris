@@ -76,6 +76,57 @@ describe("SessionPage state projection", () => {
     expect(visibleConnection("idle", false, false)).toBe("idle")
   })
 
+  test("shows refused-ticket guidance without hiding the address-only connection editor", async () => {
+    const snapshot = {configured: true, soulLoading: false, soulId: "", souls: [], soulConfirmed: false,
+      soulLocked: true, connectionLocked: false, memuAvailable: false,
+      connectionProfile: {baseUrl: "http://test.example", userId: "Test User", deviceSessionId: "test-phone"},
+      lastError: "Installation report failed (409): Setup ticket is unavailable or already used. Make a new Stock Install QR in the OpenAlma launcher, then install Iris from that QR.",
+    }
+    const states: unknown[] = []
+    let cursor = 0
+    const calls: Array<{channel: string; payload: unknown}> = []
+    const context = {
+      exports: {}, localStorage: {getItem: () => null},
+      require: (name: string) => {
+        if (name === "react") return {
+          useState(initial: unknown) {
+            const index = cursor++
+            if (!(index in states)) states[index] = typeof initial === "function" ? initial() : initial
+            return [states[index], (value: unknown) => {states[index] = typeof value === "function" ? value(states[index]) : value}]
+          },
+          useEffect() {}, useRef: (value: unknown) => ({current: value}),
+        }
+        if (name === "react/jsx-runtime") return jsx
+        if (name.endsWith("/useChannel")) return {useChannel: () => snapshot}
+        if (name === "@mentra/miniapp/ui") return {useRpc: (channel: string) => async (payload: unknown) => {calls.push({channel, payload}); return {ok: true}}}
+        return {default: "", __esModule: true}
+      },
+    }
+    const source = readFileSync(new URL("./SessionPage.tsx", import.meta.url), "utf8")
+    runInNewContext(ts.transpileModule(source, {compilerOptions: {module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX}}).outputText, context)
+    const render = () => {cursor = 0; return (context.exports as {default: () => any}).default()}
+    const nodes = (tree: any): any[] => !tree || typeof tree !== "object" ? []
+      : Array.isArray(tree) ? tree.flatMap(nodes) : [tree, ...nodes(tree.props?.children)]
+    expect(JSON.stringify(render())).toContain(snapshot.lastError)
+    expect(JSON.stringify(render())).not.toContain("memU is unavailable. Start memU")
+    expect(nodes(render()).find(node => node.props?.className === "sitting-button").props.disabled).toBe(true)
+    nodes(render()).find(node => node.props?.children === "Edit Connection").props.onClick()
+    const inputs = nodes(render()).filter(node => node.type === "input")
+    expect(inputs.map(node => node.props.readOnly)).toEqual([false, true, true])
+    expect(inputs.map(node => node.props.value)).toEqual(Object.values(snapshot.connectionProfile))
+    inputs[0].props.onChange({target: {value: "http://repaired.example"}})
+    nodes(render()).find(node => node.props?.children === "Save and connect").props.onClick()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(calls).toEqual([{channel: "openalma:set-profile", payload: {...snapshot.connectionProfile, baseUrl: "http://repaired.example"}}])
+    for (const error of ["Installation report failed (503): Temporarily unavailable",
+      "Installation report failed (409): OpenAlma owner has not been created",
+      "Installation report failed (409): All stock_01 through stock_99 names are in use"]) {
+      snapshot.lastError = error
+      expect(JSON.stringify(render())).toContain(error)
+      expect(JSON.stringify(render())).not.toContain("Make a new Stock Install QR")
+    }
+  })
+
   test("accepts non-empty JPEG and PNG files of any size", () => {
     expect(validateImageFile({size: 80_000, type: "image/jpeg"})).toBe("image/jpeg")
     expect(validateImageFile({size: 2_000_000, type: "image/png"})).toBe("image/png")

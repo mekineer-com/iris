@@ -39,6 +39,6 @@ export async function reportInstallation(
   if (!response.ok) {
     const result = await response.json().catch(() => null) as {detail?: string | {message?: string}} | null
     const detail = typeof result?.detail === "string" ? result.detail : result?.detail?.message
-    throw new Error(`Installation report failed (${response.status})${typeof detail === "string" && detail ? `: ${detail}` : ""}`)
+    throw Object.assign(new Error(`Installation report failed (${response.status})${typeof detail === "string" && detail ? `: ${detail}` : ""}`), {status: response.status, detail})
   }
 }

@@ -366,19 +366,25 @@ describe("SessionController", () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(stock.stored.has("openalma.connection-profile")).toBe(false)
     expect(lastSnapshot(stock)?.lastError).toContain("installationTicket")
-    const wrong = new FakeSession()
-    wrong.stored.set("openalma.host", JSON.stringify({host_package: "com.mentra.mentra.openalma",
-      host_version: "3.2.1", deviceSessionId: "other-installation"}))
-    new SessionController(wrong as never, {installationDefaults}).start()
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(wrong.stored.has("openalma.connection-profile")).toBe(false)
-    expect(lastSnapshot(wrong)?.lastError).toContain("OpenAlma Mentra row")
+    for (const defaults of [installationDefaults,
+      {baseUrl: CONFIG.baseUrl, userId: CONFIG.userId, installationTicket: "ticket-stock"}]) {
+      const wrong = new FakeSession()
+      wrong.stored.set("openalma.host", JSON.stringify({host_package: "com.mentra.mentra.openalma",
+        host_version: "3.2.1", deviceSessionId: "other-installation"}))
+      new SessionController(wrong as never, {installationDefaults: defaults,
+        fetchFn: (async () => {throw new Error("Wrong bundle must not make requests")}) as typeof fetch,
+      }).start()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(wrong.stored.has("openalma.connection-profile")).toBe(false)
+      expect(lastSnapshot(wrong)?.lastError).toBe("Install Iris from its OpenAlma Mentra row in the launcher")
+    }
     const requests: string[] = []
     const fetchFn = (async (url, init) => {
       requests.push(init?.method ?? "GET")
       return Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: []})
     }) as typeof fetch
-    new SessionController(session as never, {installationDefaults, fetchFn}).start()
+    new SessionController(session as never, {installationDefaults: {...installationDefaults,
+      deviceSessionId: ` ${CONFIG.deviceSessionId} `}, fetchFn}).start()
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(lastSnapshot(session)).toMatchObject({configured: true, soulId: "", soulConfirmed: false})
     expect(requests.every((method) => method === "GET")).toBe(true)
@@ -442,7 +448,7 @@ describe("SessionController", () => {
         if (init?.method) {
           reports.push(JSON.parse(String(init.body)))
           return String(url).startsWith(CONFIG.baseUrl)
-            ? Response.json({detail: "Installation ticket already used"}, {status: 409})
+            ? Response.json({detail: "Setup ticket is unavailable or already used"}, {status: 409})
             : Response.json({ok: true})
         }
         return Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: [CONFIG.soulId]})
@@ -453,8 +459,9 @@ describe("SessionController", () => {
       await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
       const pending = JSON.parse(session.stored.get("openalma.connection-profile")!)
       expect(lastSnapshot(session)).toMatchObject({configured: true, connectionLocked: false,
-        soulLocked: true, soulConfirmed: false, memuAvailable: false,
-        lastError: "Installation report failed (409): Installation ticket already used"})
+        soulLocked: true, soulConfirmed: false, memuAvailable: false})
+      expect(lastSnapshot(session)?.lastError).toContain("Installation report failed (409): Setup ticket is unavailable or already used")
+      expect(lastSnapshot(session)?.lastError).toContain("Make a new Stock Install QR")
       expect(lastSnapshot(session)?.connectionProfile).toMatchObject({baseUrl: CONFIG.baseUrl, deviceSessionId: pending.deviceSessionId})
       await expect(session.handlers["openalma:set-soul"]({soulId: CONFIG.soulId, useExisting: true})).rejects.toThrow("Finish or recover")
       await expect(session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow("Installation is not confirmed")
@@ -474,7 +481,7 @@ describe("SessionController", () => {
   })
 
   test("failed candidate/confirmation writes or lost reply cannot admit a sitting; reopen retries the saved ID", async () => {
-    for (const failure of ["candidate", "confirmation", "reply"]) {
+    for (const failure of ["candidate", "confirmation", "reply", "outage"]) {
       const session = new FakeSession()
       session.stored.set("openalma.soul-id", CONFIG.soulId)
       const installationDefaults = {baseUrl: CONFIG.baseUrl, userId: CONFIG.userId, installationTicket: "ticket-retry"}
@@ -496,6 +503,7 @@ describe("SessionController", () => {
           expect(body.installation_ticket).toBe("ticket-retry")
           ids.push(body.device_session_id)
           if (failing && failure === "reply") throw new Error("Response lost")
+          if (failing && failure === "outage") return Response.json({detail: "Temporarily unavailable"}, {status: 503})
           return Response.json({ok: true})
         }
         return Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: [CONFIG.soulId]})
@@ -505,6 +513,7 @@ describe("SessionController", () => {
       new SessionController(session as never, options).start()
       await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
       expect(lastSnapshot(session)).toMatchObject({soulConfirmed: false, soulLocked: true, memuAvailable: false})
+      expect(lastSnapshot(session)?.lastError).not.toContain("Make a new Stock Install QR")
       await expect(session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow("Installation is not confirmed")
       expect(starts).toBe(0)
       if (failure === "candidate") expect(ids).toHaveLength(0)
@@ -530,7 +539,7 @@ describe("SessionController", () => {
         const body = JSON.parse(String(init.body))
         reports.push(body)
         return body.device_session_id === CONFIG.deviceSessionId ? Response.json({ok: true})
-          : Response.json({detail: "Installation ticket target mismatch"}, {status: 409})
+          : Response.json({detail: "Setup ticket does not match this app"}, {status: 409})
       }
       expect(String(url).startsWith(saved.baseUrl)).toBe(true)
       return Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: [CONFIG.soulId]})
@@ -546,7 +555,177 @@ describe("SessionController", () => {
     await fresh.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
     expect(reports[1].device_session_id).not.toBe(CONFIG.deviceSessionId)
     expect(lastSnapshot(fresh)).toMatchObject({soulLocked: true, soulConfirmed: false, memuAvailable: false})
+    expect(lastSnapshot(fresh)?.lastError).toContain("Make a new Stock Install QR")
     await expect(fresh.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow("Installation is not confirmed")
+  })
+
+  test("a refused fresh claim keeps its candidate until a new Stock Install QR is supplied", async () => {
+    const session = new FakeSession()
+    const reports: Record<string, unknown>[] = []
+    const fetchFn = (async (url, init) => {
+      if (init?.method) {
+        const body = JSON.parse(String(init.body))
+        reports.push(body)
+        return body.installation_ticket === "ticket-new"
+          ? Response.json({ok: true})
+          : Response.json({detail: "Setup ticket is unavailable or already used"}, {status: 409})
+      }
+      return Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: []})
+    }) as typeof fetch
+    let candidate = ""
+    for (const installationTicket of ["ticket-used", "ticket-used", "ticket-new"]) {
+      new SessionController(session as never, {fetchFn,
+        installationDefaults: {baseUrl: CONFIG.baseUrl, userId: CONFIG.userId, installationTicket},
+      }).start()
+      await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+      const saved = JSON.parse(session.stored.get("openalma.connection-profile")!)
+      candidate ||= saved.deviceSessionId
+      expect(saved.deviceSessionId).toBe(candidate)
+      expect(saved.installationTicket).toBe(installationTicket)
+      expect(saved.installationConfirmed).toBe(installationTicket === "ticket-new")
+      expect(lastSnapshot(session)?.memuAvailable).toBe(installationTicket === "ticket-new")
+      if (installationTicket !== "ticket-new") {
+        expect(lastSnapshot(session)?.lastError).toContain("Make a new Stock Install QR")
+        expect(lastSnapshot(session)?.soulLocked).toBe(true)
+      }
+    }
+    expect(reports.map(body => body.device_session_id)).toEqual([candidate, candidate, candidate])
+  })
+
+  test("a refused Update QR never overwrites a working stock profile or its recovery journal", async () => {
+    for (const detail of ["Setup ticket is unavailable or already used", "Setup ticket does not match this app"]) {
+      const session = new FakeSession()
+      const saved = JSON.stringify({...CONFIG, installationTicket: "ticket-confirmed", installationConfirmed: true})
+      const journal = JSON.stringify({version: 1,
+        scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+        resumption: {handle: "fictional-handle", updatedAt: Date.now()},
+      })
+      session.stored.set("openalma.connection-profile", saved)
+      session.stored.set("openalma.soul-id", CONFIG.soulId)
+      session.stored.set("openalma:gemini-session-v1", journal)
+      const reports: Record<string, unknown>[] = []
+      const configs: OpenAlmaConfig[] = []
+      const fetchFn = (async (url, init) => {
+        if (init?.method) {
+          expect(session.stored.get("openalma.connection-profile")).toBe(saved)
+          reports.push(JSON.parse(String(init.body)))
+          return Response.json({detail: detail === "Setup ticket does not match this app" ? {message: detail} : detail}, {status: 409})
+        }
+        return Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: [CONFIG.soulId]})
+      }) as typeof fetch
+      const options = {fetchFn,
+        installationDefaults: {baseUrl: "http://wrong.example", userId: "Other User", installationTicket: "ticket-wrong"},
+        createLiveController: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => {
+          configs.push(config)
+          return new FakeLive(callbacks) as never
+        },
+      }
+      for (let reopen = 0; reopen < 2; reopen += 1) {
+        new SessionController(session as never, options).start()
+        await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+        expect(session.stored.get("openalma.connection-profile")).toBe(saved)
+        expect(session.stored.get("openalma:gemini-session-v1")).toBe(journal)
+        expect(lastSnapshot(session)).toMatchObject({memuAvailable: true, soulConfirmed: true, soulId: CONFIG.soulId})
+        expect(lastSnapshot(session)?.lastError).toContain(detail)
+        expect(lastSnapshot(session)?.lastError).toContain("existing Iris connection has been kept")
+        expect(lastSnapshot(session)?.lastError).not.toContain("Make a new Stock Install QR")
+        await session.handlers["openalma:start"]({mode: "manual"})
+        expect(configs.at(-1)).toMatchObject({baseUrl: CONFIG.baseUrl, userId: CONFIG.userId,
+          deviceSessionId: CONFIG.deviceSessionId, soulId: CONFIG.soulId,
+          installationTicket: "ticket-confirmed", installationConfirmed: true})
+        await session.handlers["openalma:stop"]({})
+      }
+      expect(reports).toHaveLength(2)
+      expect(reports.every(body => body.device_session_id === CONFIG.deviceSessionId && body.installation_ticket === "ticket-wrong")).toBe(true)
+    }
+  })
+
+  test("an uncertain Update exchange keeps its saved profile; reopen or address repair reuses the same ID and ticket", async () => {
+    for (const failure of ["reply", "confirmation", "outage"]) {
+      const session = new FakeSession()
+      const saved = JSON.stringify({...CONFIG, installationTicket: "ticket-confirmed", installationConfirmed: true})
+      session.stored.set("openalma.connection-profile", saved)
+      session.stored.set("openalma.soul-id", CONFIG.soulId)
+      let failing = true
+      const save = session.storage.set
+      session.storage.set = async (key, value) => {
+        if (failing && failure === "confirmation" && key === "openalma.connection-profile") throw new Error("Profile write failed")
+        await save(key, value)
+      }
+      const reports: Record<string, unknown>[] = []
+      const fetchFn = (async (url, init) => {
+        if (init?.method) {
+          reports.push(JSON.parse(String(init.body)))
+          if (failing && failure === "reply") throw new Error("Response lost")
+          if (failing && failure === "outage") return Response.json({detail: "Temporarily unavailable"}, {status: 503})
+          return Response.json({ok: true})
+        }
+        return Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: [CONFIG.soulId]})
+      }) as typeof fetch
+      const configs: OpenAlmaConfig[] = []
+      const options = {fetchFn, installationDefaults: {baseUrl: CONFIG.baseUrl, userId: CONFIG.userId, installationTicket: "ticket-update"},
+        createLiveController: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => {
+          configs.push(config)
+          return new FakeLive(callbacks) as never
+        },
+      }
+      new SessionController(session as never, options).start()
+      await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+      expect(lastSnapshot(session)?.memuAvailable).toBe(false)
+      expect(lastSnapshot(session)?.lastError).not.toContain("Make a new Stock Install QR")
+      expect(session.stored.get("openalma.connection-profile")).toBe(saved)
+      failing = false
+      if (failure === "outage") await session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://repaired.example"})
+      else new SessionController(session as never, options).start()
+      await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+      expect(reports).toHaveLength(2)
+      expect(reports[1]).toEqual(reports[0])
+      expect(JSON.parse(session.stored.get("openalma.connection-profile")!)).toMatchObject({
+        deviceSessionId: CONFIG.deviceSessionId, installationTicket: "ticket-update", installationConfirmed: true,
+      })
+      expect(lastSnapshot(session)).toMatchObject({memuAvailable: true, soulConfirmed: true})
+      await session.handlers["openalma:start"]({mode: "manual"})
+      expect(configs.at(-1)).toMatchObject({deviceSessionId: CONFIG.deviceSessionId,
+        installationTicket: "ticket-update", installationConfirmed: true})
+      await session.handlers["openalma:stop"]({})
+    }
+  })
+
+  test("non-ticket conflicts preserve the real error instead of giving QR advice or admitting setup", async () => {
+    const conflicts = [
+      "OpenAlma owner has not been created",
+      "OpenAlma owner is 'Other User', not 'Test User'",
+      "All stock_01 through stock_99 names are in use",
+      "Setup ticket requires the same stock app owner",
+      "Setup ticket is not an app ID",
+      "Installed stock app cannot become a fork host",
+      "Unknown conflict",
+    ]
+    for (const detail of [...conflicts, "Setup ticket is unavailable or already used"]) {
+      const status = conflicts.includes(detail) ? 409 : 503
+      for (const confirmed of [false, true]) {
+        const session = new FakeSession()
+        const saved = JSON.stringify({...CONFIG, installationTicket: "ticket-confirmed", installationConfirmed: true})
+        if (confirmed) session.stored.set("openalma.connection-profile", saved)
+        let requests = 0
+        new SessionController(session as never, {
+          installationDefaults: {baseUrl: CONFIG.baseUrl, userId: CONFIG.userId, installationTicket: "ticket-new"},
+          fetchFn: (async (url, init) => {
+            requests += 1
+            return init?.method ? Response.json({detail}, {status})
+              : Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: []})
+          }) as typeof fetch,
+        }).start()
+        await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+        expect(lastSnapshot(session)).toMatchObject({memuAvailable: false,
+          lastError: `Installation report failed (${status}): ${detail}`})
+        expect(requests).toBe(1)
+        if (confirmed) expect(session.stored.get("openalma.connection-profile")).toBe(saved)
+        else expect(JSON.parse(session.stored.get("openalma.connection-profile")!)).toMatchObject({
+          installationTicket: "ticket-new", installationConfirmed: false,
+        })
+      }
+    }
   })
 
   test("rejects a profile user that differs from the discovered owner", async () => {

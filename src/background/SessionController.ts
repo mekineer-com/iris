@@ -870,11 +870,11 @@ export class SessionController {
       const host = installationHost(await this.session.storage.get(OPENALMA_HOST_KEY))
       if (!this.config && storedProfile === null && this.installationDefaults !== undefined) {
         const raw = this.installationDefaults as Partial<OpenAlmaConfig> | null
-        const defaults = parseOpenAlmaProfile(host ? raw : {...raw,
-          deviceSessionId: makeRequestId(), installationTicket: raw?.installationTicket ?? "", installationConfirmed: false})
-        if (host && defaults.deviceSessionId !== host.deviceSessionId) {
+        if (host && (typeof raw?.deviceSessionId !== "string" || raw.deviceSessionId.trim() !== host.deviceSessionId)) {
           throw new Error("Install Iris from its OpenAlma Mentra row in the launcher")
         }
+        const defaults = parseOpenAlmaProfile(host ? raw : {...raw,
+          deviceSessionId: makeRequestId(), installationTicket: raw?.installationTicket ?? "", installationConfirmed: false})
         storedProfile = serializeOpenAlmaProfile(defaults)
         if (defaults.installationTicket) this.config = defaults
         else await this.session.storage.set(OPENALMA_PROFILE_KEY, storedProfile)
@@ -885,26 +885,45 @@ export class SessionController {
         return
       }
       if (!this.config) this.config = parseOpenAlmaProfile(storedProfile)
-      const ticket = (this.installationDefaults as Partial<OpenAlmaConfig> | null)?.installationTicket
-      if (!host && ticket !== undefined && ticket !== this.config.installationTicket) {
-        this.config = parseOpenAlmaProfile({...this.config, installationTicket: ticket, installationConfirmed: false})
-      }
+      const confirmedConfig = this.installationPending() ? undefined : this.config
       let config = this.config
+      const ticket = (this.installationDefaults as Partial<OpenAlmaConfig> | null)?.installationTicket
+      if (!host && ticket !== undefined && ticket !== config.installationTicket) {
+        config = parseOpenAlmaProfile({...config, installationTicket: ticket, installationConfirmed: false})
+      }
       storedSoul = savedSoul
       this.microphoneEnabled = microphone !== "0"
       this.cameraEnabled = camera !== "0"
       this.soulId = storedSoul?.trim() || config.soulId
       this.recoverySoulId = journalSoulId(journal, config)
       if (this.recoverySoulId) this.soulId = this.recoverySoulId
-      if (this.installationPending()) {
-        await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(config))
-        await reportInstallation({...config, soulId: this.soulId}, this.fetchFn, host)
-        const confirmed = {...config, installationConfirmed: true}
-        await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(confirmed))
-        this.config = config = confirmed
+      if (config.installationTicket && !config.installationConfirmed) {
+        // An existing app's saved ID already permits lost-response replay; keep its confirmed profile until success.
+        if (!confirmedConfig) {
+          this.config = config
+          await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(config))
+        }
+        try {
+          await reportInstallation({...config, soulId: this.soulId}, this.fetchFn, host)
+        } catch (error) {
+          const reportError = error as Error & {status?: number; detail?: string}
+          if (!(error instanceof Error) || reportError.status !== 409 || ![
+            "Setup ticket does not match this app", "Setup ticket is unavailable or already used",
+          ].includes(reportError.detail ?? "")) throw error
+          if (!confirmedConfig) {
+            throw new Error(`${error.message}. Make a new Stock Install QR in the OpenAlma launcher, then install Iris from that QR.`)
+          }
+          config = confirmedConfig
+          this.lastError = `${error.message}. Your existing Iris connection has been kept.`
+        }
+        if (config !== confirmedConfig) {
+          const confirmed = {...config, installationConfirmed: true}
+          await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(confirmed))
+          this.config = config = confirmed
+        }
       }
       const identity = resolvedIdentity ?? await this.resolveProfileIdentity(config)
-      this.config = identity.config
+      this.config = {...config, userId: identity.config.userId}
       this.souls = identity.souls
       this.memuAvailable = true
     } catch (error) {
@@ -919,7 +938,7 @@ export class SessionController {
 
   private currentConfig(): OpenAlmaConfig {
     if (!this.config) throw new Error("Set up the OpenAlma connection first")
-    if (this.installationPending()) throw new Error("Installation is not confirmed; edit the connection or reopen Iris to retry")
+    if (this.installationPending()) throw new Error("Installation is not confirmed. Check the setup error in Iris.")
     return this.config
   }
 
