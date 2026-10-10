@@ -94,6 +94,7 @@ export default function SessionPage() {
   const [startPending, setStartPending] = useState(false)
   const [stopPending, setStopPending] = useState(false)
   const [soulName, setSoulName] = useState("")
+  const [userName, setUserName] = useState("")
   const [soulDirty, setSoulDirty] = useState(true)
   const [soulPending, setSoulPending] = useState(false)
   const [soulMenuOpen, setSoulMenuOpen] = useState(false)
@@ -135,6 +136,7 @@ export default function SessionPage() {
 
   useEffect(() => {
     setSoulName(snapshot?.soulId ?? "")
+    setUserName("")
     setSoulDirty(!(snapshot?.soulConfirmed ?? false))
     setPendingNewSoul(null)
     setShowNewSoulInfo(false)
@@ -167,9 +169,13 @@ export default function SessionPage() {
 
   const selectSoul = async (soulId: string, useExisting: boolean): Promise<boolean> => {
     setRpcError(null)
+    if (!useExisting && !userName.trim()) {
+      setRpcError("Enter what this Soul should call you")
+      return false
+    }
     setSoulPending(true)
     try {
-      const result = await soulRpc({soulId, useExisting}) as SelectSoulResult
+      const result = await soulRpc({soulId, useExisting, ...(!useExisting ? {userName: userName.trim()} : {})}) as SelectSoulResult
       if ("confirmationRequired" in result) {
         setConfirmationSoul(result.soulId)
         return false
@@ -178,6 +184,7 @@ export default function SessionPage() {
       setSoulDirty(false)
       setPendingNewSoul(null)
       setConfirmationSoul(null)
+      setUserName("")
       return true
     } catch (error) {
       setRpcError(error instanceof Error ? error.message : String(error))
@@ -437,6 +444,7 @@ export default function SessionPage() {
                 onFocus={() => setSoulMenuOpen(true)}
                 onChange={(event) => {
                   setSoulName(event.target.value)
+                  setUserName("")
                   setSoulDirty(true)
                   setConfirmationSoul(null)
                   setPendingNewSoul(null)
@@ -450,6 +458,7 @@ export default function SessionPage() {
                     <button key={soul} type="button" role="option" aria-selected={soul === soulName}
                       onClick={() => {
                         setSoulName(soul)
+                        setUserName("")
                         setSoulDirty(true)
                         setConfirmationSoul(null)
                         setPendingNewSoul(null)
@@ -474,6 +483,13 @@ export default function SessionPage() {
             ) : null}
           </span>
         </label>
+        {pendingNewSoul === soulName.trim() && !confirmationSoul ? (
+          <label>
+            <span>What should this Soul call you?</span>
+            <input value={userName} required disabled={soulLocked || soulPending || startPending}
+              onChange={(event) => setUserName(event.target.value)} />
+          </label>
+        ) : null}
         {showNewSoulInfo ? <p className="soul-info">A new soul will be created when you press Start.</p> : null}
         {confirmationSoul ? (
           <div role="alert">

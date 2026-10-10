@@ -695,7 +695,7 @@ describe("SessionController", () => {
       soulId: "Existing Soul",
       confirmationRequired: true,
     })
-    await expect(harness.session.handlers["openalma:set-soul"]({soulId: "Existing Soul", useExisting: true})).resolves.toEqual({
+    await expect(harness.session.handlers["openalma:set-soul"]({soulId: "Existing Soul", useExisting: true, userName: "DoNotReplace"})).resolves.toEqual({
       soulId: "Existing Soul",
       created: false,
     })
@@ -718,6 +718,31 @@ describe("SessionController", () => {
       soulConfirmed: true,
       soulLocked: false,
     })
+  })
+
+  test("creation sends an explicit human name without changing the owner or starting voice", async () => {
+    let body: unknown
+    const h = setup({fetchFn: (async (_url: string, init?: RequestInit) => {
+      if (!init?.method) return Response.json({souls: [CONFIG.soulId]})
+      body = JSON.parse(String(init.body))
+      return Response.json({soul_id: "Fable", created: true})
+    }) as typeof fetch})
+    await expect(h.session.handlers["openalma:set-soul"]({soulId: "Fable", useExisting: false, userName: " Rowan "}))
+      .resolves.toEqual({soulId: "Fable", created: true})
+    expect(body).toEqual({soul_id: "Fable", use_existing: false, user_name: "Rowan"})
+    expect(h.configs).toEqual([])
+    expect(h.session.stored.get("openalma.soul-id")).toBe("Fable")
+  })
+
+  test("creation validation shows the server reason and preserves selected Soul", async () => {
+    const h = setup({fetchFn: (async (_url: string, init?: RequestInit) => !init?.method
+      ? Response.json({souls: [CONFIG.soulId]})
+      : Response.json({detail: "Enter what this Soul should call you"}, {status: 422})) as typeof fetch})
+    await expect(h.session.handlers["openalma:set-soul"]({soulId: "Fable", useExisting: false, userName: " "}))
+      .rejects.toThrow("Enter what this Soul should call you")
+    expect(h.session.stored.get("openalma.soul-id")).toBe(CONFIG.soulId)
+    expect(h.configs).toEqual([])
+    expect(lastSnapshot(h.session)).toMatchObject({soulId: CONFIG.soulId, soulLocked: false})
   })
 
   test("rejects a different soul returned by the server", async () => {

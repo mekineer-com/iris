@@ -181,8 +181,9 @@ export class SessionController {
     this.unsubs.push(
       ui.handle("openalma:set-soul", async (payload) => {
         await this.preferencesLoaded
-        const value = payload as {soulId?: unknown; useExisting?: unknown} | null
-        if (typeof value?.soulId !== "string" || typeof value?.useExisting !== "boolean") {
+        const value = payload as {soulId?: unknown; useExisting?: unknown; userName?: unknown} | null
+        if (typeof value?.soulId !== "string" || typeof value?.useExisting !== "boolean"
+          || (value.userName !== undefined && typeof value.userName !== "string")) {
           throw new Error("Invalid soul selection")
         }
         if (this.soulLocked()) throw new Error("Finish or recover this sitting before changing souls")
@@ -202,14 +203,19 @@ export class SessionController {
             method: "POST",
             signal: timeoutSignal(10_000),
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({soul_id: soulId, use_existing: value.useExisting}),
+            body: JSON.stringify({soul_id: soulId, use_existing: value.useExisting,
+              ...(!value.useExisting && typeof value.userName === "string" ? {user_name: value.userName.trim()} : {}),
+            }),
           })
-          if (response.status === 409) {
-            const detail = await response.json().catch(() => null) as {detail?: {reason?: unknown; message?: unknown}} | null
-            if (detail?.detail?.reason === "existing_exact" && !value.useExisting) return {soulId, confirmationRequired: true as const}
-            if (typeof detail?.detail?.message === "string") throw new Error(detail.detail.message)
+          if (!response.ok) {
+            const error = await response.json().catch(() => null) as {detail?: string | {reason?: unknown; message?: unknown}} | null
+            const detail = error?.detail
+            if (response.status === 409 && typeof detail === "object" && detail !== null) {
+              if (detail.reason === "existing_exact" && !value.useExisting) return {soulId, confirmationRequired: true as const}
+              if (typeof detail.message === "string") throw new Error(detail.message)
+            }
+            throw new Error(typeof detail === "string" ? detail : `Soul selection failed (${response.status})`)
           }
-          if (!response.ok) throw new Error(`Soul selection failed (${response.status})`)
           const result = await response.json() as Partial<{soul_id: string; created: boolean}>
           if (result.soul_id !== soulId || typeof result.created !== "boolean") {
             throw new Error("Soul selection returned an invalid response")
