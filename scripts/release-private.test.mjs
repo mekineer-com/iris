@@ -38,12 +38,25 @@ describe("private release URI", () => {
       MENTRA_PUBLIC_OPENALMA_INSTALLATION_TICKET: "test-ticket",
       MENTRA_RELEASE_HOST_PACKAGE: "com.mentra.mentra",
     }
-    for (const host of ["10.77.0.1", "100.64.0.2", "iris.example", "192.0.2.1", "[fd00::1]"]) {
-      expect(assertPrivateReleaseConfig({...env, MENTRA_PUBLIC_OPENALMA_BASE_URL: `http://${host}:8099`})).toBe(host)
+    for (const host of ["10.77.0.1", "172.16.0.1", "192.168.1.2", "100.64.0.2", "iris.example",
+      "127.example.com", "127.example.com.", "phone.localhost.example", "192.0.2.1",
+      "[fd00::1]", "[fe80::1]", "[::ffff:a4d:1]"]) {
+      for (const baseUrl of [`http://${host}:8099`, `https://${host}:8099/`]) {
+        expect(assertPrivateReleaseConfig({...env, MENTRA_PUBLIC_OPENALMA_BASE_URL: baseUrl})).toBe(host)
+      }
       expect(releaseArgs(host).slice(0, 5)).toEqual(["release", "--host", host, "--port", "6789"])
     }
+    for (const [host, normalized] of [
+      ["0x0a4d0001", "10.77.0.1"], ["012.0115.0.1", "10.77.0.1"],
+      ["[fd00:0:0:0:0:0:0:1]", "[fd00::1]"], ["[::ffff:10.77.0.1]", "[::ffff:a4d:1]"],
+    ]) {
+      expect(assertPrivateReleaseConfig({...env, MENTRA_PUBLIC_OPENALMA_BASE_URL: `http://${host}:8099/`}))
+        .toBe(normalized)
+    }
     for (const host of ["localhost", "LOCALHOST.", "phone.localhost", "127.0.0.1", "127.8.9.10",
-      "127.1", "2130706433", "[::1]", "[0:0:0:0:0:0:0:1]", "[::ffff:127.0.0.1]"]) {
+      "phone.LOCALHOST.", "127.1", "127.0.1", "2130706433", "0177.0.0.1", "0x7f000001",
+      "[::1]", "[0:0:0:0:0:0:0:1]", "[::ffff:127.0.0.1]", "[::ffff:127.8.9.10]", "[::ffff:7f00:1]",
+      "0.0.0.0", "0.0", "0", "0x0", "[::]", "[0:0:0:0:0:0:0:0]", "[::ffff:0.0.0.0]", "[::ffff:0:0]"]) {
       expect(() => assertPrivateReleaseConfig({...env, MENTRA_PUBLIC_OPENALMA_BASE_URL: `http://${host}:8099`}))
         .toThrow("phone-reachable")
     }
@@ -53,8 +66,9 @@ describe("private release URI", () => {
     expect(() => assertPrivateReleaseConfig({...env, MENTRA_RELEASE_HOST_PACKAGE: "unknown"})).toThrow(
       "Unknown Mentra app installation",
     )
-    for (const baseUrl of ["invalid", "ftp://iris.example", "http://user@iris.example", "http://iris.example?q=1",
-      "http://iris.example#fragment", "http://iris.example:65536", "http://iris.example:bad"]) {
+    for (const baseUrl of ["invalid", "ftp://iris.example", "http://user@iris.example", "http://user:pass@iris.example",
+      "http://iris.example?q=1", "http://iris.example#fragment", "http://iris.example/prefix",
+      "https://iris.example/prefix/", "http://iris.example//", "http://iris.example:65536", "http://iris.example:bad"]) {
       expect(() => assertPrivateReleaseConfig({...env, MENTRA_PUBLIC_OPENALMA_BASE_URL: baseUrl})).toThrow()
     }
     expect(JSON.parse(releaseProfile(env))).toEqual({

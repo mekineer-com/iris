@@ -2,6 +2,7 @@
 
 import {spawn} from "node:child_process"
 import {mkdirSync, renameSync, unlinkSync, writeFileSync} from "node:fs"
+import {BlockList, isIP} from "node:net"
 import {dirname, join, resolve} from "node:path"
 import {fileURLToPath} from "node:url"
 
@@ -22,19 +23,27 @@ const requiredBuildEnv = [
   "MENTRA_RELEASE_HOST_PACKAGE",
 ]
 
+const localAddresses = new BlockList()
+// IPv4 rules also match IPv4-mapped IPv6 addresses.
+localAddresses.addSubnet("127.0.0.0", 8, "ipv4")
+localAddresses.addAddress("0.0.0.0", "ipv4")
+localAddresses.addAddress("::1", "ipv6")
+localAddresses.addAddress("::", "ipv6")
+
 export function assertPrivateReleaseConfig(env) {
   const identity = env.MENTRA_RELEASE_HOST_PACKAGE === "com.mentra.mentra"
     ? "MENTRA_PUBLIC_OPENALMA_INSTALLATION_TICKET" : "MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID"
   const missing = [...requiredBuildEnv, identity].filter((name) => !env[name]?.trim())
   if (missing.length) throw new Error(`Missing required build settings: ${missing.join(", ")}`)
   const url = new URL(env.MENTRA_PUBLIC_OPENALMA_BASE_URL)
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
-    throw new Error("Iris base URL must be an http or https URL without credentials, query, or fragment")
+  if (!["http:", "https:"].includes(url.protocol) || url.pathname !== "/" ||
+      url.username || url.password || url.search || url.hash) {
+    throw new Error("Iris base URL must be an http or https origin without a path, credentials, query, or fragment")
   }
-  const hostname = url.hostname.replace(/\.$/, "")
+  const hostname = url.hostname.replace(/^\[|\]$|\.$/g, "")
   if (hostname === "localhost" || hostname.endsWith(".localhost") ||
-      /^(?:127\.|\[::1\]$|\[::ffff:7f[0-9a-f]{2}:)/.test(hostname)) {
-    throw new Error("Iris base URL must be phone-reachable, not localhost or loopback")
+      localAddresses.check(hostname, isIP(hostname) === 6 ? "ipv6" : "ipv4")) {
+    throw new Error("Iris base URL must be phone-reachable, not localhost, loopback, or unspecified")
   }
   if (!["com.mentra.mentra", "com.mentra.mentra.openalma"].includes(env.MENTRA_RELEASE_HOST_PACKAGE)) {
     throw new Error("Unknown Mentra app installation")
