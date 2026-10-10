@@ -516,11 +516,7 @@ export class GeminiLiveController {
         image_id: pending.imageId,
       }, SNAPSHOT_TIMEOUT_MS).catch(() => null)
       if (this.pendingImage !== pending || pending.providerSent || this.stopping) return
-      if (!response || response.status >= 500) {
-        await this.requestPhotoRetry(pending)
-        return
-      }
-      if (!response.ok) {
+      if (!response?.ok) {
         await this.requestPhotoRetry(pending)
         return
       }
@@ -778,11 +774,11 @@ export class GeminiLiveController {
     if (update?.resumable === false) {
       this.resumptionHandle = ""
       this.resumptionUpdatedAt = 0
-      this.queueJournalWrite()
+      void this.persistJournal()
     } else if (update?.resumable === true && typeof update.newHandle === "string" && update.newHandle.trim()) {
       this.resumptionHandle = update.newHandle
       this.resumptionUpdatedAt = Date.now()
-      this.queueJournalWrite()
+      void this.persistJournal()
     }
 
     if (message.goAway !== undefined) this.handleGoAway(message.goAway)
@@ -1010,7 +1006,7 @@ export class GeminiLiveController {
     if (output) this.enqueueEvent("transcript", "assistant", output, "complete")
     if (pendingImage?.providerSent && pendingImage.captureAfterCurrent) {
       pendingImage.captureAfterCurrent = false
-      this.queueJournalWrite()
+      void this.persistJournal()
     }
     this.deliveredToolResultIds.clear()
     this.scheduleAppend()
@@ -1246,12 +1242,12 @@ export class GeminiLiveController {
     if (input || output) this.scheduleAppend()
     if (this.pendingImage?.providerSent && !this.pendingImage.caption && !this.pendingImage.captureAfterCurrent) {
       this.pendingImage.providerSent = false
-      this.queueJournalWrite()
+      void this.persistJournal()
       this.callbacks.onPersistenceError("Photo description was interrupted; retrying")
     }
     if (this.pendingImage?.providerSent && this.pendingImage.captureAfterCurrent) {
       this.pendingImage.captureAfterCurrent = false
-      this.queueJournalWrite()
+      void this.persistJournal()
     }
   }
 
@@ -1282,7 +1278,7 @@ export class GeminiLiveController {
       }
       this.pendingEvents.push(event)
     }
-    this.queueJournalWrite()
+    void this.persistJournal()
     return event
   }
 
@@ -1344,13 +1340,6 @@ export class GeminiLiveController {
     if (!pending?.caption || (pending.retryRequested && !userRequested) || !pending.assistantSequence) return
     if (this.pendingEvents.some((event) => event.sequence <= pending.assistantSequence!)) return
     const generation = this.generation
-    if (Array.from(pending.caption).length > TRANSCRIPT_CONTENT_LIMIT) {
-      if (!await this.archivePendingImage(pending, generation)) return
-      this.pendingImage = null
-      await this.persistJournal()
-      this.callbacks.onPhotoRetryChange(false)
-      return
-    }
     let response: Response
     try {
       response = await this.request(`/integration/mentra/session/${this.sessionId}/snapshot/finalize`, {
@@ -1376,23 +1365,17 @@ export class GeminiLiveController {
       await this.requestPhotoRetry(pending)
       return
     }
-    if (result.discarded === true && !await this.archivePendingImage(pending, generation)) return
+    if (result.discarded === true) {
+      try { await this.archiveJournal(this.journalSnapshot()) } catch {
+        if (generation === this.generation && this.pendingImage === pending) await this.requestPhotoRetry(pending)
+        return
+      }
+      if (generation !== this.generation || this.pendingImage !== pending) return
+    }
     this.pendingImage = null
     await this.persistJournal()
     this.callbacks.onPhotoRetryChange(false)
     this.clearPersistenceErrorIfSynced()
-  }
-
-  private async archivePendingImage(pending: PendingImage, generation: number): Promise<boolean> {
-    try { await this.archiveJournal(this.journalSnapshot()) } catch {
-      if (generation === this.generation && this.pendingImage === pending) await this.requestPhotoRetry(pending)
-      return false
-    }
-    return generation === this.generation && this.pendingImage === pending
-  }
-
-  private queueJournalWrite(): void {
-    void this.persistJournal()
   }
 
   private async hydrateJournal(generation: number): Promise<void> {
@@ -1406,7 +1389,7 @@ export class GeminiLiveController {
     const raw = selected.raw
     this.loadedJournal = raw
     if (selected.unreadable) {
-      this.callbacks.onPersistenceError("Previous local backup kept aside; starting a fresh backup")
+      this.callbacks.onPersistenceError("Local backup unavailable; starting fresh without replacing existing data")
     }
     if (raw === null) {
       this.journalLoaded = true
@@ -1599,10 +1582,9 @@ export class GeminiLiveController {
       // ponytail: one rare-recovery list; split entries into keys only if its size becomes a problem.
       const valid = Array.isArray(recovered) && recovered.every(value => typeof value === "string")
       const entries: string[] = valid ? recovered as string[] : previous === null ? [] : [previous]
-      if (!valid || !entries.includes(raw)) {
-        if (!entries.includes(raw)) entries.push(raw)
-        await this.storage!.set(RECOVERED_CHATS_KEY, JSON.stringify(entries))
-      }
+      const exists = entries.includes(raw)
+      if (!exists) entries.push(raw)
+      if (!valid || !exists) await this.storage!.set(RECOVERED_CHATS_KEY, JSON.stringify(entries))
     })
     this.journalTail = write.catch(() => {})
     return write
@@ -1610,8 +1592,7 @@ export class GeminiLiveController {
 
   private async preserveJournal(raw: string, generation: number): Promise<void> {
     try { await this.archiveJournal(raw) } catch {
-      if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
-      this.journalKey = this.journalKey === null ? null : selectJournalKey([this.journalKey], true)
+      this.journalKey = selectJournalKey([this.journalKey!], true)
     }
     if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
     this.loadedJournal = null
@@ -1679,7 +1660,7 @@ export class GeminiLiveController {
       if (!this.resumptionHandle && this.pendingImage?.providerSent && !this.pendingImage.caption) {
         this.pendingImage.providerSent = false
         this.pendingImage.captureAfterCurrent = false
-        this.queueJournalWrite()
+        void this.persistJournal()
       }
       if (interrupted) this.callbacks.onInterrupted()
       if ((this.resumptionHandle || !this.hasCompletedProviderTurn) && !this.reconnectAttempted) {

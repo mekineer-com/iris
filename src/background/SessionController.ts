@@ -985,13 +985,9 @@ export class SessionController {
   }
 
   private async refreshRecoveryLock(): Promise<void> {
-    if (this.installationPending()) return
-    try {
-      const journal = await readSessionJournal(this.session.storage)
-      if (!journal.unreadable) this.recoverySoulId = journalSoulId(journal.raw, this.currentConfig())
-    } catch {
-      this.lastError = "Local recovery state unavailable; reopen Iris to retry"
-    }
+    if (!this.config || this.installationPending()) return
+    const journal = await readSessionJournal(this.session.storage)
+    if (!journal.unreadable) this.recoverySoulId = journalSoulId(journal.raw, this.currentConfig())
   }
 
   private resetManualState(): void {

@@ -300,6 +300,8 @@ describe("SessionController", () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(lastSnapshot(session)).toMatchObject({configured: false, soulLoading: false, lastError: null})
     expect(requests).toBe(0)
+    await expect(session.handlers["openalma:start"]({mode: "continuous"})).rejects.toThrow("Set up the OpenAlma connection first")
+    expect(requests).toBe(0)
 
     await session.handlers["openalma:set-profile"](CONFIG)
     expect(lastSnapshot(session)).toMatchObject({configured: true, soulId: "", memuAvailable: true})
