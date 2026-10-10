@@ -354,11 +354,11 @@ export default function SessionPage() {
     }
   }
 
-  const saveProfile = async () => {
+  const saveProfile = async (connectionProfile = profile) => {
     setProfilePending(true)
     setRpcError(null)
     try {
-      await profileRpc(profile)
+      await profileRpc(connectionProfile)
       setEditingConnection(false)
     } catch (error) {
       setRpcError(error instanceof Error ? error.message : String(error))
@@ -428,7 +428,13 @@ export default function SessionPage() {
       {snapshot?.memuAvailable === false ? (
         <p className="memu-status" role="status">
           <img src={memuIcon} alt="" />
-          <span>{snapshot.lastError || "memU is unavailable. Start memU or check its address."} <button type="button" onClick={editConnection}>Edit Connection</button>.</span>
+          <span>{snapshot.lastError || "memU is unavailable. Start memU or check its address."}{" "}
+            <button type="button" disabled={profilePending || connectionLocked}
+              onClick={() => void saveProfile(snapshot.connectionProfile!)}>
+              {profilePending ? "Checking..." : "Retry Connection"}
+            </button>{" "}
+            <button type="button" onClick={editConnection}>Edit Connection</button>.
+          </span>
         </p>
       ) : null}
       <section className="soul-control" aria-label="Soul selection">

@@ -110,6 +110,17 @@ describe("SessionPage state projection", () => {
     expect(JSON.stringify(render())).toContain(snapshot.lastError)
     expect(JSON.stringify(render())).not.toContain("memU is unavailable. Start memU")
     expect(nodes(render()).find(node => node.props?.className === "sitting-button").props.disabled).toBe(true)
+    const retry = nodes(render()).find(node => node.props?.children === "Retry Connection")
+    expect(retry).toBeDefined()
+    expect(retry.props.disabled).toBe(false)
+    retry.props.onClick()
+    expect(nodes(render()).find(node => node.props?.children === "Checking...").props.disabled).toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(calls).toEqual([{channel: "openalma:set-profile", payload: snapshot.connectionProfile}])
+    snapshot.connectionLocked = true
+    expect(nodes(render()).find(node => node.props?.children === "Retry Connection").props.disabled).toBe(true)
+    snapshot.connectionLocked = false
+    calls.length = 0
     nodes(render()).find(node => node.props?.children === "Edit Connection").props.onClick()
     const inputs = nodes(render()).filter(node => node.type === "input")
     expect(inputs.map(node => node.props.readOnly)).toEqual([false, true, true])

@@ -825,13 +825,20 @@ describe("SessionController", () => {
     }
   })
 
-  test("failed discovery releases loading and shows its error", async () => {
+  test("failed discovery can reconnect in place when the server returns without starting voice", async () => {
+    let available = false
     const h = setup({fetchFn: (async (_url, init) => {
       expect(init?.signal).toBeInstanceOf(AbortSignal)
-      throw new Error("Discovery timed out")
+      if (!available) throw new Error("Discovery timed out")
+      return Response.json({souls: [CONFIG.soulId]})
     }) as typeof fetch})
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(lastSnapshot(h.session)).toMatchObject({soulLoading: false, lastError: "Discovery timed out"})
+    available = true
+    await h.session.handlers["openalma:set-profile"](lastSnapshot(h.session)!.connectionProfile)
+    expect(lastSnapshot(h.session)).toMatchObject({memuAvailable: true, soulLoading: false,
+      soulConfirmed: true, soulId: CONFIG.soulId, lastError: null})
+    expect(h.configs).toEqual([])
   })
 
   test("pending selection excludes Start and concurrent selections", async () => {
