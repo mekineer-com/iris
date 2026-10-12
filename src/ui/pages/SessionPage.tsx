@@ -647,7 +647,7 @@ export default function SessionPage() {
         <button type="button" onClick={editConnection}>Edit Connection</button>
       </section>
       <button type="button" className="settings-toggle" aria-label="Settings" aria-controls="iris-settings"
-        aria-expanded={settingsOpen} onClick={() => setSettingsOpen((open) => !open)}>&#9881;</button>
+        aria-expanded={settingsOpen} onClick={() => setSettingsOpen((open) => !open)}>&#9881; Settings</button>
     </main>
   )
 }
