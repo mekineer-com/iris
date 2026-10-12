@@ -594,6 +594,8 @@ export class SessionController {
     this.pushSnapshot()
     await this.abortCurrentWriter()
     trace("session.speaker.aborted")
+    this.speechFinishTail = Promise.resolve()
+    this.pendingSpeechWrites.clear()
     await this.stopLiveController(graceful)
     trace("session.provider.stopped")
     if (graceful) {
@@ -814,7 +816,10 @@ export class SessionController {
   }
 
   private queueFinishSpeech(finalResponse = true): void {
-    this.speechFinishTail = this.speechFinishTail.then(() => this.finishSpeech(finalResponse))
+    const epoch = this.speakerEpoch
+    this.speechFinishTail = this.speechFinishTail.then(() => {
+      if (epoch === this.speakerEpoch) return this.finishSpeech(finalResponse)
+    })
   }
 
   private handleManualAction(action: ManualAction): void {

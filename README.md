@@ -27,6 +27,12 @@ and complete or let go of an intention through server tools. Lost write results
 are uncertain; Iris never automatically repeats those writes. Connection renewal
 keeps the original entry context.
 
+Invalid tool arguments are answered without ending voice or running part of a
+rejected batch. A shortened working thought is reported as truncated. Authentication
+and expired-sitting failures still end the session. Server-request deadlines cover
+response bodies as well as headers; interrupted transcript sync retains the phone
+backup. Stop abandons waits from interrupted playback before playing a reflection.
+
 Iris stores its OpenAlma connection profile and selected soul in phone-local
 `session.storage`. With no profile it asks you to install Iris from the launcher
 and makes no OpenAlma or Gemini request. Discovery checks the one shared OpenAlma

@@ -1,4 +1,5 @@
 import {approxBase64ByteLength} from "./audioHelpers"
+import {timeoutSignal} from "./timeoutSignal"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import type {ImageRequest} from "../shared/channels"
 import {PHOTO_RETRY_MESSAGE, type SessionMode} from "../shared/types"
@@ -337,7 +338,7 @@ export class GeminiLiveController {
       // ponytail: drop audio during the single reconnect; add a bounded queue only if field tests show speech loss.
       return
     }
-    if (!this.socket || this.socket.readyState !== WS_OPEN) throw new Error("Gemini socket is not ready")
+    if (!this.socket || this.socket.readyState !== WS_OPEN) return
     this.sendAudioToSocket(this.socket, base64Pcm)
   }
 
@@ -734,7 +735,10 @@ export class GeminiLiveController {
       socket.addEventListener("error", () => {
         if (this.stopping || this.socket !== socket) return
         const error = new Error(ready ? "Gemini socket failed" : "Gemini socket failed during setup")
-        if (ready) socket.close()
+        if (ready) {
+          this.ready = false
+          socket.close()
+        }
         else finish(error)
       })
       socket.addEventListener("close", (event) => {
@@ -1021,13 +1025,12 @@ export class GeminiLiveController {
     }
     const parsed: Array<{id: string; name: string; args: Record<string, unknown>}> = []
     const ids = new Set<string>()
+    let invalid = false
     for (const call of calls) {
       const id = typeof call?.id === "string" ? call.id.trim() : ""
       const name = typeof call?.name === "string" ? call.name : ""
-      const args = call?.args
-      if (!args || typeof args !== "object" || Array.isArray(args)) {
-        throw new Error("Gemini returned malformed tool arguments")
-      }
+      const argumentsValid = call?.args && typeof call.args === "object" && !Array.isArray(call.args)
+      const args = argumentsValid ? call.args : {}
       let keys: string[]
       let valid: boolean
       switch (name) {
@@ -1054,14 +1057,13 @@ export class GeminiLiveController {
       }
       if (
         !id ||
-        !valid ||
-        Object.keys(args).some((key) => !keys.includes(key)) ||
         ids.has(id) ||
         this.pendingToolCalls.has(id) ||
         this.deliveredToolResultIds.has(id)
       ) {
         throw new Error(`Gemini returned malformed ${name} call`)
       }
+      invalid ||= !argumentsValid || !valid || Object.keys(args).some((key) => !keys.includes(key))
       ids.add(id)
       parsed.push({id, name, args: Object.fromEntries(Object.entries(args).map(([key, value]) =>
         [key, typeof value === "string" ? value.trim() : value],
@@ -1074,7 +1076,10 @@ export class GeminiLiveController {
         sessionId: this.sessionId,
       }
       this.pendingToolCalls.set(id, pending)
-      if (name === "recall_memory") void this.runRecall(id, args.query as string, pending)
+      if (invalid) this.completeToolCall(id, pending, {
+        ok: false, status: "invalid", message: "Invalid tool arguments; no calls in this batch were run.",
+      }, false)
+      else if (name === "recall_memory") void this.runRecall(id, args.query as string, pending)
       else void this.runWorkingTool(id, args, pending)
     }
   }
@@ -1120,7 +1125,11 @@ export class GeminiLiveController {
         return
       }
     }
-    if ([400, 401, 403, 404, 409, 422, 503].includes(response.status)) {
+    if (response.status === 422) {
+      this.completeToolCall(id, pending, {ok: false, status: "invalid", message: "Invalid recall arguments."}, false)
+      return
+    }
+    if ([400, 401, 403, 404, 409].includes(response.status)) {
       trace("recall.fatal", {id, status: response.status, elapsedMs: Date.now() - startedAt})
       this.failToolCall(id, pending, `OpenAlma memory recall failed (${response.status})`)
       return
@@ -1130,7 +1139,16 @@ export class GeminiLiveController {
       this.completeToolCall(id, pending, "Memory recall is temporarily unavailable.", true)
       return
     }
-    const body = await response.json().catch(() => null) as {context?: unknown; retrieve_ms?: unknown} | null
+    let body: {context?: unknown; retrieve_ms?: unknown} | null
+    try {
+      body = await response.json()
+    } catch (error) {
+      if (error instanceof Error && ["AbortError", "TypeError"].includes(error.name)) {
+        this.completeToolCall(id, pending, "Memory recall is temporarily unavailable.", true)
+        return
+      }
+      body = null
+    }
     if (
       !body ||
       typeof body.context !== "string" ||
@@ -1176,7 +1194,11 @@ export class GeminiLiveController {
       this.completeToolCall(id, pending, {ok: false, status: "paused", message: "Working state is paused; recovery is in OpenAlma launcher."}, false)
       return
     }
-    if ([400, 401, 403, 404, 409, 422].includes(response.status)) {
+    if (response.status === 422) {
+      this.completeToolCall(id, pending, {ok: false, status: "invalid", message: "Invalid working-state arguments; not saved."}, false)
+      return
+    }
+    if ([400, 401, 403, 404, 409].includes(response.status)) {
       this.failToolCall(id, pending, `OpenAlma working-state tool failed (${response.status})`)
       return
     }
@@ -1310,7 +1332,14 @@ export class GeminiLiveController {
         return
       }
       if (!response.ok) throw new Error(`OpenAlma transcript append failed (${response.status})`)
-      const result = (await response.json()) as {ack_sequence?: unknown}
+      let result: {ack_sequence?: unknown}
+      try {
+        result = await response.json()
+      } catch (error) {
+        if (!(error instanceof Error) || !["AbortError", "TypeError"].includes(error.name)) throw error
+        this.callbacks.onPersistenceError("Transcript sync failed; retrying")
+        return
+      }
       const ack = result.ack_sequence
       if (!Number.isSafeInteger(ack) || Number(ack) !== batch[batch.length - 1].sequence) {
         throw new Error("OpenAlma transcript append returned an invalid acknowledgement")
@@ -1756,7 +1785,13 @@ export class GeminiLiveController {
         response.status >= 500,
       )
     }
-    const body = await response.json().catch(() => null)
+    let body
+    try {
+      body = await response.json()
+    } catch (error) {
+      throw new TokenRefreshError("OpenAlma token refresh returned an invalid contract",
+        error instanceof Error && ["AbortError", "TypeError"].includes(error.name))
+    }
     const token = typeof body?.ephemeral_token === "string" ? body.ephemeral_token.trim() : ""
     if (!token) throw new TokenRefreshError("OpenAlma token refresh returned an invalid contract", false)
     if (!this.reconnectOwned(generation, sessionId)) {
@@ -1790,7 +1825,7 @@ export class GeminiLiveController {
         trace("provider.heartbeat.missed", {status: response.status})
         this.expireMissedHeartbeat()
       } else {
-        const body = await response.json().catch(() => null)
+        const body = await response.json()
         if (!this.reconnectOwned(generation, sessionId)) return
         this.lastHeartbeatSuccessAt = Date.now()
         const previousPause = this.activityPauseReason
@@ -1839,16 +1874,14 @@ export class GeminiLiveController {
   }
 
   private request(path: string, body: unknown, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Response> {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), timeoutMs)
     return this.fetchFn(`${this.config.baseUrl}${path}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
-      signal: controller.signal,
-    }).finally(() => clearTimeout(timeout))
+      signal: timeoutSignal(timeoutMs),
+    })
   }
 
   private clearHeartbeat(): void {
@@ -1871,6 +1904,11 @@ export class GeminiLiveController {
   private reportError(error: Error): void {
     if (this.stopping || this.errorReported) return
     this.errorReported = true
+    if ([...this.pendingToolCalls.values()].some(call => (!call.response ||
+      (typeof call.response === "object" && call.response.status === "uncertain")) &&
+      (call.name === "save_working_thought" || call.name === "annul_intention"))) {
+      error = new Error(`${error.message}. ${WRITE_UNCERTAINTY_MESSAGE}`)
+    }
     this.pendingToolCalls.clear()
     this.deliveredToolResultIds.clear()
     this.clearHeartbeat()

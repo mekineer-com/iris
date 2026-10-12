@@ -1703,6 +1703,10 @@ describe("SessionController", () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     harness.session.closeGate = new Promise<void>(() => {})
     harness.live.turnComplete()
+    for (let i = 0; i < 20 && !harness.session.streams[0]?.closed; i++) {
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+    expect(harness.session.streams[0]?.closed).toBe(true)
 
     const stop = harness.session.handlers["openalma:stop"]({})
     await Promise.race([
@@ -1780,6 +1784,37 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:stop"]({})
     expect(harness.session.streams[0]?.writes).toEqual([silentPcm()])
     expect(harness.session.streams[0]?.closed).toBe(true)
+    expect(lastSnapshot(harness.session)?.connection).toBe("idle")
+  })
+
+  test("obsolete queued finish cannot close the reflection writer", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    harness.live.audio()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    let releaseOld!: () => void
+    harness.session.closeGate = new Promise<void>(resolve => {releaseOld = resolve})
+    harness.live.turnComplete()
+    harness.live.turnComplete()
+    for (let i = 0; i < 20 && !harness.session.streams[0]?.closed; i++) {
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+    expect(harness.session.streams[0]?.closed).toBe(true)
+    harness.session.closeGate = null
+    let releaseStop!: () => void
+    harness.live.stopGate = new Promise<void>(resolve => {releaseStop = resolve})
+    harness.live.audioOnStop = true
+    const stop = harness.session.handlers["openalma:stop"]({})
+    for (let i = 0; i < 20 && harness.session.streams.length < 2; i++) {
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+    expect(harness.session.streams).toHaveLength(2)
+    releaseOld()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(harness.session.streams[1].closed).toBe(false)
+    releaseStop()
+    await stop
+    expect(harness.session.streams[1].closed).toBe(true)
     expect(lastSnapshot(harness.session)?.connection).toBe("idle")
   })
 

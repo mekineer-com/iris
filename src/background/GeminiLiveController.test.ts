@@ -118,6 +118,8 @@ function harness(
     workingStatus?: number
     workingBodies?: unknown[]
     workingThrows?: boolean
+    stalledBodyPath?: string
+    bodyTransportFailure?: boolean
     storage?: FakeStorage
     warningSeconds?: number
   } = {},
@@ -150,6 +152,12 @@ function harness(
     const url = String(input)
     const body = JSON.parse(String(init?.body ?? "{}"))
     requests.push({url, body, authorization: new Headers(init?.headers).get("Authorization")})
+    if (options.stalledBodyPath && url.endsWith(options.stalledBodyPath)) {
+      return new Response(new ReadableStream({start(controller) {
+        if (options.bodyTransportFailure) controller.error(new TypeError("Timed out"))
+        else init?.signal?.addEventListener("abort", () => controller.error(new DOMException("Timed out", "AbortError")), {once: true})
+      }}), {headers: {"Content-Type": "application/json"}})
+    }
     if (url.endsWith("/session/start")) {
       if (options.startGate) await options.startGate
       const result = startResults.shift()
@@ -1562,10 +1570,63 @@ describe("GeminiLiveController", () => {
         {id: "valid-first", name: "save_working_thought", args: {thought: "beacon"}},
         {id: "invalid", ...call},
       ]}})
-      expect(h.errors).toHaveLength(1)
+      expect(h.errors).toEqual([])
+      const responses = h.sockets[0].sent.flatMap(value => JSON.parse(value).toolResponse?.functionResponses ?? [])
+      expect(responses.map(response => [response.id, response.response.status, response.scheduling])).toEqual([
+        ["valid-first", "invalid", "SILENT"], ["invalid", "invalid", "SILENT"],
+      ])
       expect(h.requests.some(request => /\/(working-state|working-thought|annul-intention)$/.test(request.url))).toBe(false)
       await h.controller.stop()
     }
+  })
+
+  test("server argument rejection answers tools without ending voice", async () => {
+    for (const name of ["save_working_thought", "recall_memory"]) {
+      const h = harness({workingStatus: 422, recallStatus: 422})
+      await start(h)
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "rejected", name,
+        args: name === "recall_memory" ? {query: "x".repeat(4001)} : {thought: "x".repeat(4001)},
+      }]}})
+      await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
+      const response = JSON.parse(h.sockets[0].sent.find(value => JSON.parse(value).toolResponse)!)
+      expect(response.toolResponse.functionResponses[0]).toMatchObject({response: {ok: false, status: "invalid"}, scheduling: "SILENT"})
+      expect(h.errors).toEqual([])
+      await h.controller.stop()
+    }
+  })
+
+  test("fatal session errors preserve unresolved write uncertainty", async () => {
+    let release!: () => void
+    const h = harness({workingGate: new Promise<void>(resolve => {release = resolve})})
+    await start(h)
+    h.sockets[0].message({toolCall: {functionCalls: [
+      {id: "pending-save", name: "save_working_thought", args: {thought: "beacon"}},
+    ]}})
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/working-thought")))
+    h.sockets[0].message("not JSON")
+    expect(h.errors[0]).toContain("may have saved")
+    release()
+    await h.controller.stop()
+    expect(h.requests.filter(request => request.url.endsWith("/working-thought"))).toHaveLength(1)
+  })
+
+  test("failed reconnect retains an uncertain write answer that could not be delivered", async () => {
+    let release!: () => void
+    const h = harness({workingThrows: true, tokenStatuses: [401],
+      tokenGate: new Promise<void>(resolve => {release = resolve}),
+    })
+    await start(h)
+    h.sockets[0].message({toolCall: {functionCalls: [
+      {id: "queued-uncertain", name: "save_working_thought", args: {thought: "beacon"}},
+    ]}})
+    h.sockets[0].error()
+    await waitFor(() => h.persistenceErrors.some(message => message?.includes("may have saved") === true))
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).toolResponse)).toBe(false)
+    release()
+    await waitFor(() => h.errors.length > 0)
+    expect(h.errors[0]).toContain("may have saved")
+    await h.controller.stop()
+    expect(h.requests.filter(request => request.url.endsWith("/working-thought"))).toHaveLength(1)
   })
 
   test("cancelled and stopped writes discard late responses without undo or replay", async () => {
@@ -1661,7 +1722,7 @@ describe("GeminiLiveController", () => {
   })
 
   test("temporary recall failure is SILENT and nonfatal", async () => {
-    for (const status of [429, 500, 502]) {
+    for (const status of [429, 500, 502, 503]) {
       const h = harness({recallStatus: status, recallBody: {detail: "private upstream detail"}})
       await start(h)
       h.sockets[0].message({
@@ -1732,7 +1793,7 @@ describe("GeminiLiveController", () => {
   })
 
   test("recall scope, internal, and config failures are fatal without exposing the query", async () => {
-    for (const status of [404, 503]) {
+    for (const status of [401, 403, 404, 409]) {
       const h = harness({recallStatus: status, recallBody: {detail: "private scope detail"}})
       await start(h)
       h.sockets[0].message({
@@ -2674,6 +2735,75 @@ describe("GeminiLiveController", () => {
       .flatMap((request) => request.body.events)
     expect(events.some((event: any) => event.content === "private partial")).toBe(false)
     expect(h.sockets).toHaveLength(1)
+  })
+
+  test("audio during a deferred socket close leaves recovery in charge", async () => {
+    const h = harness()
+    await start(h)
+    const socket = h.sockets[0]
+    const close = socket.close.bind(socket)
+    socket.close = () => {}
+    socket.error()
+    expect(() => h.controller.sendAudio("AAAA")).not.toThrow()
+    expect(socket.sent).toHaveLength(1)
+    socket.readyState = 2
+    expect(() => h.controller.sendAudio("AAAA")).not.toThrow()
+    close()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    h.sockets[1].message({setupComplete: {}})
+    await waitFor(() => h.reconnecting.at(-1) === false)
+    h.controller.sendAudio("AAAA")
+    expect(h.sockets[1].sent).toHaveLength(2)
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("stalled response bodies time out without losing transcript retries", async () => {
+    const original = globalThis.setTimeout
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: TimerHandler, ms?: number, ...args: any[]) =>
+      original(callback, ms === 10_000 || ms === 30_000 ? 10 : ms, ...args)) as typeof setTimeout)
+    try {
+      for (const bodyTransportFailure of [false, true]) {
+        const starting = harness({stalledBodyPath: "/session/start", bodyTransportFailure})
+        await expect(starting.controller.start()).rejects.toThrow("Timed out")
+        expect(starting.requests.some(request => request.url.endsWith("/end"))).toBe(false)
+        const storage = new FakeStorage()
+        const h = harness({stalledBodyPath: "/transcripts/append", storage, bodyTransportFailure})
+        await start(h)
+        completeTurn(h, "fictional unsynced words", "fictional reply")
+        await waitFor(() => h.persistenceErrors.includes("Transcript sync failed; retrying"))
+        expect(h.errors).toEqual([])
+        await h.controller.stop()
+        expect([...storage.values.values()].join(" ")).toContain("fictional unsynced words")
+        expect(h.requests.some(request => request.url.endsWith("/end"))).toBe(true)
+
+        const recalling = harness({stalledBodyPath: "/recall", bodyTransportFailure})
+        await start(recalling)
+        recalling.sockets[0].message({toolCall: {functionCalls: [
+          {id: "stalled-recall", name: "recall_memory", args: {query: "beacon"}},
+        ]}})
+        await waitFor(() => recalling.persistenceErrors.includes("Memory recall unavailable; voice is continuing"))
+        expect(recalling.errors).toEqual([])
+        await recalling.controller.stop()
+
+        const renewing = harness({stalledBodyPath: "/token", setupTimeoutMs: 10, bodyTransportFailure})
+        await start(renewing)
+        renewing.sockets[0].error()
+        await new Promise(resolve => original(resolve, 100))
+        expect(renewing.requests.filter(request => request.url.endsWith("/token"))).toHaveLength(6)
+        expect(renewing.errors).toHaveLength(1)
+        await renewing.controller.stop()
+
+        const heartbeat = harness({stalledBodyPath: "/heartbeat", heartbeatMs: 5, leaseSeconds: 0.03, bodyTransportFailure})
+        await start(heartbeat)
+        await new Promise(resolve => original(resolve, 60))
+        expect(heartbeat.errors).toEqual(["OpenAlma heartbeat lease expired"])
+        await heartbeat.controller.stop()
+      }
+    } finally {
+      timer.mockRestore()
+    }
   })
 
   test("resumes with the latest private handle and resets only after a completed turn", async () => {
