@@ -215,6 +215,8 @@ export default function SessionPage() {
 
   const onStart = async () => {
     const owner = ++startOwner.current
+    imageOwner.current += 1
+    setImagePending(false)
     setRpcError(null)
     setStartPending(true)
     try {
@@ -342,15 +344,18 @@ export default function SessionPage() {
   }
 
   const handleStoredPhoto = async (action: "retry" | "discard") => {
+    const owner = ++imageOwner.current
     setImagePending(true)
     setRpcError(null)
     try {
       await pendingImageRpc({action})
+      if (owner !== imageOwner.current) return
       if (action === "discard") setImageStatus(null)
     } catch (error) {
+      if (owner !== imageOwner.current) return
       setRpcError(error instanceof Error ? error.message : String(error))
     } finally {
-      setImagePending(false)
+      if (owner === imageOwner.current) setImagePending(false)
     }
   }
 
@@ -589,10 +594,12 @@ export default function SessionPage() {
       {imageStatus ? <p role="status">{imageStatus}</p> : null}
       {photoRetryPending ? (
         <div>
-          <p role="status">{PHOTO_RETRY_MESSAGE}</p>
+          <p role="status">{visible === "idle" || visible === "error"
+            ? "Start Iris to retry or discard the pending photo"
+            : PHOTO_RETRY_MESSAGE}</p>
           <div className="image-review">
             <button type="button" disabled={imagePending || !voiceReady} onClick={() => void handleStoredPhoto("retry")}>Retry</button>
-            <button type="button" disabled={imagePending} onClick={() => void handleStoredPhoto("discard")}>Discard</button>
+            <button type="button" disabled={imagePending || !voiceReady} onClick={() => void handleStoredPhoto("discard")}>Discard</button>
           </div>
         </div>
       ) : null}

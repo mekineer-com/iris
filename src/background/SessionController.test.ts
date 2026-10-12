@@ -1147,6 +1147,9 @@ describe("SessionController", () => {
   test("routes images only while a sitting is active", async () => {
     const harness = setup()
     await expect(harness.session.handlers["openalma:image"]({})).rejects.toThrow("Start Iris")
+    for (const action of ["retry", "discard"]) {
+      await expect(harness.session.handlers["openalma:pending-image"]({action})).rejects.toThrow("Start Iris")
+    }
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     const image = {imageId: "image-1", mimeType: "image/png", data: "AQID"}
     await harness.session.handlers["openalma:image"](image)
@@ -1155,6 +1158,9 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:pending-image"]({action: "discard"})
     expect([harness.live.imageRetries, harness.live.imageDiscards]).toEqual([1, 1])
     await harness.session.handlers["openalma:stop"]({})
+    for (const action of ["retry", "discard"]) {
+      await expect(harness.session.handlers["openalma:pending-image"]({action})).rejects.toThrow("Start Iris")
+    }
   })
 
   test("projects provider rollover as reconnecting with Stop ownership", async () => {

@@ -859,6 +859,28 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("Stop retains a pending photo for explicit recovery after the next Start", async () => {
+    const storage = new FakeStorage()
+    const old = harness({storage, finalizeStatuses: Array(100).fill(503)})
+    await start(old)
+    await old.controller.sendImage({imageId: "retained-photo", mimeType: "image/png", data: "AQID"})
+    old.sockets[0].message({serverContent: {
+      outputTranscription: {text: "A fictional paper kite."}, turnComplete: true,
+    }})
+    await waitFor(() => old.photoRetryChanges.at(-1) === true)
+    await old.controller.stop()
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.caption).toBe("A fictional paper kite.")
+    const next = harness({storage, startSequence: 43})
+    await start(next)
+    expect(next.photoRetryChanges.at(-1)).toBe(true)
+    expect(next.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    await next.controller.discardImage()
+    expect(next.photoRetryChanges.at(-1)).toBe(false)
+    expect(storage.values.get(JOURNAL_KEY)).toBe("")
+    expect(next.errors).toEqual([])
+    await next.controller.stop()
+  })
+
   for (const status of [200, 503, 400, "network"] as const) {
     test(`caption-ready Retry finalization after Stop preserves replacement recovery (${status})`, async () => {
       const storage = new FakeStorage()

@@ -79,6 +79,7 @@ describe("SessionPage state projection", () => {
   test("shows refused-ticket guidance without hiding the address-only connection editor", async () => {
     const snapshot = {configured: true, soulLoading: false, soulId: "", souls: [], soulConfirmed: false,
       soulLocked: true, connectionLocked: false, memuAvailable: false,
+      connection: "idle", photoRetryPending: false,
       connectionProfile: {baseUrl: "http://test.example", userId: "Test User", deviceSessionId: "test-phone"},
       lastError: "Installation report failed (409): Setup ticket is unavailable or already used. Make a new Stock Install QR in the OpenAlma launcher, then install Iris from that QR.",
     }
@@ -136,7 +137,126 @@ describe("SessionPage state projection", () => {
       expect(JSON.stringify(render())).toContain(error)
       expect(JSON.stringify(render())).not.toContain("Make a new Stock Install QR")
     }
+    snapshot.photoRetryPending = true
+    for (const connection of ["idle", "error", "starting", "stopping", "reconnecting", "listening", "speaking"]) {
+      snapshot.connection = connection
+      const actions = nodes(render()).find(node => node.props?.className === "image-review").props.children
+      expect(actions.map((node: any) => node.props.disabled)).toEqual(
+        ["listening", "speaking"].includes(connection) ? [false, false] : [true, true],
+      )
+      expect(JSON.stringify(render()).includes("Start Iris to retry or discard the pending photo"))
+        .toBe(connection === "idle" || connection === "error")
+    }
   })
+
+  for (const action of ["retry", "discard"] as const) {
+    for (const [fails, boundary] of [[false, "Stop"], [true, "Stop"], [false, "error/Start"], [true, "error/Start"]] as const) {
+      test(`late stored-photo ${action} ${fails ? "failure" : "success"} after ${boundary} leaves replacement UI alone`, async () => {
+        const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
+          soulConfirmed: true, soulLocked: false, connection: "idle", photoRetryPending: false}
+        const states: unknown[] = []
+        const refs: Array<{current: unknown}> = []
+        let cursor = 0
+        let refCursor = 0
+        const pending: Array<{resolve: () => void; reject: (error: Error) => void}> = []
+        const calls: string[] = []
+        const context = {
+          exports: {}, btoa, localStorage: {getItem: () => null},
+          require: (name: string) => {
+            if (name === "react") return {
+              useState(initial: unknown) {
+                const index = cursor++
+                if (!(index in states)) states[index] = typeof initial === "function" ? initial() : initial
+                return [states[index], (value: unknown) => {states[index] = typeof value === "function" ? value(states[index]) : value}]
+              },
+              useEffect() {},
+              useRef(value: unknown) {return refs[refCursor++] ??= {current: value}},
+            }
+            if (name === "react/jsx-runtime") return jsx
+            if (name.endsWith("/useChannel")) return {useChannel: () => snapshot}
+            if (name === "@mentra/miniapp/ui") return {useRpc: (channel: string) => async () => {
+              calls.push(channel)
+              if (channel === "openalma:pending-image") {
+                return new Promise<void>((resolve, reject) => pending.push({resolve, reject}))
+              }
+              if (channel === "openalma:set-capabilities") throw new Error("Replacement setting failed")
+              if (channel === "openalma:set-soul") return {soulId: "Quill", created: false}
+              return {ok: true}
+            }}
+            return {default: "", __esModule: true}
+          },
+        }
+        const source = readFileSync(new URL("./SessionPage.tsx", import.meta.url), "utf8")
+        runInNewContext(ts.transpileModule(source, {compilerOptions: {module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX}}).outputText, context)
+        const render = () => {cursor = refCursor = 0; return (context.exports as {default: () => any}).default()}
+        const nodes = (tree: any): any[] => !tree || typeof tree !== "object" ? []
+          : Array.isArray(tree) ? tree.flatMap(nodes) : [tree, ...nodes(tree.props?.children)]
+        const actions = () => nodes(render()).find(node => node.props?.className === "image-review").props.children
+        const flush = () => new Promise(resolve => setTimeout(resolve, 0))
+        const pickPhoto = () => nodes(render()).find(node => node.props?.type === "file").props.onChange({currentTarget: {
+          files: [new File([new Uint8Array([1, 2, 3])], "fictional.png", {type: "image/png"})], value: "",
+        }})
+        const settingError = () => nodes(render()).find(node => node.props?.type === "checkbox").props.onChange({target: {checked: false}})
+        const finishOld = () => fails ? pending[0].reject(new Error("Old photo failed")) : pending[0].resolve()
+
+        nodes(render()).find(node => node.props?.onFocus).props.onChange({target: {value: "Quill"}})
+        nodes(render()).find(node => node.props?.["aria-label"] === "Use soul").props.onClick()
+        await flush()
+        snapshot.connection = "listening"
+        snapshot.soulLocked = true
+        pickPhoto()
+        await flush()
+        expect(JSON.stringify(render())).toContain("Photo sent")
+        snapshot.photoRetryPending = true
+        actions()[action === "retry" ? 0 : 1].props.onClick()
+        expect(pending).toHaveLength(1)
+        expect(actions().map((node: any) => node.props.disabled)).toEqual([true, true])
+        if (boundary === "Stop") {
+          nodes(render()).find(node => node.props?.className === "sitting-button").props.onClick()
+          await flush()
+          expect(calls).toContain("openalma:stop")
+        } else {
+          snapshot.connection = "error"
+          const start = nodes(render()).find(node => node.props?.className === "sitting-button")
+          expect(start.props.disabled).toBe(false)
+          start.props.onClick()
+          await flush()
+          expect(calls).toContain("openalma:start")
+          expect(calls).not.toContain("openalma:stop")
+          snapshot.connection = "listening"
+          expect(actions().map((node: any) => node.props.disabled)).toEqual([false, false])
+          settingError()
+          await flush()
+          const restarted = JSON.stringify(render())
+          finishOld()
+          await flush()
+          expect(JSON.stringify(render())).toBe(restarted)
+        }
+
+        snapshot.photoRetryPending = false
+        pickPhoto()
+        await flush()
+        expect(calls).toContain("openalma:image")
+        expect(JSON.stringify(render())).toContain("Photo sent")
+        snapshot.photoRetryPending = true
+        actions()[0].props.onClick()
+        expect(pending).toHaveLength(2)
+        settingError()
+        await flush()
+        const replacement = JSON.stringify(render())
+        expect(replacement).toContain("Replacement setting failed")
+        expect(actions().map((node: any) => node.props.disabled)).toEqual([true, true])
+
+        if (boundary === "Stop") finishOld()
+        await flush()
+        expect(JSON.stringify(render())).toBe(replacement)
+        pending[1].reject(new Error("Current photo failed"))
+        await flush()
+        expect(JSON.stringify(render())).toContain("Current photo failed")
+        expect(actions().map((node: any) => node.props.disabled)).toEqual([false, false])
+      })
+    }
+  }
 
   test("accepts non-empty JPEG and PNG files of any size", () => {
     expect(validateImageFile({size: 80_000, type: "image/jpeg"})).toBe("image/jpeg")

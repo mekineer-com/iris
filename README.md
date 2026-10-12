@@ -64,6 +64,9 @@ transcript saving stays enabled with a visible local-backup warning.
 
 While a sitting is active, **Take photo** and **Choose image** durably store a non-empty JPEG/PNG before sending it to Gemini. Immediate send is the default; optional preview provides Send/Retake. Files over 1 MB pause for a cost/latency warning that can be permanently dismissed. Gemini's spoken description is saved as the image caption only after its transcript is acknowledged.
 
+Unconfirmed photo recovery stays on the phone after Stop. Start Iris again before
+using Retry or Discard; a delayed old button result cannot change the new sitting.
+
 The MiniApp ZIP is generic and contains no endpoint, credential, user, soul, or
 phone identity. `.env.local` is used only by the private release wrapper for its
 explicit address bind and installation-completion poll; it is never compiled into Iris.
