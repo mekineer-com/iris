@@ -892,9 +892,11 @@ export class SessionController {
       if (!this.config) this.config = parseOpenAlmaProfile(storedProfile)
       const confirmedConfig = this.installationPending() ? undefined : this.config
       let config = this.config
-      const ticket = (this.installationDefaults as Partial<OpenAlmaConfig> | null)?.installationTicket
+      const defaults = this.installationDefaults as Partial<OpenAlmaConfig> | null
+      const ticket = defaults?.installationTicket
       if (!host && ticket !== undefined && ticket !== config.installationTicket) {
-        config = parseOpenAlmaProfile({...config, installationTicket: ticket, installationConfirmed: false})
+        config = parseOpenAlmaProfile({...config, baseUrl: resolvedIdentity ? config.baseUrl : defaults?.baseUrl,
+          installationTicket: ticket, installationConfirmed: false})
       }
       storedSoul = savedSoul
       this.microphoneEnabled = microphone !== "0"
@@ -921,13 +923,13 @@ export class SessionController {
           config = confirmedConfig
           this.lastError = `${error.message}. Your existing Iris connection has been kept.`
         }
-        if (config !== confirmedConfig) {
-          const confirmed = {...config, installationConfirmed: true}
-          await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(confirmed))
-          this.config = config = confirmed
-        }
       }
       const identity = resolvedIdentity ?? await this.resolveProfileIdentity(config)
+      if (config.installationTicket && !config.installationConfirmed) {
+        const confirmed = {...config, installationConfirmed: true}
+        await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(confirmed))
+        config = confirmed
+      }
       this.config = {...config, userId: identity.config.userId}
       this.souls = identity.souls
       this.memuAvailable = true
