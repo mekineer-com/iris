@@ -1151,6 +1151,13 @@ describe("GeminiLiveController", () => {
     expect(h.requests.find((request) => request.url.endsWith("/snapshot/finalize"))?.body.caption).toBe(
       "The photo shows a fictional blue square.",
     )
+    const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events)
+    expect(rows.map(event => [event.sequence, event.event_kind, event.content])).toEqual([
+      [41, "transcript", "The older tool answer."],
+      [42, "image", "Shared a photo."],
+      [43, "transcript", "The photo shows a fictional blue square."],
+    ])
     expect(h.errors).toEqual([])
     await h.controller.stop()
   })
@@ -1262,7 +1269,7 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
-  test("does not bind an already-active speech turn as the image caption", async () => {
+  test.each(["complete", "interrupted", "stop"])("orders an already-active speech turn before the image on %s", async boundary => {
     const h = harness({storage: new FakeStorage()})
     await start(h)
     h.sockets[0].message({serverContent: {
@@ -1270,9 +1277,22 @@ describe("GeminiLiveController", () => {
       outputTranscription: {text: "Current answer."},
     }})
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
-    h.sockets[0].message({serverContent: {turnComplete: true}})
+    expect(h.sockets[0].sent.filter(value => JSON.parse(value).clientContent)).toHaveLength(1)
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    if (boundary === "stop") await h.controller.stop()
+    else h.sockets[0].message({serverContent: {
+      ...(boundary === "interrupted" ? {interrupted: true} : {}), turnComplete: true,
+    }})
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(h.requests.some((request) => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    const preceding = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events)
+    expect(preceding.map(event => [event.sequence, event.event_kind, event.content, event.status])).toEqual([
+      [41, "transcript", "Current user turn.", boundary === "stop" ? "interrupted" : "complete"],
+      [42, "transcript", "Current answer.", boundary === "complete" ? "complete" : "interrupted"],
+      [43, "image", "Shared a photo.", undefined],
+    ])
+    if (boundary === "stop") return
 
     h.sockets[0].message({serverContent: {
       outputTranscription: {text: "The photo shows a fictional blue square."},
@@ -1282,6 +1302,110 @@ describe("GeminiLiveController", () => {
     expect(h.requests.find((request) => request.url.endsWith("/snapshot/finalize"))?.body.caption).toBe(
       "The photo shows a fictional blue square.",
     )
+    const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events)
+    expect(rows.map(event => event.sequence)).toEqual([41, 42, 43, 44])
+    expect(new Set(rows.map(event => event.event_id)).size).toBe(4)
+    expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id).toBe("sitting-1:44")
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("refreshes the photo fence when speech completes during journal preparation", async () => {
+    let release!: () => void
+    const storage = new FakeStorage()
+    const h = harness({storage})
+    await start(h)
+    h.sockets[0].message({serverContent: {
+      inputTranscription: {text: "Current user turn."}, outputTranscription: {text: "Current answer."},
+    }})
+    const before = storage.setCalls
+    storage.setGate = new Promise<void>(resolve => {release = resolve})
+    const sending = h.controller.sendImage({imageId: "journal-photo", mimeType: "image/png", data: "AQID"})
+    await waitFor(() => storage.setCalls > before)
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
+    h.sockets[0].message({serverContent: {turnComplete: true}})
+    release()
+    await sending
+    h.sockets[0].message({serverContent: {
+      outputTranscription: {text: "The photo shows a fictional blue square."}, turnComplete: true,
+    }})
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+    const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events)
+    expect(rows.map(event => [event.sequence, event.event_kind])).toEqual([
+      [41, "transcript"], [42, "transcript"], [43, "image"], [44, "transcript"],
+    ])
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test.each(["empty", "input", "output", "empty-interrupted"])("retains the image marker after a preceding %s boundary", async boundary => {
+    const storage = new FakeStorage()
+    const h = harness({storage})
+    await start(h)
+    h.sockets[0].message({serverContent: {
+      inputTranscription: {text: boundary === "input" ? "Partial question." : " "},
+      outputTranscription: {text: boundary === "output" ? "Partial answer." : " "},
+    }})
+    await h.controller.sendImage({imageId: "gap-photo", mimeType: "image/png", data: "AQID"})
+    h.sockets[0].message({serverContent: {
+      ...(boundary === "empty-interrupted" ? {interrupted: true} : {}), turnComplete: true,
+    }})
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/transcripts/append")))
+    const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events)
+    expect(rows.map(event => event.sequence)).toEqual(boundary === "empty-interrupted" ? [41] : [41, 42, 43])
+    expect(rows.at(-1)).toEqual(expect.objectContaining({event_kind: "image", content: "Shared a photo."}))
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage).toEqual(expect.objectContaining({
+      imageSequence: rows.at(-1).sequence, captureAfterCurrent: false,
+    }))
+    expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    expect(h.errors).toEqual(boundary === "empty-interrupted" ? [] : [boundary === "empty"
+      ? "Gemini completed a turn without transcription" : "Gemini completed a turn without both transcriptions"])
+    await h.controller.stop()
+  })
+
+  test("defers a recovered photo marker during speech and finalizes only after caption ACK", async () => {
+    let releaseReplay!: () => void
+    let releaseAppend!: () => void
+    const replayGate = new Promise<void>(resolve => {releaseReplay = resolve})
+    const appendGate = new Promise<void>(resolve => {releaseAppend = resolve})
+    const storage = new FakeStorage()
+    storage.values.set(JOURNAL_KEY, JSON.stringify({
+      version: 1,
+      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+      resumption: null, pendingTranscripts: [],
+      pendingImage: {imageId: "recovered-photo", mediaRef: "mentra_media/test-phone/recovered-photo.png",
+        providerSent: false, captureAfterCurrent: false, generation: 1, sessionId: "old-sitting"},
+    }))
+    const h = harness({storage, replayGates: [replayGate], appendGates: [appendGate]})
+    await start(h)
+    const retry = h.controller.retryImage()
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/replay")))
+    h.sockets[0].message({serverContent: {
+      inputTranscription: {text: "Current user turn."}, outputTranscription: {text: "Current answer."},
+    }})
+    releaseReplay()
+    await retry
+    expect(h.sockets[0].sent.filter(value => JSON.parse(value).clientContent)).toHaveLength(1)
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    h.sockets[0].message({serverContent: {turnComplete: true}})
+    h.sockets[0].message({serverContent: {
+      outputTranscription: {text: "The photo shows a fictional blue square."}, turnComplete: true,
+    }})
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/transcripts/append")))
+    expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    releaseAppend()
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+    const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events)
+    expect(rows.map(event => [event.sequence, event.content])).toEqual([
+      [41, "Current user turn."], [42, "Current answer."], [43, "Shared a photo."],
+      [44, "The photo shows a fictional blue square."],
+    ])
+    expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id).toBe("sitting-1:44")
+    expect(h.errors).toEqual([])
     await h.controller.stop()
   })
 
@@ -2926,6 +3050,17 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).clientContent))
 
     expect(h.sockets[1].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
+    h.sockets[1].message({serverContent: {
+      outputTranscription: {text: "The photo shows a fictional blue square."}, turnComplete: true,
+    }})
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+    const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events)
+    expect(rows.map(event => [event.sequence, event.event_kind, event.status])).toEqual([
+      [41, "transcript", "interrupted"], [42, "image", undefined], [43, "transcript", "complete"],
+    ])
+    expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id).toBe("sitting-1:43")
+    expect(h.errors).toEqual([])
     await h.controller.stop()
   })
 

@@ -444,6 +444,9 @@ export class GeminiLiveController {
     }
     let sent: boolean
     try {
+      pending.captureAfterCurrent = this.turnActive || Boolean(
+        this.inputTranscript || this.outputTranscript || this.pendingToolCalls.size || this.deliveredToolResultIds.size,
+      )
       sent = this.sendImageTurn(activeSocket, image.mimeType, image.data)
     } catch {
       if (this.activityPauseReason) await this.requestPhotoRetry(pending)
@@ -451,10 +454,7 @@ export class GeminiLiveController {
     }
     if (!sent) throw new Error("Photo send cancelled")
     pending.providerSent = true
-    if (pending.imageSequence === undefined) {
-      const event = this.enqueueEvent("image", "user", "Shared a photo.", undefined, mediaRef)
-      pending.imageSequence = event.sequence
-    }
+    this.enqueueImageMarker()
     this.turnActive = true
     await this.persistJournal()
     this.scheduleAppend()
@@ -541,20 +541,18 @@ export class GeminiLiveController {
         return
       }
       try {
+        pending.captureAfterCurrent = this.turnActive || Boolean(
+          this.inputTranscript || this.outputTranscript || this.pendingToolCalls.size || this.deliveredToolResultIds.size,
+        )
         if (!this.sendImageTurn(socket, mimeType, data)) return
       } catch {
         this.reportError(new Error("Gemini image replay send failed"))
         return
       }
       pending.providerSent = true
-      pending.captureAfterCurrent = this.turnActive || Boolean(
-        this.inputTranscript || this.outputTranscript || this.pendingToolCalls.size || this.deliveredToolResultIds.size,
-      )
       pending.generation = this.generation
       pending.sessionId = this.sessionId
-      if (pending.imageSequence === undefined) {
-        pending.imageSequence = this.enqueueEvent("image", "user", "Shared a photo.", undefined, pending.mediaRef).sequence
-      }
+      this.enqueueImageMarker()
       this.turnActive = true
       await this.persistJournal()
       this.scheduleAppend()
@@ -563,6 +561,21 @@ export class GeminiLiveController {
     } finally {
       this.imageRetrying = false
       if (retryOnReplacement) void this.retryPendingImage()
+    }
+  }
+
+  private enqueueImageMarker(): void {
+    const pending = this.pendingImage
+    if (pending?.providerSent && !pending.captureAfterCurrent && pending.imageSequence === undefined) {
+      pending.imageSequence = this.enqueueEvent("image", "user", "Shared a photo.", undefined, pending.mediaRef).sequence
+    }
+  }
+
+  private releaseImageFence(): void {
+    if (this.pendingImage?.providerSent && this.pendingImage.captureAfterCurrent) {
+      this.pendingImage.captureAfterCurrent = false
+      this.enqueueImageMarker()
+      void this.persistJournal()
     }
   }
 
@@ -987,6 +1000,7 @@ export class GeminiLiveController {
     if (!input && !output) {
       this.enqueueEvent("transcript_gap", "user", "Transcript unavailable.")
       this.enqueueEvent("transcript_gap", "assistant", "Transcript unavailable.")
+      this.releaseImageFence()
       this.scheduleAppend()
       throw new Error("Gemini completed a turn without transcription")
     }
@@ -1000,6 +1014,7 @@ export class GeminiLiveController {
       }
       if (output) this.enqueueEvent("transcript", "assistant", output, "complete")
       else this.enqueueEvent("transcript_gap", "assistant", "Transcript unavailable.")
+      this.releaseImageFence()
       this.scheduleAppend()
       throw new Error("Gemini completed a turn without both transcriptions")
     }
@@ -1008,10 +1023,7 @@ export class GeminiLiveController {
       this.completeUserTurns += 1
     }
     if (output) this.enqueueEvent("transcript", "assistant", output, "complete")
-    if (pendingImage?.providerSent && pendingImage.captureAfterCurrent) {
-      pendingImage.captureAfterCurrent = false
-      void this.persistJournal()
-    }
+    this.releaseImageFence()
     this.deliveredToolResultIds.clear()
     this.scheduleAppend()
   }
@@ -1261,16 +1273,13 @@ export class GeminiLiveController {
     if (output) this.enqueueEvent("transcript", "assistant", output, "interrupted")
     if (input && userComplete) this.completeUserTurns += 1
     this.interruptionFinalized = true
-    if (input || output) this.scheduleAppend()
     if (this.pendingImage?.providerSent && !this.pendingImage.caption && !this.pendingImage.captureAfterCurrent) {
       this.pendingImage.providerSent = false
       void this.persistJournal()
       this.callbacks.onPersistenceError("Photo description was interrupted; retrying")
     }
-    if (this.pendingImage?.providerSent && this.pendingImage.captureAfterCurrent) {
-      this.pendingImage.captureAfterCurrent = false
-      void this.persistJournal()
-    }
+    this.releaseImageFence()
+    this.scheduleAppend()
   }
 
   private clearTurn(): void {
