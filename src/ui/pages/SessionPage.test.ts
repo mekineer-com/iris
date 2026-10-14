@@ -3,6 +3,7 @@ import {readFileSync} from "node:fs"
 import {runInNewContext} from "node:vm"
 import ts from "typescript"
 import * as jsx from "react/jsx-runtime"
+import manifest from "../../../miniapp.json"
 
 import {
   imageRequest,
@@ -31,6 +32,7 @@ describe("SessionPage state projection", () => {
       require: (name: string) => {
         if (name === "react") return react
         if (name === "react/jsx-runtime") return jsx
+        if (name.endsWith("miniapp.json")) return {default: manifest, __esModule: true}
         if (name.endsWith("/useChannel")) return {useChannel: () => ({configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"], soulConfirmed: true, soulLocked: false})}
         if (name === "@mentra/miniapp/ui") return {useRpc: (channel: string) => async (payload: {soulId?: string}) => {
           calls.push({channel, payload})
@@ -49,6 +51,7 @@ describe("SessionPage state projection", () => {
     const arrow = (tree: Node) => nodes(tree).find(node => node.props?.["aria-label"] === "Use soul")!
     const start = (tree: Node) => nodes(tree).find(node => node.props?.className === "sitting-button")!
     const human = (tree: Node) => nodes(tree).find(node => node.props?.required && node.props?.value !== undefined)
+    expect(nodes(render()).find(node => node.props?.className === "iris-version")?.props.children).toEqual(["Iris ", manifest.version])
 
     soulInput(render()).props.onChange({target: {value: "Fable"}})
     await arrow(render()).props.onClick()

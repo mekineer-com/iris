@@ -12,6 +12,7 @@ import {
 } from "../../shared/types"
 import {useChannel} from "../hooks/useChannel"
 import memuIcon from "../memu-icon.png"
+import manifest from "../../../miniapp.json"
 
 function unreachable(value: never): never {
   throw new Error(`Unhandled session state: ${value}`)
@@ -652,6 +653,7 @@ export default function SessionPage() {
         Speak photo descriptions
       </label>
         <button type="button" onClick={editConnection}>Edit Connection</button>
+        <small className="iris-version">Iris {manifest.version}</small>
       </section>
       <button type="button" className="settings-toggle" aria-label="Settings" aria-controls="iris-settings"
         aria-expanded={settingsOpen} onClick={() => setSettingsOpen((open) => !open)}>&#9881; Settings</button>

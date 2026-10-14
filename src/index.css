@@ -40,6 +40,7 @@ main {
 #iris-settings > button {
   margin-top: 1rem;
 }
+.iris-version { display: block; margin-top: 1rem; }
 
 h1 {
   margin: 0.1rem 0 1.5rem;
