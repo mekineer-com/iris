@@ -181,9 +181,8 @@ export class SessionController {
     this.unsubs.push(
       ui.handle("openalma:set-soul", async (payload) => {
         await this.preferencesLoaded
-        const value = payload as {soulId?: unknown; useExisting?: unknown; userName?: unknown} | null
-        if (typeof value?.soulId !== "string" || typeof value?.useExisting !== "boolean"
-          || (value.userName !== undefined && typeof value.userName !== "string")) {
+        const value = payload as {soulId?: unknown; useExisting?: unknown} | null
+        if (typeof value?.soulId !== "string" || typeof value?.useExisting !== "boolean") {
           throw new Error("Invalid soul selection")
         }
         if (this.soulLocked()) throw new Error("Finish or recover this sitting before changing souls")
@@ -203,9 +202,7 @@ export class SessionController {
             method: "POST",
             signal: timeoutSignal(10_000),
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({soul_id: soulId, use_existing: value.useExisting,
-              ...(!value.useExisting && typeof value.userName === "string" ? {user_name: value.userName.trim()} : {}),
-            }),
+            body: JSON.stringify({soul_id: soulId, use_existing: value.useExisting}),
           })
           if (!response.ok) {
             const error = await response.json().catch(() => null) as {detail?: string | {reason?: unknown; message?: unknown}} | null

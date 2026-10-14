@@ -939,7 +939,7 @@ describe("SessionController", () => {
       soulId: "Existing Soul",
       confirmationRequired: true,
     })
-    await expect(harness.session.handlers["openalma:set-soul"]({soulId: "Existing Soul", useExisting: true, userName: "DoNotReplace"})).resolves.toEqual({
+    await expect(harness.session.handlers["openalma:set-soul"]({soulId: "Existing Soul", useExisting: true})).resolves.toEqual({
       soulId: "Existing Soul",
       created: false,
     })
@@ -964,16 +964,16 @@ describe("SessionController", () => {
     })
   })
 
-  test("creation sends an explicit human name without changing the owner or starting voice", async () => {
+  test("creation sends no human name without changing the owner or starting voice", async () => {
     let body: unknown
     const h = setup({fetchFn: (async (_url: string, init?: RequestInit) => {
       if (!init?.method) return Response.json({souls: [CONFIG.soulId]})
       body = JSON.parse(String(init.body))
       return Response.json({soul_id: "Fable", created: true})
     }) as typeof fetch})
-    await expect(h.session.handlers["openalma:set-soul"]({soulId: "Fable", useExisting: false, userName: " Rowan "}))
+    await expect(h.session.handlers["openalma:set-soul"]({soulId: "Fable", useExisting: false}))
       .resolves.toEqual({soulId: "Fable", created: true})
-    expect(body).toEqual({soul_id: "Fable", use_existing: false, user_name: "Rowan"})
+    expect(body).toEqual({soul_id: "Fable", use_existing: false})
     expect(h.configs).toEqual([])
     expect(h.session.stored.get("openalma.soul-id")).toBe("Fable")
   })
@@ -981,9 +981,9 @@ describe("SessionController", () => {
   test("creation validation shows the server reason and preserves selected Soul", async () => {
     const h = setup({fetchFn: (async (_url: string, init?: RequestInit) => !init?.method
       ? Response.json({souls: [CONFIG.soulId]})
-      : Response.json({detail: "Enter what this Soul should call you"}, {status: 422})) as typeof fetch})
-    await expect(h.session.handlers["openalma:set-soul"]({soulId: "Fable", useExisting: false, userName: " "}))
-      .rejects.toThrow("Enter what this Soul should call you")
+      : Response.json({detail: "Soul name must differ from the owner name"}, {status: 422})) as typeof fetch})
+    await expect(h.session.handlers["openalma:set-soul"]({soulId: "Fable", useExisting: false}))
+      .rejects.toThrow("Soul name must differ from the owner name")
     expect(h.session.stored.get("openalma.soul-id")).toBe(CONFIG.soulId)
     expect(h.configs).toEqual([])
     expect(lastSnapshot(h.session)).toMatchObject({soulId: CONFIG.soulId, soulLocked: false})

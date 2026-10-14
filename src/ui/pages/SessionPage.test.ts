@@ -15,7 +15,7 @@ import {
 
 describe("SessionPage state projection", () => {
 
-  test("asks only on creation, defers creation to Start, and leaves existing selection unnamed", async () => {
+  test("creates without a human-name field, defers creation to Start, and preserves existing selection", async () => {
     const states: unknown[] = []
     let cursor = 0
     const calls: Array<{channel: string; payload: unknown}> = []
@@ -56,15 +56,12 @@ describe("SessionPage state projection", () => {
     soulInput(render()).props.onChange({target: {value: "Fable"}})
     await arrow(render()).props.onClick()
     expect(calls).toEqual([])
-    expect(human(render())).toBeDefined()
-    await start(render()).props.onClick()
-    expect(calls).toEqual([])
-    human(render())!.props.onChange({target: {value: " Rowan "}})
+    expect(human(render())).toBeUndefined()
     expect(start(render()).props.disabled).toBe(false)
     await start(render()).props.onClick()
     await new Promise(resolve => setTimeout(resolve, 0))
     expect(calls).toEqual([
-      {channel: "openalma:set-soul", payload: {soulId: "Fable", useExisting: false, userName: "Rowan"}},
+      {channel: "openalma:set-soul", payload: {soulId: "Fable", useExisting: false}},
       {channel: "openalma:start", payload: {mode: "continuous"}},
     ])
     soulInput(render()).props.onChange({target: {value: "Quill"}})
