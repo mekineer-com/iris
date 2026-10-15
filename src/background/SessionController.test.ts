@@ -951,6 +951,7 @@ describe("SessionController", () => {
     expect(JSON.parse(String(requests.at(-1)?.init?.body))).toEqual({
       soul_id: "Existing Soul",
       use_existing: true,
+      user_name: CONFIG.userId,
     })
     expect(requests.at(-1)?.init?.headers).toEqual({
       "Content-Type": "application/json",
@@ -964,7 +965,7 @@ describe("SessionController", () => {
     })
   })
 
-  test("creation sends no human name without changing the owner or starting voice", async () => {
+  test("creation uses the owner name for released servers without prompting or starting voice", async () => {
     let body: unknown
     const h = setup({fetchFn: (async (_url: string, init?: RequestInit) => {
       if (!init?.method) return Response.json({souls: [CONFIG.soulId]})
@@ -973,7 +974,7 @@ describe("SessionController", () => {
     }) as typeof fetch})
     await expect(h.session.handlers["openalma:set-soul"]({soulId: "Fable", useExisting: false}))
       .resolves.toEqual({soulId: "Fable", created: true})
-    expect(body).toEqual({soul_id: "Fable", use_existing: false})
+    expect(body).toEqual({soul_id: "Fable", use_existing: false, user_name: CONFIG.userId})
     expect(h.configs).toEqual([])
     expect(h.session.stored.get("openalma.soul-id")).toBe("Fable")
   })

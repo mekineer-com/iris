@@ -202,7 +202,8 @@ export class SessionController {
             method: "POST",
             signal: timeoutSignal(10_000),
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({soul_id: soulId, use_existing: value.useExisting}),
+            // Released v0.1.12 servers need the owner name; newer servers derive it themselves.
+            body: JSON.stringify({soul_id: soulId, use_existing: value.useExisting, user_name: config.userId}),
           })
           if (!response.ok) {
             const error = await response.json().catch(() => null) as {detail?: string | {reason?: unknown; message?: unknown}} | null
