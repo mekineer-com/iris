@@ -38,18 +38,19 @@ index eebd1556474dd1f9bea9dc29612e8f87453fd4aa..6dd22dfd76c7c7efcd5864473f719b3f
 diff --git a/src/release.ts b/src/release.ts
 --- a/src/release.ts
 +++ b/src/release.ts
-@@ -23,8 +23,10 @@
+@@ -23,8 +23,11 @@
   */
 
  import {readFileSync, existsSync, statSync, readdirSync} from 'fs'
 +import {randomUUID} from 'crypto'
  import os from 'os'
  import {resolve, join} from 'path'
++import {createInterface} from 'readline'
 +import JSZip from 'jszip'
  import {buildProduction} from './build.js'
  import {pack} from './pack.js'
  import {printQR} from './qr.js'
-@@ -36,23 +38,62 @@
+@@ -36,23 +39,79 @@
  const MANIFEST_PATH = '/miniapp.json'
  const ICON_PATH = '/icon.png'
  const BUNDLE_PATH = '/bundle.zip'
@@ -89,6 +90,23 @@ diff --git a/src/release.ts b/src/release.ts
  }
 
  export async function release(opts: ReleaseOptions = {}): Promise<void> {
++  let server: ReturnType<typeof Bun.serve> | undefined
++  let finish!: () => void
++  let fail!: (error: unknown) => void
++  const done = new Promise<void>((resolve, reject) => { finish = resolve; fail = reject })
++  let stopped = false
++  const stop = () => {
++    if (stopped) return
++    stopped = true
++    if (server) void server.stop(false).then(finish, fail)
++  }
++  process.on('SIGINT', stop)
++  process.on('SIGTERM', stop)
++  const control = process.platform === 'win32' && !process.stdin.isTTY
++    ? createInterface({input: process.stdin, terminal: false}) : null
++  control?.on('line', (line) => { if (line === 'stop') stop() })
++
++  try {
    const cwd = process.cwd()
 +  let suppliedBundle: Awaited<ReturnType<typeof readReleaseBundle>> | null = null
 +  if (opts.bundle) {
@@ -114,7 +132,7 @@ diff --git a/src/release.ts b/src/release.ts
    } catch {
      console.error('Error: miniapp.json is not valid JSON')
      process.exit(1)
-@@ -69,63 +110,106 @@
+@@ -69,63 +128,98 @@
    const name = (manifest.name as string) ?? packageName
 
    // ---- 2. Build (or skip via cache) -----------------------------------
@@ -191,17 +209,10 @@ diff --git a/src/release.ts b/src/release.ts
    let installCount = 0
 
    // ---- 4. Serve --------------------------------------------------------
-+  let finish!: () => void
-+  const done = new Promise<void>((resolve) => { finish = resolve })
-+  let stopped = false
-+  const stop = () => {
-+    if (stopped) return
-+    stopped = true
-+    server.stop()
-+    finish()
-+  }
-   const server = Bun.serve({
+-  const server = Bun.serve({
 -    hostname: '0.0.0.0',
++  if (stopped) return
++  server = Bun.serve({
 +    hostname: opts.host ?? '0.0.0.0',
      port,
      fetch(req) {
@@ -249,7 +260,7 @@ diff --git a/src/release.ts b/src/release.ts
          installCount += 1
          const remote = req.headers.get('x-forwarded-for') ?? 'unknown'
          console.log(`✓ Install #${installCount} — ${name}@${version} → ${remote}`)
-@@ -141,7 +225,7 @@
+@@ -141,7 +235,7 @@
    })
 
    // ---- 5. QR + banner --------------------------------------------------
@@ -258,7 +269,7 @@ diff --git a/src/release.ts b/src/release.ts
 
    console.log('\n╔══════════════════════════════════════════════════════════════╗')
    console.log('║  Install your mini app on a phone:                           ║')
-@@ -151,8 +235,8 @@
+@@ -151,8 +245,8 @@
    console.log('║    3. Under "Mini App Development", tap                      ║')
    console.log('║       "Scan Mini App QR Code" and scan the QR below          ║')
    console.log('║                                                              ║')
@@ -269,21 +280,26 @@ diff --git a/src/release.ts b/src/release.ts
    console.log('║  Ctrl+C to stop.                                             ║')
    console.log('╚══════════════════════════════════════════════════════════════╝\n')
 
-@@ -161,13 +245,11 @@
+@@ -160,14 +254,14 @@
+   console.log(`\n${qrUrl}\n`)
    console.log(`Serving on ${baseUrl}`)
 
-   // ---- 6. Wait for SIGINT ---------------------------------------------
+-  // ---- 6. Wait for SIGINT ---------------------------------------------
 -  await new Promise<void>((resolve) => {
 -    process.on('SIGINT', () => {
 -      console.log('\nShutting down...')
 -      server.stop()
 -      resolve()
 -    })
-+  process.on('SIGINT', () => {
-+    console.log('\nShutting down...')
-+    stop()
-   })
+-  })
++  // ---- 6. Wait for shutdown and active downloads -----------------------
 +  await done
++  } finally {
++    process.off('SIGINT', stop)
++    process.off('SIGTERM', stop)
++    control?.close()
++    if (control) process.stdin.pause()
++  }
  }
 
  // ---------------------------------------------------------------------------

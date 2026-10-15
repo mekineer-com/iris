@@ -95,18 +95,27 @@ export function run() {
   const miniapp = spawn(process.execPath, [join(root, "node_modules", "@mentra", "miniapp-cli", "src", "index.ts"), ...releaseArgs(host)], {
     cwd: root,
     env: {...process.env, MENTRA_RELEASE_DEFAULTS: releaseProfile(process.env)},
-    stdio: ["inherit", "pipe", "inherit"],
+    stdio: [process.platform === "win32" ? "pipe" : "inherit", "pipe", "inherit"],
   })
   let output = ""
   let emitted = false
   let shutdownRequested = false
   let pollTimer = null
   let polling = false
+  let failureCode = 0
   const startedAt = Date.now() / 1000
 
   miniapp.stdout.on("data", (chunk) => {
-    process.stdout.write(chunk)
-    if (emitted) return
+    try {
+      onOutput(chunk)
+    } catch (error) {
+      fail(error)
+    }
+  })
+
+  function onOutput(chunk) {
+    if (!process.stdout.destroyed) process.stdout.write(chunk)
+    if (shutdownRequested || emitted) return
     output = (output + chunk).slice(-16_384)
     const original = findReleaseUri(output)
     if (!original) return
@@ -172,13 +181,20 @@ export function run() {
     void QRCode.toFile(qrPath, uri, {width: 1024, margin: 4, errorCorrectionLevel: "M"})
       .then(() => console.log(`\nPrivate network release:\n${uri}\nQR image: ${qrPath}\n`))
       .catch((error) => console.error(`Could not write private release QR: ${error.message}`))
-  })
+  }
+
+  function fail(error) {
+    failureCode = 1
+    console.error(`Mentra release failed: ${error.message}`)
+    shutdown()
+  }
 
   function shutdown() {
     if (shutdownRequested) return
     shutdownRequested = true
-    cleanup()
-    miniapp.kill("SIGTERM")
+    if (pollTimer) clearInterval(pollTimer)
+    if (process.platform === "win32") miniapp.stdin.end("stop\n")
+    else miniapp.kill("SIGTERM")
   }
 
   function cleanup() {
@@ -192,14 +208,15 @@ export function run() {
 
   process.on("SIGINT", shutdown)
   process.on("SIGTERM", shutdown)
-  process.once("exit", shutdown)
-  miniapp.on("exit", (code, signal) => {
+  process.stdout.on("error", fail)
+  miniapp.stdin?.on("error", fail)
+  miniapp.on("close", (code, signal) => {
     cleanup()
-    process.exit(code ?? (shutdownRequested ? 0 : signal ? 1 : 0))
+    process.exit(failureCode || (code ?? (signal ? 1 : 0)))
   })
   miniapp.on("error", (error) => {
     console.error(`Could not start Mentra release server: ${error.message}`)
-    process.exit(1)
+    failureCode = 1
   })
 }
 

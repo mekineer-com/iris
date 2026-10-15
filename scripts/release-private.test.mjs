@@ -1,6 +1,7 @@
 import {describe, expect, test} from "bun:test"
 import {spawn, spawnSync} from "node:child_process"
 import {once} from "node:events"
+import {createConnection} from "node:net"
 import {copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync} from "node:fs"
 import {tmpdir} from "node:os"
 import {join} from "node:path"
@@ -15,6 +16,14 @@ import {
   releaseProfile,
   writeReleaseStatus,
 } from "./release-private.mjs"
+
+async function waitForFile(path) {
+  const deadline = Date.now() + 3000
+  while (!existsSync(path)) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${path}`)
+    await Bun.sleep(10)
+  }
+}
 
 describe("private release URI", () => {
   test("the pinned CLI packs nested files and dotfiles without external zip", async () => {
@@ -125,64 +134,217 @@ describe("private release URI", () => {
     })
   })
 
-  test("run clears its child and status on malformed output or fatal stdout failure", async () => {
-    for (const fatalOutput of [false, true]) {
-      const root = mkdtempSync(join(tmpdir(), "iris-release-run-test-"))
-      const statusPath = join(root, "build", "release-private-status.json")
-      let wrapper
-      try {
-        mkdirSync(join(root, "scripts"))
-        mkdirSync(join(root, "node_modules", "@mentra", "miniapp-cli", "src"), {recursive: true})
-        for (const name of ["release-private.mjs", "load-env-local.mjs"]) {
-          copyFileSync(fileURLToPath(new URL(name, import.meta.url)), join(root, "scripts", name))
-        }
-        symlinkSync(fileURLToPath(new URL("../node_modules/qrcode", import.meta.url)), join(root, "node_modules", "qrcode"))
-        writeReleaseStatus(statusPath, {device_session_id: "test-phone"})
-        const uri = fatalOutput
-          ? "miniapp://release?url=http://[&package=com.openalma.mentra&version=0.1.0"
-          : "miniapp://release?url=invalid"
-        writeFileSync(join(root, "node_modules", "@mentra", "miniapp-cli", "src", "index.ts"), `
+  for (const windows of [false, true]) {
+    for (const mode of ["malformed", "epipe", "signal", "completion", "natural", "spawn-error", "pipe-error"]) {
+      if (!windows && mode === "pipe-error") continue
+      test(`wrapper waits for cleanup: ${windows ? "Windows stdin" : "POSIX SIGTERM"}, ${mode}`, async () => {
+        const root = mkdtempSync(join(tmpdir(), "iris-release-run-test-"))
+        const statusPath = join(root, "build", "release-private-status.json")
+        let wrapper
+        try {
+          mkdirSync(join(root, "scripts"))
+          mkdirSync(join(root, "node_modules", "@mentra", "miniapp-cli", "src"), {recursive: true})
+          for (const name of ["release-private.mjs", "load-env-local.mjs"]) {
+            copyFileSync(fileURLToPath(new URL(name, import.meta.url)), join(root, "scripts", name))
+          }
+          symlinkSync(fileURLToPath(new URL("../node_modules/qrcode", import.meta.url)), join(root, "node_modules", "qrcode"))
+          writeReleaseStatus(statusPath, {device_session_id: "test-phone"})
+          const uri = mode === "malformed" ? "miniapp://release?url=invalid"
+            : "miniapp://release?url=http://192.0.2.1&package=com.openalma.mentra&version=0.1.0"
+          writeFileSync(join(root, "node_modules", "@mentra", "miniapp-cli", "src", "index.ts"), `
 import {writeFileSync} from "node:fs"
+import {spawn} from "node:child_process"
 writeFileSync("child.pid", String(process.pid))
 writeFileSync("child.executable", process.execPath)
-process.on("SIGTERM", () => {
-  writeFileSync("child.stopped", "SIGTERM")
+let stopping = false
+function stop(transport) {
+  if (stopping) return
+  stopping = true
+  writeFileSync("child.transport", transport)
+  // Keep stdout open after this process exits, exercising wrapper 'close', not 'exit'.
+  const finish = ${JSON.stringify(`
+    const fs = require("node:fs");
+    setTimeout(() => {
+      fs.writeFileSync("child.status-during-cleanup", String(fs.existsSync("build/release-private-status.json")));
+      fs.writeFileSync("child.stopped", "done");
+    }, 150);
+  `)}
+  spawn(process.execPath, ["-e", finish], {stdio: ["ignore", "inherit", "inherit"]})
   process.exit(0)
-})
+}
+process.on("SIGTERM", () => stop("SIGTERM"))
+process.stdin.on("data", (data) => { if (data.toString().includes("stop\\n")) stop("stdin") })
 setInterval(() => {}, 1000)
-console.log(${JSON.stringify(uri)})
+${mode === "pipe-error" ? 'setTimeout(() => stop("natural"), 300)' : ""}
+writeFileSync("child.ready", "ready")
+${mode === "natural" ? 'stop("natural")' : `console.log(${JSON.stringify(uri)})`}
 `)
-        wrapper = spawn(process.execPath, [join(root, "scripts", "release-private.mjs")], {
-          cwd: root,
-          env: {
-            ...process.env,
-            MENTRA_PUBLIC_OPENALMA_BASE_URL: "http://192.0.2.1",
-            MENTRA_PUBLIC_OPENALMA_USER_ID: "Test User",
-            MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID: "test-phone",
-            MENTRA_RELEASE_HOST_PACKAGE: "com.mentra.mentra.openalma",
-          },
-          stdio: ["ignore", "pipe", "pipe"],
-        })
-        let stderr = ""
-        wrapper.stderr.on("data", (chunk) => { stderr += chunk })
-        if (fatalOutput) wrapper.stdout.destroy()
-        else wrapper.stdout.resume()
-        const [code, signal] = await once(wrapper, "close", {signal: AbortSignal.timeout(2000)})
-        expect(code).toBe(fatalOutput ? 1 : 0)
-        expect(signal).toBeNull()
-        expect(stderr).toContain(fatalOutput ? "EPIPE" : "missing package identity")
-        expect(existsSync(statusPath)).toBe(false)
-        expect(readFileSync(join(root, "child.stopped"), "utf8")).toBe("SIGTERM")
-        expect(readFileSync(join(root, "child.executable"), "utf8")).toBe(process.execPath)
-      } finally {
-        wrapper?.kill("SIGKILL")
-        if (!existsSync(join(root, "child.stopped")) && existsSync(join(root, "child.pid"))) {
-          try { process.kill(Number(readFileSync(join(root, "child.pid"), "utf8")), "SIGKILL") } catch {}
+          const script = join(root, "scripts", "release-private.mjs")
+          writeFileSync(join(root, "runner.mjs"), `
+${windows ? 'Object.defineProperty(process, "platform", {value: "win32"})' : ""}
+${mode === "spawn-error" ? 'Object.defineProperty(process, "execPath", {value: "/nonexistent-iris-fixture-bun"})' : ""}
+${mode === "completion" ? `globalThis.fetch = async () => Response.json({installations: [{installation_ticket: "test-ticket", package_name: "com.openalma.mentra", version: "0.1.0", seen_at: Date.now() / 1000 + 1}]})` : ""}
+${mode === "pipe-error" ? `
+// Bun's Linux pipe sink can swallow a peer close; inject its Windows error event.
+const {mock} = await import("bun:test")
+const {spawn} = await import("node:child_process")
+mock.module("node:child_process", () => ({spawn(...args) {
+  const child = spawn(...args)
+  child.stdin.end = () => { child.stdin.emit("error", new Error("fixture EPIPE")); return child.stdin }
+  return child
+}}))
+` : ""}
+process.argv[1] = ${JSON.stringify(script)}
+await import(${JSON.stringify(script)})
+`)
+          wrapper = spawn(process.execPath, [join(root, "runner.mjs")], {
+            cwd: root,
+            env: {
+              ...process.env,
+              MENTRA_PUBLIC_OPENALMA_BASE_URL: "http://192.0.2.1",
+              MENTRA_PUBLIC_OPENALMA_USER_ID: "Test User",
+              MENTRA_PUBLIC_OPENALMA_DEVICE_SESSION_ID: "test-phone",
+              MENTRA_PUBLIC_OPENALMA_INSTALLATION_TICKET: "test-ticket",
+              MENTRA_RELEASE_HOST_PACKAGE: mode === "completion" ? "com.mentra.mentra" : "com.mentra.mentra.openalma",
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+          })
+          const closed = once(wrapper, "close", {signal: AbortSignal.timeout(4000)})
+          let stderr = ""
+          wrapper.stderr.on("data", (chunk) => { stderr += chunk })
+          if (mode === "epipe") wrapper.stdout.destroy()
+          else wrapper.stdout.resume()
+          if (mode === "signal" || mode === "pipe-error") {
+            await waitForFile(join(root, "child.ready"))
+            wrapper.kill("SIGINT")
+            if (mode === "signal") wrapper.kill("SIGINT")
+          }
+          const [code, signal] = await closed
+          expect(code).toBe(["epipe", "spawn-error", "pipe-error"].includes(mode) ? 1 : 0)
+          expect(signal).toBeNull()
+          expect(existsSync(statusPath)).toBe(false)
+          if (mode === "spawn-error") {
+            expect(stderr).toContain("Could not start")
+          } else {
+            if (mode === "epipe" || mode === "pipe-error") expect(stderr).toContain("EPIPE")
+            if (mode === "malformed") expect(stderr).toContain("missing package identity")
+            expect(readFileSync(join(root, "child.status-during-cleanup"), "utf8")).toBe("true")
+            expect(readFileSync(join(root, "child.stopped"), "utf8")).toBe("done")
+            expect(readFileSync(join(root, "child.transport"), "utf8")).toBe(
+              ["natural", "pipe-error"].includes(mode) ? "natural" : windows ? "stdin" : "SIGTERM",
+            )
+            expect(readFileSync(join(root, "child.executable"), "utf8")).toBe(process.execPath)
+          }
+        } finally {
+          wrapper?.kill("SIGKILL")
+          if (!existsSync(join(root, "child.stopped")) && existsSync(join(root, "child.pid"))) {
+            try { process.kill(Number(readFileSync(join(root, "child.pid"), "utf8")), "SIGKILL") } catch {}
+          }
+          rmSync(root, {recursive: true, force: true})
         }
+      })
+    }
+  }
+
+  for (const mode of ["stdin", "SIGINT", "SIGTERM", "acknowledgement", "early-stdin"]) {
+    test(`patched CLI drains active downloads: ${mode}`, async () => {
+      const root = mkdtempSync(join(tmpdir(), "iris-release-drain-"))
+      let child
+      let download
+      try {
+        const manifest = JSON.parse(readFileSync(new URL("../miniapp.json", import.meta.url), "utf8"))
+        const zip = new JSZip()
+        zip.file("miniapp.json", JSON.stringify(manifest))
+        zip.file("payload.bin", Buffer.alloc(16 * 1024 * 1024, 42))
+        const bundle = await zip.generateAsync({type: "nodebuffer", compression: "STORE"})
+        const bundlePath = join(root, "bundle.zip")
+        writeFileSync(bundlePath, bundle)
+        const socket = Bun.serve({hostname: "127.0.0.1", port: 0, fetch: () => new Response()})
+        const port = socket.port
+        await socket.stop()
+        const cli = fileURLToPath(new URL("../node_modules/@mentra/miniapp-cli/src/index.ts", import.meta.url))
+        writeFileSync(join(root, "runner.mjs"), `
+import {writeFileSync} from "node:fs"
+${mode.includes("stdin") ? 'Object.defineProperty(process, "platform", {value: "win32"})' : ""}
+const serve = Bun.serve
+Bun.serve = (options) => {
+  const server = serve(options)
+  const stop = server.stop.bind(server)
+  server.stop = (force) => {
+    writeFileSync("draining", String(force))
+    return stop(force)
+  }
+  return server
+}
+process.argv = [process.execPath, ${JSON.stringify(cli)}, "release", "--host", "127.0.0.1", "--port", "${port}", "--bundle", ${JSON.stringify(bundlePath)}]
+await import(${JSON.stringify(cli)})
+writeFileSync("returned", "done")
+`)
+        child = spawn(process.execPath, [join(root, "runner.mjs")], {
+          cwd: root, stdio: ["pipe", "pipe", "pipe"],
+          env: {...process.env, MENTRA_RELEASE_DEFAULTS: "", MENTRA_RELEASE_HOST_PACKAGE: "com.mentra.mentra.openalma"},
+        })
+        const closed = once(child, "close", {signal: AbortSignal.timeout(4000)})
+        let output = ""
+        let stderr = ""
+        child.stderr.on("data", (chunk) => { stderr += chunk })
+        child.stdout.on("data", (chunk) => { output += chunk })
+        if (mode === "early-stdin") {
+          child.stdin.end("stop\n")
+        } else {
+          while (!output.includes("Serving on")) {
+            if (child.exitCode !== null) throw new Error(`CLI exited: ${output}\n${stderr}`)
+            await Bun.sleep(10)
+          }
+          const target = new URL(findReleaseUri(output)).searchParams.get("url")
+          download = createConnection({host: "127.0.0.1", port})
+          await once(download, "connect", {signal: AbortSignal.timeout(3000)})
+          download.pause()
+          const chunks = []
+          download.on("data", (chunk) => { chunks.push(Buffer.from(chunk)) })
+          const ended = once(download, "end", {signal: AbortSignal.timeout(3000)})
+          download.write(`GET ${new URL(target).pathname}/bundle.zip HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`)
+          while (!output.includes("Install #1")) {
+            if (child.exitCode !== null) throw new Error(`CLI exited: ${output}\n${stderr}`)
+            await Bun.sleep(10)
+          }
+          if (mode === "stdin") {
+            child.stdin.write("st")
+            child.stdin.end("op\nstop\n")
+          } else if (mode === "acknowledgement") {
+            const offerId = new URL(target).pathname.slice(1)
+            const response = await fetch(`http://127.0.0.1:${port}/__mentra_release/installed`, {
+              method: "POST", body: JSON.stringify({offerId}),
+            })
+            expect(response.status).toBe(200)
+          } else child.kill(mode)
+          await waitForFile(join(root, "draining"))
+          expect(readFileSync(join(root, "draining"), "utf8")).toBe("false")
+          expect(child.exitCode).toBeNull()
+          expect(existsSync(join(root, "returned"))).toBe(false)
+          if (mode === "stdin") child.kill("SIGINT")
+          download.resume()
+          await ended
+          const response = Buffer.concat(chunks)
+          expect(response.subarray(0, 12).toString()).toBe("HTTP/1.1 200")
+          expect(response.subarray(response.indexOf("\r\n\r\n") + 4).equals(bundle)).toBe(true)
+        }
+        const [code, signal] = await closed
+        expect(stderr).toBe("")
+        expect(code).toBe(0)
+        expect(signal).toBeNull()
+        expect(readFileSync(join(root, "returned"), "utf8")).toBe("done")
+        if (mode === "early-stdin") {
+          expect(output).not.toContain("Serving on")
+          expect(existsSync(join(root, "draining"))).toBe(false)
+        }
+      } finally {
+        download?.destroy()
+        child?.kill("SIGKILL")
         rmSync(root, {recursive: true, force: true})
       }
-    }
-  })
+    })
+  }
 
   test("completes only a fresh exact stock installation report", () => {
     const offer = {
