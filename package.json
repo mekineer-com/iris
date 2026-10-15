@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "dev": "node ./scripts/dev.mjs",
-    "release:private": "node ./scripts/release-private.mjs",
+    "release:private": "bun ./scripts/release-private.mjs",
     "build": "bun run build.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"

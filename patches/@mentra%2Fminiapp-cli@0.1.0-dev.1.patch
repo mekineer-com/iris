@@ -391,3 +391,37 @@ new file mode 100644
 +    rmSync(dir, {recursive: true, force: true})
 +  }
 +})
+diff --git a/src/pack.ts b/src/pack.ts
+index aa93a6867450852728f853d840549952e968105a..8358b2d59adc4ea5228c32699d57b4cac714aefe 100644
+--- a/src/pack.ts
++++ b/src/pack.ts
+@@ -1,5 +1,6 @@
+ import { existsSync, mkdirSync, readFileSync, copyFileSync, writeFileSync } from 'fs';
+ import { resolve, join } from 'path';
++import JSZip from 'jszip';
+ import { buildProduction } from './build.js';
+ import { validateManifest } from './manifest.js';
+
+@@ -117,18 +118,11 @@ export async function pack(opts: PackOptions = {}): Promise<string> {
+   }
+   const outputPath = resolve(outDir, outputName);
+
+-  // Create ZIP using system zip command
+-  const zipProc = Bun.spawn(['zip', '-r', outputPath, '.'], {
+-    cwd: distDir,
+-    stdout: opts.silent ? 'pipe' : 'inherit',
+-    stderr: opts.silent ? 'pipe' : 'inherit',
+-  });
+-
+-  const exitCode = await zipProc.exited;
+-  if (exitCode !== 0) {
+-    console.error('Error: zip command failed');
+-    process.exit(1);
++  const zip = new JSZip();
++  for (const file of new Bun.Glob('**/*').scanSync({cwd: distDir, dot: true, onlyFiles: true})) {
++    zip.file(file.replaceAll('\\', '/'), readFileSync(join(distDir, file)));
+   }
++  writeFileSync(outputPath, await zip.generateAsync({type: 'nodebuffer', compression: 'DEFLATE'}));
+
+   if (!opts.silent) {
+     console.log(`\nPacked: ${outputPath}`);

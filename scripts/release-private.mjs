@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import {spawn} from "node:child_process"
 import {mkdirSync, renameSync, unlinkSync, writeFileSync} from "node:fs"
@@ -92,7 +92,7 @@ export function installationCompletesOffer(status, offer) {
 export function run() {
   loadEnvLocal(root)
   const host = assertPrivateReleaseConfig(process.env)
-  const miniapp = spawn(join(root, "node_modules", ".bin", "mentra-miniapp"), releaseArgs(host), {
+  const miniapp = spawn(process.execPath, [join(root, "node_modules", "@mentra", "miniapp-cli", "src", "index.ts"), ...releaseArgs(host)], {
     cwd: root,
     env: {...process.env, MENTRA_RELEASE_DEFAULTS: releaseProfile(process.env)},
     stdio: ["inherit", "pipe", "inherit"],

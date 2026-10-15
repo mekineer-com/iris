@@ -1,10 +1,11 @@
 import {describe, expect, test} from "bun:test"
-import {spawn} from "node:child_process"
+import {spawn, spawnSync} from "node:child_process"
 import {once} from "node:events"
 import {copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync} from "node:fs"
 import {tmpdir} from "node:os"
 import {join} from "node:path"
 import {fileURLToPath} from "node:url"
+import JSZip from "jszip"
 
 import {
   assertPrivateReleaseConfig,
@@ -16,6 +17,33 @@ import {
 } from "./release-private.mjs"
 
 describe("private release URI", () => {
+  test("the pinned CLI packs nested files and dotfiles without external zip", async () => {
+    const root = mkdtempSync(join(tmpdir(), "iris-pack-test-"))
+    try {
+      const manifest = JSON.parse(readFileSync(new URL("../miniapp.json", import.meta.url), "utf8"))
+      writeFileSync(join(root, "miniapp.json"), JSON.stringify(manifest))
+      mkdirSync(join(root, "dist", "background"), {recursive: true})
+      mkdirSync(join(root, "dist", "ui"), {recursive: true})
+      writeFileSync(join(root, "dist", manifest.entry.background), "fixture background")
+      writeFileSync(join(root, "dist", manifest.entry.ui), "fixture UI")
+      writeFileSync(join(root, "dist", "ui", ".hidden"), "fixture dotfile")
+      const packUrl = new URL("../node_modules/@mentra/miniapp-cli/src/pack.ts", import.meta.url).href
+      const script = `import {pack} from ${JSON.stringify(packUrl)}; await pack({cwd:${JSON.stringify(root)}, silent:true})`
+      const result = spawnSync(process.execPath, ["-e", script], {
+        env: {...process.env, PATH: ""}, encoding: "utf8", timeout: 5000,
+      })
+      expect(result.error).toBeUndefined()
+      expect(result.status).toBe(0)
+      const archive = await JSZip.loadAsync(readFileSync(join(root, "build", `${manifest.packageName}-${manifest.version}.zip`)))
+      expect(JSON.parse(await archive.file("miniapp.json").async("string"))).toEqual(manifest)
+      expect(await archive.file(manifest.entry.background).async("string")).toBe("fixture background")
+      expect(await archive.file(manifest.entry.ui).async("string")).toBe("fixture UI")
+      expect(await archive.file("ui/.hidden").async("string")).toBe("fixture dotfile")
+    } finally {
+      rmSync(root, {recursive: true, force: true})
+    }
+  })
+
   test("binds the CLI directly to the configured address and fixed port", () => {
     const uri =
       "miniapp://release?url=http%3A%2F%2F10.77.0.1%3A6789&package=com.openalma.mentra&version=0.1.0&name=OpenAlma%20Iris"
@@ -104,7 +132,7 @@ describe("private release URI", () => {
       let wrapper
       try {
         mkdirSync(join(root, "scripts"))
-        mkdirSync(join(root, "node_modules", ".bin"), {recursive: true})
+        mkdirSync(join(root, "node_modules", "@mentra", "miniapp-cli", "src"), {recursive: true})
         for (const name of ["release-private.mjs", "load-env-local.mjs"]) {
           copyFileSync(fileURLToPath(new URL(name, import.meta.url)), join(root, "scripts", name))
         }
@@ -113,17 +141,18 @@ describe("private release URI", () => {
         const uri = fatalOutput
           ? "miniapp://release?url=http://[&package=com.openalma.mentra&version=0.1.0"
           : "miniapp://release?url=invalid"
-        writeFileSync(join(root, "node_modules", ".bin", "mentra-miniapp"), `#!/usr/bin/env node
+        writeFileSync(join(root, "node_modules", "@mentra", "miniapp-cli", "src", "index.ts"), `
 import {writeFileSync} from "node:fs"
 writeFileSync("child.pid", String(process.pid))
+writeFileSync("child.executable", process.execPath)
 process.on("SIGTERM", () => {
   writeFileSync("child.stopped", "SIGTERM")
   process.exit(0)
 })
 setInterval(() => {}, 1000)
 console.log(${JSON.stringify(uri)})
-`, {mode: 0o755})
-        wrapper = spawn("node", [join(root, "scripts", "release-private.mjs")], {
+`)
+        wrapper = spawn(process.execPath, [join(root, "scripts", "release-private.mjs")], {
           cwd: root,
           env: {
             ...process.env,
@@ -144,6 +173,7 @@ console.log(${JSON.stringify(uri)})
         expect(stderr).toContain(fatalOutput ? "EPIPE" : "missing package identity")
         expect(existsSync(statusPath)).toBe(false)
         expect(readFileSync(join(root, "child.stopped"), "utf8")).toBe("SIGTERM")
+        expect(readFileSync(join(root, "child.executable"), "utf8")).toBe(process.execPath)
       } finally {
         wrapper?.kill("SIGKILL")
         if (!existsSync(join(root, "child.stopped")) && existsSync(join(root, "child.pid"))) {
