@@ -35,7 +35,7 @@ export function statusText(connection: ConnectionState, mode: SessionMode, manua
     case "idle": return "Ready"
     case "recording": return "Recording..."
     case "review": return "Review recording"
-    case "submitted": return "Waiting for Siri..."
+    case "submitted": return "Waiting for response..."
     default: return unreachable(manualPhase)
   }
 }

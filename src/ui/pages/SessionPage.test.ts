@@ -9,11 +9,16 @@ import {
   imageRequest,
   newImageId,
   shouldWarnLargeImage,
+  statusText,
   validateImageFile,
   visibleConnection,
 } from "./SessionPage"
 
 describe("SessionPage state projection", () => {
+
+  test("submitted manual recording uses neutral waiting text", () => {
+    expect(statusText("listening", "manual", "submitted")).toBe("Waiting for response...")
+  })
 
   test("creates without a human-name field, defers creation to Start, and preserves existing selection", async () => {
     const states: unknown[] = []
