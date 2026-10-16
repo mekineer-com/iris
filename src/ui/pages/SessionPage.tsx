@@ -18,7 +18,7 @@ function unreachable(value: never): never {
   throw new Error(`Unhandled session state: ${value}`)
 }
 
-export function statusText(connection: ConnectionState, mode: SessionMode, manualPhase: ManualPhase): string {
+export function statusText(connection: ConnectionState, mode: SessionMode, manualPhase: ManualPhase, soulId: string): string {
   switch (connection) {
     case "starting": return "Starting..."
     case "reconnecting": return "Reconnecting..."
@@ -35,7 +35,7 @@ export function statusText(connection: ConnectionState, mode: SessionMode, manua
     case "idle": return "Ready"
     case "recording": return "Recording..."
     case "review": return "Review recording"
-    case "submitted": return "Waiting for response..."
+    case "submitted": return `Waiting for ${soulId}...`
     default: return unreachable(manualPhase)
   }
 }
@@ -422,7 +422,7 @@ export default function SessionPage() {
       </header>
       <p className="status" role="status" aria-live="polite">
         {showSpinner ? <span className="spinner" aria-hidden="true" /> : null}
-        {statusText(visible, mode, manualPhase)}
+        {statusText(visible, mode, manualPhase, snapshot.soulId)}
       </p>
       {snapshot?.memuAvailable === false ? (
         <p className="memu-status" role="status">

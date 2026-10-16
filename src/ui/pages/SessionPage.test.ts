@@ -16,8 +16,10 @@ import {
 
 describe("SessionPage state projection", () => {
 
-  test("submitted manual recording uses neutral waiting text", () => {
-    expect(statusText("listening", "manual", "submitted")).toBe("Waiting for response...")
+  test("submitted manual recording names the selected Soul", () => {
+    for (const soulId of ["Quill", "Paper Moon"]) {
+      expect(statusText("listening", "manual", "submitted", soulId)).toBe(`Waiting for ${soulId}...`)
+    }
   })
 
   test("creates without a human-name field, defers creation to Start, and preserves existing selection", async () => {
