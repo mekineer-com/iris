@@ -3,6 +3,7 @@ import {makeRequestId} from "@mentra/miniapp"
 
 import type {Channels} from "../shared/channels"
 import type {ImageRequest} from "../shared/channels"
+import {MIC_SOURCES, type MicSource} from "../shared/types"
 import type {
   ConnectionState,
   EarconName,
@@ -75,6 +76,7 @@ export class SessionController {
   private photoRetryPending = false
   private manualAudio: string[] = []
   private manualAudioBytes = 0
+  private manualMicSource: MicSource | undefined
   private manualResponseTimeout: ReturnType<typeof setTimeout> | null = null
   private interruptPromise: Promise<void> | null = null
   private lastError: string | null = null
@@ -690,7 +692,7 @@ export class SessionController {
     }, this.watchdogMs)
   }
 
-  private handlePcmFrame(chunk: AudioChunkData): void {
+  private handlePcmFrame(chunk: AudioChunkData & {source?: string}): void {
     if (!ACTIVE.has(this.connection)) return
     if (this.connection === "speaking") return
     try {
@@ -701,7 +703,7 @@ export class SessionController {
         this.clearFirstPcmTimeout()
       }
       if (this.mode === "continuous") {
-        this.liveController?.sendAudio(normalized)
+        this.liveController?.sendAudio(normalized, MIC_SOURCES.find(source => source === chunk.source))
         return
       }
       if (this.manualPhase !== "recording") return
@@ -714,6 +716,7 @@ export class SessionController {
       }
       this.manualAudio.push(normalized)
       this.manualAudioBytes += bytes
+      this.manualMicSource = MIC_SOURCES.find(source => source === chunk.source)
     } catch (error) {
       void this.fail(error)
     }
@@ -844,7 +847,7 @@ export class SessionController {
     } else {
       if (this.manualPhase !== "review") throw new Error("Send requires a recording in Review")
       if (!this.liveController) throw new Error("Gemini controller is not available")
-      this.liveController.sendActivity(this.manualAudio)
+      this.liveController.sendActivity(this.manualAudio, this.manualMicSource)
       this.clearManualAudio()
       this.lastError = null
       this.manualPhase = "submitted"
@@ -856,6 +859,7 @@ export class SessionController {
   private clearManualAudio(): void {
     this.manualAudio = []
     this.manualAudioBytes = 0
+    this.manualMicSource = undefined
   }
 
   private async loadPreferences(

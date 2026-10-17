@@ -101,7 +101,7 @@ function harness(
     appendStatuses?: number[]
     appendGates?: Promise<void>[]
     appendAckLost?: boolean
-    history?: Array<{event_id: string; role: string; event_kind: string; content: string}>
+    history?: Array<{event_id: string; role: string; event_kind: string; content: string; mic_source?: string}>
     snapshotStatus?: number
     snapshotGate?: Promise<void>
     snapshotResponse?: Response
@@ -365,6 +365,7 @@ describe("GeminiLiveController", () => {
     const storage = new FakeStorage()
     const h = harness({storage})
     await start(h)
+    h.controller.sendAudio("AAAA", "glasses")
 
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
     expect(h.requests.find((request) => request.url.endsWith("/snapshot"))?.body).toEqual({
@@ -1422,7 +1423,7 @@ describe("GeminiLiveController", () => {
       },
       authorization: null,
     })
-    h.controller.sendAudio("AAAA")
+    h.controller.sendAudio("AAAA", "glasses")
     expect(JSON.parse(h.sockets[0].sent[1])).toEqual({
       realtimeInput: {audio: {data: "AAAA", mimeType: "audio/pcm;rate=16000"}},
     })
@@ -1436,7 +1437,7 @@ describe("GeminiLiveController", () => {
     const h = harness()
     await start(h, "manual")
 
-    h.controller.sendActivity(["AAAA", "BBBB"])
+    h.controller.sendActivity(["AAAA", "BBBB"], "bluetooth")
 
     expect(h.requests[0].body.mode).toBe("manual")
     expect(h.sockets[0].sent.slice(1).map((value) => JSON.parse(value))).toEqual([
@@ -1445,7 +1446,36 @@ describe("GeminiLiveController", () => {
       {realtimeInput: {audio: {data: "BBBB", mimeType: "audio/pcm;rate=16000"}}},
       {realtimeInput: {activityEnd: {}}},
     ])
+    completeTurn(h)
     await h.controller.stop()
+    const events = h.requests.find(request => request.url.endsWith("/transcripts/append"))!.body.events
+    expect(events.map((event: any) => event.mic_source)).toEqual(["bluetooth", undefined])
+  })
+
+  test("only successful audio sends update the selected turn source", async () => {
+    const h = harness()
+    h.controller.sendAudio("AAAA", "glasses")
+    await start(h)
+    completeTurn(h)
+    h.controller.sendAudio("AAAA", "phone")
+    h.controller.activityPauseReason = "Test pause"
+    h.controller.sendAudio("BBBB", "glasses")
+    h.controller.activityPauseReason = null
+    h.sockets[0].readyState = 0
+    h.controller.sendAudio("BBBB", "glasses")
+    h.sockets[0].readyState = 1
+    h.sockets[0].failAtSendCount = h.sockets[0].sent.length
+    expect(() => h.controller.sendAudio("BBBB", "glasses")).toThrow("socket send failed")
+    h.sockets[0].failAtSendCount = null
+    completeTurn(h)
+    h.controller.sendAudio("AAAA", "glasses")
+    h.controller.sendAudio("AAAA")
+    completeTurn(h)
+    await h.controller.stop()
+    const events = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events)
+    expect(events.map((event: any) => event.mic_source)).toEqual([undefined, undefined, "phone", undefined, undefined, undefined])
+    expect(events.filter((event: any) => event.mic_source === undefined).every((event: any) => !("mic_source" in event))).toBe(true)
   })
 
   test("preserves a pre-send Manual take but reports partial transmission", async () => {
@@ -1559,6 +1589,7 @@ describe("GeminiLiveController", () => {
     })
     const h = harness({recallGate: gate})
     await start(h)
+    h.controller.sendAudio("AAAA", "bluetoothClassic")
 
     h.sockets[0].message({
       serverContent: {
@@ -1617,6 +1648,7 @@ describe("GeminiLiveController", () => {
       ["user", "Transcript unavailable.", undefined],
       ["assistant", "stale license", "complete"],
     ])
+    expect(events.map((event: any) => event.mic_source)).toEqual(["bluetoothClassic", undefined, undefined, undefined, undefined, undefined])
     expect(h.errors).toEqual(["Gemini completed a turn without both transcriptions"])
     await h.controller.stop()
   })
@@ -2122,6 +2154,7 @@ describe("GeminiLiveController", () => {
     const h = harness()
     try {
       await start(h)
+      h.controller.sendAudio("AAAA", "glasses")
       h.sockets[0].message({serverContent: {inputTranscription: {text: "first question"}}})
       h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
       h.sockets[0].message({serverContent: {interrupted: true}})
@@ -2136,6 +2169,7 @@ describe("GeminiLiveController", () => {
         ["second question", "complete"],
         ["second answer", "complete"],
       ])
+      expect(appends[0].body.events.map((event: any) => event.mic_source)).toEqual(["glasses", undefined, undefined, undefined])
       expect(h.events).toEqual(["interrupted", "turnComplete", "turnComplete"])
       expect(consoleInfo).toHaveBeenCalledWith(
         expect.stringContaining("provider.interrupted"),
@@ -2172,26 +2206,32 @@ describe("GeminiLiveController", () => {
   test("fails loud when a completed turn lacks either transcript side", async () => {
     const h = harness()
     await start(h)
+    h.controller.sendAudio("AAAA", "phone")
     h.sockets[0].message({serverContent: {inputTranscription: {text: "only one side"}, turnComplete: true}})
     expect(h.errors).toEqual(["Gemini completed a turn without both transcriptions"])
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
     expect(h.requests.find((request) => request.url.endsWith("/transcripts/append"))?.body.events).toEqual([
-      expect.objectContaining({event_kind: "transcript", role: "user", content: "only one side"}),
+      expect.objectContaining({event_kind: "transcript", role: "user", content: "only one side", mic_source: "phone"}),
       expect.objectContaining({event_kind: "transcript_gap", role: "assistant", content: "Transcript unavailable."}),
     ])
+    expect(h.requests.find(request => request.url.endsWith("/transcripts/append"))!.body.events[1]).not.toHaveProperty("mic_source")
     await h.controller.stop()
   })
 
   test("retains a failed append and retries the whole contiguous queue on the next turn", async () => {
     const h = harness({appendStatuses: [503, 200]})
     await start(h)
+    h.controller.sendAudio("AAAA", "glasses")
     completeTurn(h, "one", "answer one")
     await waitFor(() => h.persistenceErrors.length === 1)
+    h.controller.sendAudio("AAAA", "phone")
     completeTurn(h, "two", "answer two")
     await waitFor(() => h.persistenceErrors.at(-1) === null)
 
     const appends = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
     expect(appends.map((request) => request.body.events.length)).toEqual([2, 4])
+    expect(appends[1].body.events.map((event: any) => event.mic_source)).toEqual(["glasses", undefined, "phone", undefined])
+    expect(appends[1].body.events.slice(0, 2)).toEqual(appends[0].body.events)
     expect(h.errors).toEqual([])
     await h.controller.stop()
   })
@@ -2220,10 +2260,14 @@ describe("GeminiLiveController", () => {
     const storage = new FakeStorage()
     const h = harness({storage, appendGates: [gate]})
     await start(h)
+    h.controller.sendAudio("AAAA", "glasses")
     completeTurn(h, "first", "first answer")
     await waitFor(() => h.requests.some(request => request.url.endsWith("/transcripts/append")))
+    h.controller.sendAudio("AAAA", "phone")
     completeTurn(h, "second", "second answer")
     await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY) ?? "{}").pendingTranscripts?.length === 4)
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingTranscripts.map((event: any) => event.mic_source))
+      .toEqual(["glasses", undefined, "phone", undefined])
     expect(h.requests.filter(request => request.url.endsWith("/transcripts/append"))).toHaveLength(1)
     release()
     await h.controller.stop()
@@ -2461,11 +2505,15 @@ describe("GeminiLiveController", () => {
     const history: NonNullable<Parameters<typeof harness>[0]>["history"] = []
     const h = harness({storage: new FakeStorage(), history})
     await start(h)
+    h.controller.sendAudio("AAAA", "phone")
     completeTurn(h, text, "A short answer")
+    h.controller.sendAudio("AAAA", "glasses")
     await h.controller.stop()
     const spoken = history.filter(event => event.role === "user")
     expect(spoken.map(event => event.content).join("")).toBe(text)
     expect(spoken.every(event => Array.from(event.content).length <= 16_000)).toBe(true)
+    expect(spoken.every(event => event.mic_source === "phone")).toBe(true)
+    expect(history.filter(event => event.role === "assistant").every(event => !("mic_source" in event))).toBe(true)
   })
 
   test("photo finalization refusal and Discard do not poison or hide speech sync", async () => {
@@ -2540,6 +2588,7 @@ describe("GeminiLiveController", () => {
             role: "user",
             content: "already accepted",
             status: "complete",
+            mic_source: "glasses",
           },
           {
             event_id: "old-sitting:41",
@@ -2548,6 +2597,15 @@ describe("GeminiLiveController", () => {
             role: "assistant",
             content: "unacknowledged suffix",
             status: "complete",
+          },
+          {
+            event_id: "old-sitting:42",
+            sequence: 42,
+            event_kind: "transcript",
+            role: "user",
+            content: "unacknowledged speech",
+            status: "interrupted",
+            mic_source: "bluetooth",
           },
         ],
       }),
@@ -2584,6 +2642,12 @@ describe("GeminiLiveController", () => {
         event_id: "replacement-sitting:41",
         sequence: 41,
         content: "unacknowledged suffix",
+      }),
+      expect.objectContaining({
+        event_id: "replacement-sitting:42",
+        sequence: 42,
+        content: "unacknowledged speech",
+        mic_source: "bluetooth",
       }),
     ])
     await waitFor(() => {
@@ -2674,7 +2738,17 @@ describe("GeminiLiveController", () => {
     expect(JSON.parse(storage.values.get("openalma:gemini-session-v1")!).resumption.handle).toBe("private-handle")
   })
 
-  test("archives a journal event that mcp would reject without replaying it", async () => {
+  test.each([
+    {name: "missing status", fields: {}},
+    {name: "unknown source", fields: {status: "complete", mic_source: "unknown"}},
+    {name: "empty source", fields: {status: "complete", mic_source: ""}},
+    {name: "null source", fields: {status: "complete", mic_source: null}},
+    {name: "assistant source", fields: {status: "complete", role: "assistant", mic_source: "phone"}},
+    {name: "gap source", fields: {event_kind: "transcript_gap", content: "Transcript unavailable.", mic_source: "phone"}},
+    {name: "summary source", fields: {event_kind: "sitting_summary", role: "assistant", mic_source: "phone"}},
+    {name: "image source", fields: {event_kind: "image", content: "Shared a photo.",
+      media_ref: "mentra_media/test-phone/image.png", mic_source: "phone"}},
+  ])("archives a journal event that mcp would reject without replaying it ($name)", async ({fields}) => {
     const storage = new FakeStorage()
     storage.values.set(
       "openalma:gemini-session-v1",
@@ -2689,15 +2763,17 @@ describe("GeminiLiveController", () => {
             event_kind: "transcript",
             role: "user",
             content: "blank status is invalid",
+            ...fields,
           },
         ],
       }),
     )
+    const original = storage.values.get(JOURNAL_KEY)!
     const h = harness({storage})
     await start(h)
     expect(JSON.parse(h.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
     expect(storage.values.get("openalma:gemini-session-v1")).toBe("")
-    expect(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)[0]).toContain("blank status is invalid")
+    expect(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)[0]).toBe(original)
     await h.controller.stop()
   })
 
@@ -2738,6 +2814,7 @@ describe("GeminiLiveController", () => {
   test("Stop persists proven partial text as interrupted before End", async () => {
     const h = harness()
     await start(h)
+    h.controller.sendAudio("AAAA", "phone")
     h.sockets[0].message({serverContent: {inputTranscription: {text: "partial question"}}})
     h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
     await h.controller.stop()
@@ -2747,6 +2824,7 @@ describe("GeminiLiveController", () => {
       ["partial question", "interrupted"],
       ["partial answer", "interrupted"],
     ])
+    expect(append.body.events.map((event: any) => event.mic_source)).toEqual(["phone", undefined])
     expect(h.requests.findIndex((request) => request.url.endsWith("/transcripts/append"))).toBeLessThan(
       h.requests.findIndex((request) => request.url.endsWith("/end")),
     )
@@ -2886,14 +2964,16 @@ describe("GeminiLiveController", () => {
   test("audio during a deferred socket close leaves recovery in charge", async () => {
     const h = harness()
     await start(h)
+    h.controller.sendAudio("AAAA", "phone")
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "before reconnect"}}})
     const socket = h.sockets[0]
     const close = socket.close.bind(socket)
     socket.close = () => {}
     socket.error()
-    expect(() => h.controller.sendAudio("AAAA")).not.toThrow()
-    expect(socket.sent).toHaveLength(1)
+    expect(() => h.controller.sendAudio("AAAA", "glasses")).not.toThrow()
+    expect(socket.sent).toHaveLength(2)
     socket.readyState = 2
-    expect(() => h.controller.sendAudio("AAAA")).not.toThrow()
+    expect(() => h.controller.sendAudio("AAAA", "glasses")).not.toThrow()
     close()
     await waitFor(() => h.sockets.length === 2)
     h.sockets[1].open()
@@ -2902,7 +2982,11 @@ describe("GeminiLiveController", () => {
     h.controller.sendAudio("AAAA")
     expect(h.sockets[1].sent).toHaveLength(2)
     expect(h.errors).toEqual([])
+    completeTurn(h)
     await h.controller.stop()
+    const events = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events)
+    expect(events.map((event: any) => event.mic_source)).toEqual(["phone", undefined, undefined])
   })
 
   test("stalled response bodies time out without losing transcript retries", async () => {

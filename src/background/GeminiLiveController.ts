@@ -2,7 +2,7 @@ import {approxBase64ByteLength} from "./audioHelpers"
 import {timeoutSignal} from "./timeoutSignal"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import type {ImageRequest} from "../shared/channels"
-import {PHOTO_RETRY_MESSAGE, type SessionMode} from "../shared/types"
+import {MIC_SOURCES, PHOTO_RETRY_MESSAGE, type MicSource, type SessionMode} from "../shared/types"
 
 type StartResponse = {
   session_id: string
@@ -38,6 +38,7 @@ type TranscriptEvent = {
   content: string
   status?: "complete" | "interrupted"
   media_ref?: string
+  mic_source?: MicSource
 }
 
 type PendingImage = {
@@ -197,6 +198,7 @@ export class GeminiLiveController {
   private errorReported = false
   private inputTranscript = ""
   private outputTranscript = ""
+  private turnMicSource: MicSource | undefined
   private interruptionFinalized = false
   private turnActive = false
   private hasCompletedProviderTurn = false
@@ -251,8 +253,7 @@ export class GeminiLiveController {
     this.reconnectAttempted = false
     this.reconnecting = false
     this.errorReported = false
-    this.inputTranscript = ""
-    this.outputTranscript = ""
+    this.clearTurn()
     this.interruptionFinalized = false
     this.turnActive = false
     this.hasCompletedProviderTurn = false
@@ -332,7 +333,7 @@ export class GeminiLiveController {
     }
   }
 
-  sendAudio(base64Pcm: string): void {
+  sendAudio(base64Pcm: string, micSource?: MicSource): void {
     if (this.activityPauseReason) return
     if (!this.ready && !this.stopping) {
       // ponytail: drop audio during the single reconnect; add a bounded queue only if field tests show speech loss.
@@ -340,9 +341,10 @@ export class GeminiLiveController {
     }
     if (!this.socket || this.socket.readyState !== WS_OPEN) return
     this.sendAudioToSocket(this.socket, base64Pcm)
+    this.turnMicSource = micSource
   }
 
-  sendActivity(audioChunks: readonly string[]): void {
+  sendActivity(audioChunks: readonly string[], micSource?: MicSource): void {
     if (this.activityPauseReason) throw new Error(this.activityPauseReason)
     const socket = this.socket
     if (this.mode !== "manual") throw new Error("Manual activity requires Manual mode")
@@ -359,6 +361,7 @@ export class GeminiLiveController {
       for (const chunk of audioChunks) {
         if (socket.readyState !== WS_OPEN) throw new Error("socket closed during Manual activity")
         this.sendAudioToSocket(socket, chunk)
+        this.turnMicSource = micSource
       }
       if (socket.readyState !== WS_OPEN) throw new Error("socket closed during Manual activity")
       socket.send(JSON.stringify({realtimeInput: {activityEnd: {}}}))
@@ -961,6 +964,7 @@ export class GeminiLiveController {
   private finalizeCompleteTurn(toolCallBoundary = false): void {
     const input = this.inputTranscript.trim()
     const output = this.outputTranscript.trim()
+    const micSource = this.turnMicSource
     const pendingImage = this.pendingImage
     const capturesImage = Boolean(
       pendingImage?.providerSent && !pendingImage.caption && !pendingImage.captureAfterCurrent &&
@@ -970,7 +974,7 @@ export class GeminiLiveController {
     if (capturesImage) {
       if (toolCallBoundary) {
         if (input) {
-          this.enqueueEvent("transcript", "user", input, "complete")
+          this.enqueueEvent("transcript", "user", input, "complete", undefined, micSource)
           this.completeUserTurns += 1
         }
         if (output) this.enqueueEvent("transcript", "assistant", output, "complete")
@@ -979,7 +983,7 @@ export class GeminiLiveController {
       }
       if (!output) {
         if (input) {
-          this.enqueueEvent("transcript", "user", input, "complete")
+          this.enqueueEvent("transcript", "user", input, "complete", undefined, micSource)
           this.completeUserTurns += 1
         }
         this.enqueueEvent("transcript_gap", "assistant", "Transcript unavailable.")
@@ -987,7 +991,7 @@ export class GeminiLiveController {
         throw new Error("Gemini image turn completed without a usable caption")
       }
       if (input) {
-        this.enqueueEvent("transcript", "user", input, "complete")
+        this.enqueueEvent("transcript", "user", input, "complete", undefined, micSource)
         this.completeUserTurns += 1
       }
       const event = this.enqueueEvent("transcript", "assistant", output, "complete")
@@ -1007,7 +1011,7 @@ export class GeminiLiveController {
     const followsToolResult = !input && output && this.deliveredToolResultIds.size > 0
     if ((!input || !output) && !(input && toolCallBoundary) && !followsToolResult) {
       if (input) {
-        this.enqueueEvent("transcript", "user", input, "complete")
+        this.enqueueEvent("transcript", "user", input, "complete", undefined, micSource)
         this.completeUserTurns += 1
       } else {
         this.enqueueEvent("transcript_gap", "user", "Transcript unavailable.")
@@ -1019,7 +1023,7 @@ export class GeminiLiveController {
       throw new Error("Gemini completed a turn without both transcriptions")
     }
     if (input) {
-      this.enqueueEvent("transcript", "user", input, "complete")
+      this.enqueueEvent("transcript", "user", input, "complete", undefined, micSource)
       this.completeUserTurns += 1
     }
     if (output) this.enqueueEvent("transcript", "assistant", output, "complete")
@@ -1268,8 +1272,9 @@ export class GeminiLiveController {
   private finalizeInterruptedTurn(userComplete = false): void {
     const input = this.inputTranscript.trim()
     const output = this.outputTranscript.trim()
+    const micSource = this.turnMicSource
     this.clearTurn()
-    if (input) this.enqueueEvent("transcript", "user", input, userComplete ? "complete" : "interrupted")
+    if (input) this.enqueueEvent("transcript", "user", input, userComplete ? "complete" : "interrupted", undefined, micSource)
     if (output) this.enqueueEvent("transcript", "assistant", output, "interrupted")
     if (input && userComplete) this.completeUserTurns += 1
     this.interruptionFinalized = true
@@ -1285,6 +1290,7 @@ export class GeminiLiveController {
   private clearTurn(): void {
     this.inputTranscript = ""
     this.outputTranscript = ""
+    this.turnMicSource = undefined
   }
 
   private enqueueEvent(
@@ -1293,6 +1299,7 @@ export class GeminiLiveController {
     content: string,
     status?: TranscriptEvent["status"],
     mediaRef?: string,
+    micSource?: MicSource,
   ): TranscriptEvent {
     const characters = Array.from(content)
     let event!: TranscriptEvent
@@ -1306,6 +1313,7 @@ export class GeminiLiveController {
         content: characters.slice(offset, offset + TRANSCRIPT_CONTENT_LIMIT).join(""),
         ...(status ? {status} : {}),
         ...(mediaRef ? {media_ref: mediaRef} : {}),
+        ...(micSource ? {mic_source: micSource} : {}),
       }
       this.pendingEvents.push(event)
     }
@@ -1481,9 +1489,11 @@ export class GeminiLiveController {
       value.every((event) => {
         if (!event || typeof event !== "object") return false
         const keys = Object.keys(event)
-        if (keys.some((key) => !["event_id", "sequence", "event_kind", "role", "content", "status", "media_ref"].includes(key))) {
+        if (keys.some((key) => !["event_id", "sequence", "event_kind", "role", "content", "status", "media_ref", "mic_source"].includes(key))) {
           return false
         }
+        if (event.mic_source !== undefined && (event.event_kind !== "transcript" || event.role !== "user" ||
+          !MIC_SOURCES.some(source => source === event.mic_source))) return false
         if (
           typeof event.event_id !== "string" ||
           event.event_id !== event.event_id.trim() ||

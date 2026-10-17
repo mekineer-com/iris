@@ -1,4 +1,6 @@
 export type SessionMode = "continuous" | "manual"
+export const MIC_SOURCES = ["glasses", "phone", "bluetooth", "bluetoothClassic"] as const
+export type MicSource = typeof MIC_SOURCES[number]
 export type ConnectionState = "idle" | "starting" | "reconnecting" | "listening" | "speaking" | "stopping" | "error"
 export type EarconName = "listen-start" | "listen-stop" | "disconnected"
 export type ManualPhase = "idle" | "recording" | "review" | "submitted"

@@ -4,7 +4,7 @@ import type {GeminiCallbacks} from "./GeminiLiveController"
 import {GeminiLiveController, JOURNAL_KEY} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {SessionController} from "./SessionController"
-import type {SessionSnapshot as Snapshot} from "../shared/types"
+import type {MicSource, SessionSnapshot as Snapshot} from "../shared/types"
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://127.0.0.1:9999",
@@ -37,8 +37,10 @@ class FakeLive {
   stops = 0
   stopArgs: boolean[] = []
   sent: string[] = []
+  audioSources: Array<MicSource | undefined> = []
   startModes: string[] = []
   activities: string[][] = []
+  activitySources: Array<MicSource | undefined> = []
   images: unknown[] = []
   imageRetries = 0
   imageDiscards = 0
@@ -56,13 +58,15 @@ class FakeLive {
     if (this.startGate) await this.startGate
   }
 
-  sendAudio(data: string): void {
+  sendAudio(data: string, source?: MicSource): void {
     this.sent.push(data)
+    this.audioSources.push(source)
   }
 
-  sendActivity(chunks: readonly string[]): void {
+  sendActivity(chunks: readonly string[], source?: MicSource): void {
     if (this.activityError) throw this.activityError
     this.activities.push([...chunks])
+    this.activitySources.push(source)
   }
 
   async sendImage(image: unknown): Promise<void> {
@@ -123,7 +127,7 @@ class FakeLive {
 }
 
 class FakeSession {
-  micHandler: ((chunk: {data: string; sampleRate?: number; format?: string}) => void) | null = null
+  micHandler: ((chunk: {data: string; sampleRate?: number; format?: string; source?: string}) => void) | null = null
   micSubs = 0
   micStops = 0
   speakerStops = 0
@@ -172,7 +176,7 @@ class FakeSession {
   }
 
   mic = {
-    onAudioChunk: (handler: (chunk: {data: string; sampleRate?: number; format?: string}) => void) => {
+    onAudioChunk: (handler: (chunk: {data: string; sampleRate?: number; format?: string; source?: string}) => void) => {
       this.micSubs += 1
       this.micHandler = handler
       return () => {
@@ -1295,7 +1299,7 @@ describe("SessionController", () => {
   test("normalizes mic PCM and drains Gemini speech", async () => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
-    harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000, source: "glasses"})
     expect(harness.live.sent).toEqual([silentPcm()])
 
     harness.live.audio()
@@ -1303,14 +1307,26 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)?.connection).toBe("speaking")
     expect(harness.session.streams[0]?.opts.sampleRate).toBe(24000)
     expect(harness.session.streams[0]?.writes).toEqual([silentPcm()])
-    harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000, source: "phone"})
     expect(harness.live.sent).toEqual([silentPcm()])
+    expect(harness.live.audioSources).toEqual(["glasses"])
     harness.live.turnComplete()
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(harness.session.streams[0]?.closed).toBe(true)
     expect(lastSnapshot(harness.session)?.connection).toBe("listening")
     harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})
     expect(harness.live.sent).toEqual([silentPcm(), silentPcm()])
+    expect(harness.live.audioSources).toEqual(["glasses", undefined])
+  })
+
+  test("normalizes selected microphone sources without retaining stale knowledge", async () => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    for (const source of ["glasses", "phone", "bluetooth", "bluetoothClassic", "", undefined, "unknown"]) {
+      harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000, source})
+    }
+    expect(harness.live.audioSources).toEqual(["glasses", "phone", "bluetooth", "bluetoothClassic", undefined, undefined, undefined])
+    await harness.session.handlers["openalma:stop"]({})
   })
 
   test("turn completion waits for audio dispatched in the same tick", async () => {
@@ -1543,7 +1559,7 @@ describe("SessionController", () => {
   test("Manual records, reviews, redoes, and sends only the replacement", async () => {
     const harness = setup({watchdogMs: 15})
     await harness.session.handlers["openalma:start"]({mode: "manual"})
-    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000, source: "phone"})
     await new Promise((resolve) => setTimeout(resolve, 25))
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", manualPhase: "idle"})
 
@@ -1551,27 +1567,47 @@ describe("SessionController", () => {
     expect(() => harness.session.handlers["openalma:manual-action"]({action: "done"})).toThrow(
       "No audio was recorded",
     )
-    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000, source: "glasses"})
     harness.session.handlers["openalma:manual-action"]({action: "done"})
     expect(harness.live.activities).toEqual([])
 
     harness.session.handlers["openalma:manual-action"]({action: "redo"})
-    harness.session.micHandler?.({data: testPcm(2), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.micHandler?.({data: testPcm(2), format: "pcm_s16le", sampleRate: 16000, source: "bluetoothClassic"})
     harness.session.handlers["openalma:manual-action"]({action: "done"})
+    harness.session.micHandler?.({data: testPcm(3), format: "pcm_s16le", sampleRate: 16000, source: "phone"})
     harness.session.handlers["openalma:manual-action"]({action: "send"})
     expect(harness.live.activities).toEqual([[testPcm(2)]])
+    expect(harness.live.activitySources).toEqual(["bluetoothClassic"])
     expect(lastSnapshot(harness.session)?.manualPhase).toBe("submitted")
 
     harness.live.turnComplete()
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", manualPhase: "idle"})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+    harness.session.handlers["openalma:manual-action"]({action: "send"})
+    expect(harness.live.activitySources).toEqual(["bluetoothClassic", undefined])
+    await harness.session.handlers["openalma:stop"]({})
+  })
+
+  test.each([undefined, "", "unknown"])("Manual clears a source on accepted unlabelled audio (%s)", async source => {
+    const harness = setup()
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000, source: "glasses"})
+    harness.session.micHandler?.({data: testPcm(2), format: "pcm_s16le", sampleRate: 16000, source})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+    harness.session.handlers["openalma:manual-action"]({action: "send"})
+    expect(harness.live.activitySources).toEqual([undefined])
+    await harness.session.handlers["openalma:stop"]({})
   })
 
   test("Manual keeps a Review draft when the provider is not ready", async () => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "manual"})
     harness.session.handlers["openalma:manual-action"]({action: "talk"})
-    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000, source: "glasses"})
     harness.session.handlers["openalma:manual-action"]({action: "done"})
     harness.live.activityError = new Error("Gemini socket is not ready")
 
@@ -1579,9 +1615,11 @@ describe("SessionController", () => {
       "Gemini socket is not ready",
     )
     expect(lastSnapshot(harness.session)?.manualPhase).toBe("review")
+    harness.session.micHandler?.({data: testPcm(2), format: "pcm_s16le", sampleRate: 16000, source: "phone"})
     harness.live.activityError = null
     harness.session.handlers["openalma:manual-action"]({action: "send"})
     expect(harness.live.activities).toEqual([[testPcm(1)]])
+    expect(harness.live.activitySources).toEqual(["glasses"])
   })
 
   test("Stop discards an unsent Manual draft", async () => {
@@ -1648,10 +1686,11 @@ describe("SessionController", () => {
       data: Buffer.alloc(16000 * 2 * 120).toString("base64"),
       format: "pcm_s16le",
       sampleRate: 16000,
+      source: "glasses",
     })
     expect(lastSnapshot(harness.session)).toMatchObject({manualPhase: "recording", lastError: null})
 
-    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000, source: "phone"})
     expect(lastSnapshot(harness.session)).toMatchObject({
       manualPhase: "review",
       lastError: "Manual recording reached 120-second limit",
@@ -1663,6 +1702,7 @@ describe("SessionController", () => {
     })
     harness.session.handlers["openalma:manual-action"]({action: "send"})
     expect(lastSnapshot(harness.session)).toMatchObject({manualPhase: "submitted", lastError: null})
+    expect(harness.live.activitySources).toEqual(["glasses"])
   })
 
   test("tool boundary and interrupted abort cannot release Manual early", async () => {
