@@ -2,85 +2,47 @@
 
 Iris is part of [OpenAlma](https://github.com/mekineer-com/OpenAlma). For project-wide questions and ideas, use [OpenAlma Discussions](https://github.com/mekineer-com/OpenAlma/discussions).
 
-Nested at `mentra-os/miniapps/openalma/` for MentraOS development convenience. This is its own git repository (`mekineer-com/iris`), not part of MentraOS history.
+## Get Started
 
-After cloning MentraOS, add this path to the **parent** checkout’s local exclude (it does not survive a fresh MentraOS clone):
+Install Iris from the OpenAlma launcher and use a trusted private connection,
+such as your VPN, to reach your OpenAlma computer. Devices allowed onto that
+connection can access the Soul's Iris data.
 
-```
-miniapps/openalma/
-```
+Choose an existing Soul or create one, then press **Start**. The selected Soul
+stays fixed until the sitting and any pending recovery are finished. Connection
+settings live on your phone; **Edit Connection** can repair the server address
+without losing your selected Soul or installation identity.
 
-in `mentra-os/.git/info/exclude`.
+## Voice and Photos
 
-The OpenAlma Mentra fork already commits `!miniapps/openalma` in its workspace list. An unmodified upstream MentraOS checkout may need that exclusion locally; do not send it upstream. Otherwise `bun install` here rewrites MentraOS `bun.lock` and links the in-tree SDK instead of the MiniApp's pinned npm dependency.
+Talk continuously, or use manual mode: record a take, press **Done**, then choose
+**Send** or **Redo**. Done does not send it. Microphone and camera switches work
+independently. A temporary transcript-sync failure retries without ending voice.
+After at least two completed user turns, Stop may play and save a short reflection.
 
-The MiniApp connects OpenAlma's private-network Mentra bootstrap to Gemini Live native audio and sitting-scoped durable transcripts. Continuous mode uses provider VAD. Manual mode records one memory-only take, then waits for `Send` or `Redo`; `Done` never sends by itself. Persistent Iris-local switches independently mute microphone capture or disable camera actions without ending the sitting. Temporary transcript-sync failure remains visible and retries without ending voice; a provider turn missing usable transcript text records a non-conversational gap marker before failing loud. Graceful Stop may play and persist one short first-person reflection after two completed user turns.
-
-Before changing the Gemini wire or diagnosing provider behavior, read
-[`GEMINI_LIVE.md`](GEMINI_LIVE.md). It pins Iris's model-specific contract,
-official sources, proven behavior, and local redacted fixtures.
-
-Soul Presence is fixed at Start: narrative self, both identity anchors, the flat
-**My Categories** list, and recent conversations. Working thoughts and intentions
-stay live instead: Gemini can read their current state, save a working thought,
-and complete or let go of an intention through server tools. Lost write results
-are uncertain; Iris never automatically repeats those writes. Connection renewal
-keeps the original entry context.
-
-Invalid tool arguments are answered without ending voice or running part of a
-rejected batch. A shortened working thought is reported as truncated. Authentication
-and expired-sitting failures still end the session. Server-request deadlines cover
-response bodies as well as headers; interrupted transcript sync retains the phone
-backup. Stop abandons waits from interrupted playback before playing a reflection.
-
-Iris stores its OpenAlma connection profile and selected soul in phone-local
-`session.storage`. With no profile it asks you to install Iris from the launcher
-and makes no OpenAlma or Gemini request. Discovery checks the one shared OpenAlma
-owner through the private-network `/integration/mentra/owner` contract; a
-saved profile whose user does not match that owner is kept for address repair,
-but Soul selection and Start refuse the mismatched owner.
-Existing soul suggestions come from
-`GET /integration/mentra/souls?user_id=...`. Selection or creation uses `POST`
-on the same route with `user_id`, `soul_id`, and `use_existing`. Only a 409
-with `detail.reason: existing_exact` offers consent to reuse; sanitized-name
-collisions remain errors. Start waits for local preferences and discovery.
-A saved name missing from discovery requires explicit selection or creation.
-Selection stays locked during a sitting and while its Gemini journal remains;
-Start recovers that journal's original soul, then Stop completes finalization.
-The bottom gear opens existing settings. **Edit Connection** preserves the
-installation identity and selected Soul; its Save is locked during a sitting or
-settings work, but allows address-only repair with pending recovery data intact.
-The owner and installation ID are read-only. There is no
-Clear Connection/reset path.
-
-If the phone's conversation backup cannot match the server, Iris keeps its exact
-original in phone-local **Recovered Chats** (`openalma:recovered-chats`) before
-starting fresh. Original line numbers and photo references are retained there,
-not automatically replayed or memorized. If the backup cannot be read or copied,
-its old key stays untouched and Iris starts a fresh numbered backup. Both readers
-use the newest key; an empty marker after Stop prevents older backups resurfacing.
-Backup trouble never blocks Start. If phone storage itself is unavailable, server
-transcript saving stays enabled with a visible local-backup warning.
-
-While a sitting is active, **Take photo** and **Choose image** durably store a non-empty JPEG/PNG before sending it to Gemini. Immediate send is the default; optional preview provides Send/Retake. Files over 1 MB pause for a cost/latency warning that can be permanently dismissed. Gemini's spoken description is saved as the image caption only after its transcript is acknowledged.
+During a sitting, use **Take photo** or **Choose image** to show her a JPEG or
+PNG. Photos send immediately unless you enable preview, which offers Send or
+Retake. Files over 1 MB show a dismissible cost and latency warning. Her spoken
+description becomes the saved caption.
 
 Unconfirmed photo recovery stays on the phone after Stop. Start Iris again before
-using Retry or Discard; a delayed old button result cannot change the new sitting.
+using Retry or Discard.
 
-The MiniApp ZIP is generic and contains no endpoint, credential, user, soul, or
-phone identity. `.env.local` is used only by the private release wrapper for its
-explicit address bind and installation-completion poll; it is never compiled into Iris.
-Use a trusted private VPN/connection: devices allowed to reach this endpoint can
-access the Soul's Iris data; trust the permitted devices and network access rules.
+If a phone backup cannot be matched to the server, Iris keeps it in
+**Recovered Chats** rather than replaying it into the conversation. A local
+backup problem does not prevent Start; server transcript saving remains available.
 
-A failed Memorize or consolidation pauses new activity for that Soul. Start
-reports launcher recovery; an active sitting learns the pause on its existing
-heartbeat, stops new audio/photo sends and preserves manual takes. Already-paid
-output can finish, and transcript saving, token renewal and Stop remain usable.
-Stop skips a new reflection while paused. Retry belongs to the launcher; a later
-healthy heartbeat permits input again. No offline input queue is created.
+## Memory Processing
 
-```
+If Memorize or consolidation fails, Iris pauses new input and directs you to
+**Retry** in the OpenAlma launcher. Transcript saving and Stop remain available;
+unfinished manual takes are kept. Input resumes when processing is healthy.
+
+## Development
+
+See [AGENTS.md](AGENTS.md) for checkout, build and implementation guidance.
+
+```sh
 bun install
 bun test
 bun run build
