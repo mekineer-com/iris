@@ -1282,7 +1282,8 @@ export class GeminiLiveController {
     if (this.pendingImage?.providerSent && !this.pendingImage.caption && !this.pendingImage.captureAfterCurrent) {
       this.pendingImage.providerSent = false
       void this.persistJournal()
-      this.callbacks.onPersistenceError("Photo description was interrupted; retrying")
+      this.callbacks.onPhotoRetryChange(true)
+      this.callbacks.onPersistenceError("Photo description was interrupted; retry after speaking")
     }
     this.releaseImageFence()
     this.scheduleAppend()

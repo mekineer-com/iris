@@ -323,6 +323,22 @@ describe("SessionController", () => {
       .rejects.toThrow("cannot change the owner or installation ID")
   })
 
+  test.each([new Error("Network request failed"), new Error("The operation was aborted"), 409, 503])(
+    "distinguishes discovery transport failures from server responses (%s)", async failure => {
+      const session = new FakeSession()
+      new SessionController(session as never, {
+        config: CONFIG,
+        fetchFn: (async () => {
+          if (failure instanceof Error) throw failure
+          return new Response("unavailable", {status: failure})
+        }) as typeof fetch,
+      }).start()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(lastSnapshot(session)).toMatchObject({memuAvailable: false,
+        lastError: failure instanceof Error ? "Is memU running?" : `Owner discovery failed (${failure})`})
+    },
+  )
+
   test("leaves missing owner setup to the launcher", async () => {
     const session = new FakeSession()
     const requests: Array<{url: string; method: string; body: unknown}> = []

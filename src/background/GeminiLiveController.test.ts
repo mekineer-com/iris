@@ -122,6 +122,7 @@ function harness(
     bodyTransportFailure?: boolean
     storage?: FakeStorage
     warningSeconds?: number
+    onError?: () => void
   } = {},
 ) {
   const sockets: FakeSocket[] = []
@@ -258,7 +259,7 @@ function harness(
       },
       onPhotoRetryChange: (pending) => photoRetryChanges.push(pending),
       onPersistenceError: (message) => persistenceErrors.push(message),
-      onError: (error) => errors.push(error.message),
+      onError: (error) => { errors.push(error.message); options.onError?.() },
     },
     {
       fetchFn: fetchFn as typeof fetch,
@@ -1264,6 +1265,7 @@ describe("GeminiLiveController", () => {
     await new Promise(resolve => setTimeout(resolve, 0))
     expect(h.sockets[0].sent.filter(value => JSON.parse(value).clientContent)).toHaveLength(1)
     expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.providerSent).toBe(false)
+    expect(h.photoRetryChanges.at(-1)).toBe(true)
     h.sockets[0].message({serverContent: {
       inputTranscription: {text: "I was still speaking."},
       outputTranscription: {text: "The answer to the interruption, not a photo caption."},
@@ -3033,10 +3035,13 @@ describe("GeminiLiveController", () => {
         expect(recalling.errors).toEqual([])
         await recalling.controller.stop()
 
-        const renewing = harness({stalledBodyPath: "/token", setupTimeoutMs: 10, bodyTransportFailure})
+        let errorReported!: () => void
+        const failed = new Promise<void>(resolve => { errorReported = resolve })
+        const renewing = harness({stalledBodyPath: "/token", setupTimeoutMs: 10, bodyTransportFailure,
+          onError: errorReported})
         await start(renewing)
         renewing.sockets[0].error()
-        await new Promise(resolve => original(resolve, 100))
+        await failed
         expect(renewing.requests.filter(request => request.url.endsWith("/token"))).toHaveLength(6)
         expect(renewing.errors).toHaveLength(1)
         await renewing.controller.stop()

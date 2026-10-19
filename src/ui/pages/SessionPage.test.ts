@@ -91,17 +91,18 @@ describe("SessionPage state projection", () => {
     expect(visibleConnection("idle", false, false)).toBe("idle")
   })
 
-  test("shows a plain connection question with the actions on the next line", () => {
+  test.each(["Is memU running?", "Owner discovery failed (409)", "Owner discovery failed (503)"])(
+    "keeps connection guidance and the actions on the next line (%s)", lastError => {
     const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: [],
-      connection: "idle", memuAvailable: false, lastError: "Owner discovery failed (502)"}
+      connection: "idle", memuAvailable: false, lastError}
     const render = renderPage(snapshot, async () => ({ok: true}))
     const status = nodes(render()).find(node => node.props?.className === "memu-status")
     const content = nodes(status).find(node => node.type === "span")
-    expect(content.props.children[0]).toBe("Is memU running?")
+    expect(content.props.children[0]).toBe(lastError)
     expect(content.props.children[1].type).toBe("br")
     expect(nodes(content).filter(node => node.type === "button").map(node => node.props.children))
       .toEqual(["Retry Connection", "Edit Connection"])
-    expect(snapshot.lastError).toBe("Owner discovery failed (502)")
+    expect(snapshot.lastError).toBe(lastError)
   })
 
   test("shows refused-ticket guidance without hiding the address-only connection editor", async () => {

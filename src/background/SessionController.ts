@@ -960,6 +960,8 @@ export class SessionController {
   ): Promise<{config: OpenAlmaConfig; souls: string[]}> {
     const ownerResponse = await this.fetchFn(`${config.baseUrl}/integration/mentra/owner`, {
       signal: timeoutSignal(10_000),
+    }).catch(() => {
+      throw new Error("Is memU running?")
     })
     if (!ownerResponse.ok) throw new Error(`Owner discovery failed (${ownerResponse.status})`)
     const ownerResult = await ownerResponse.json() as Partial<{user_id: unknown}>
