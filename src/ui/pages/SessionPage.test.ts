@@ -91,6 +91,19 @@ describe("SessionPage state projection", () => {
     expect(visibleConnection("idle", false, false)).toBe("idle")
   })
 
+  test("shows a plain connection question with the actions on the next line", () => {
+    const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: [],
+      connection: "idle", memuAvailable: false, lastError: "Owner discovery failed (502)"}
+    const render = renderPage(snapshot, async () => ({ok: true}))
+    const status = nodes(render()).find(node => node.props?.className === "memu-status")
+    const content = nodes(status).find(node => node.type === "span")
+    expect(content.props.children[0]).toBe("Is memU running?")
+    expect(content.props.children[1].type).toBe("br")
+    expect(nodes(content).filter(node => node.type === "button").map(node => node.props.children))
+      .toEqual(["Retry Connection", "Edit Connection"])
+    expect(snapshot.lastError).toBe("Owner discovery failed (502)")
+  })
+
   test("shows refused-ticket guidance without hiding the address-only connection editor", async () => {
     const snapshot = {configured: true, soulLoading: false, soulId: "", souls: [], soulConfirmed: false,
       soulLocked: true, connectionLocked: false, memuAvailable: false,

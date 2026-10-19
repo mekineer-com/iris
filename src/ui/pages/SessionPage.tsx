@@ -427,12 +427,13 @@ export default function SessionPage() {
       {snapshot?.memuAvailable === false ? (
         <p className="memu-status" role="status">
           <img src={memuIcon} alt="" />
-          <span>{snapshot.lastError || "memU is unavailable. Start memU or check its address."}{" "}
+          <span>{!snapshot.lastError || snapshot.lastError.startsWith("Owner discovery failed (")
+            ? "Is memU running?" : snapshot.lastError}<br />
             <button type="button" disabled={profilePending || connectionLocked}
               onClick={() => void saveProfile(snapshot.connectionProfile!)}>
               {profilePending ? "Checking..." : "Retry Connection"}
             </button>{" "}
-            <button type="button" onClick={editConnection}>Edit Connection</button>.
+            <button type="button" onClick={editConnection}>Edit Connection</button>
           </span>
         </p>
       ) : null}
