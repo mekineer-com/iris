@@ -28,10 +28,6 @@ description becomes the saved caption.
 Unconfirmed photo recovery stays on the phone after Stop. Start Iris again before
 using Retry or Discard.
 
-If a phone backup cannot be matched to the server, Iris keeps it in
-**Recovered Chats** rather than replaying it into the conversation. A local
-backup problem does not prevent Start; server transcript saving remains available.
-
 ## Memory Processing
 
 If Memorize or consolidation fails, Iris pauses new input and directs you to

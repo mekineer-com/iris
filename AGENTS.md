@@ -81,5 +81,5 @@ spoken transcript is acknowledged. Pending photo recovery survives Stop; stale
 button results cannot mutate a later sitting.
 
 A Soul's processing pause blocks new input, not transcript saving, token renewal
-or Stop. Keep unfinished manual takes; Retry belongs to the launcher. Do not
-invent an offline input queue.
+or Stop. Keep unfinished manual takes in memory only; Retry belongs to the
+launcher. Do not invent an offline input queue.
