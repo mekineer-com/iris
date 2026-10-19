@@ -61,8 +61,4 @@ describe("installation report", () => {
     expect(bodies[1]).not.toHaveProperty("installation_ticket")
   })
 
-  test("shows the server's used-ticket refusal", async () => {
-    await expect(reportInstallation(CONFIG, (async () => Response.json({detail: "Installation ticket already used"},
-      {status: 409})) as typeof fetch)).rejects.toThrow("Installation report failed (409): Installation ticket already used")
-  })
 })

@@ -14,6 +14,39 @@ import {
   visibleConnection,
 } from "./SessionPage"
 
+type Node = {props: Record<string, any>}
+const nodes = (tree: any): any[] => !tree || typeof tree !== "object" ? []
+  : Array.isArray(tree) ? tree.flatMap(nodes) : [tree, ...nodes(tree.props?.children)]
+
+function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Promise<unknown>) {
+  const states: unknown[] = []
+  const refs: Array<{current: unknown}> = []
+  let cursor = 0
+  let refCursor = 0
+  const context = {
+    exports: {}, btoa, localStorage: {getItem: () => null},
+    require: (name: string) => {
+      if (name === "react") return {
+        useState(initial: unknown) {
+          const index = cursor++
+          if (!(index in states)) states[index] = typeof initial === "function" ? initial() : initial
+          return [states[index], (value: unknown) => {states[index] = typeof value === "function" ? value(states[index]) : value}]
+        },
+        useEffect() {},
+        useRef(value: unknown) {return refs[refCursor++] ??= {current: value}},
+      }
+      if (name === "react/jsx-runtime") return jsx
+      if (name.endsWith("miniapp.json")) return {default: manifest, __esModule: true}
+      if (name.endsWith("/useChannel")) return {useChannel: () => snapshot}
+      if (name === "@mentra/miniapp/ui") return {useRpc: (channel: string) => (payload: unknown) => rpc(channel, payload)}
+      return {default: "", __esModule: true}
+    },
+  }
+  const source = readFileSync(new URL("./SessionPage.tsx", import.meta.url), "utf8")
+  runInNewContext(ts.transpileModule(source, {compilerOptions: {module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX}}).outputText, context)
+  return () => {cursor = refCursor = 0; return (context.exports as {default: () => Node}).default()}
+}
+
 describe("SessionPage state projection", () => {
 
   test("submitted manual recording names the selected Soul", () => {
@@ -23,37 +56,12 @@ describe("SessionPage state projection", () => {
   })
 
   test("creates without a human-name field, defers creation to Start, and preserves existing selection", async () => {
-    const states: unknown[] = []
-    let cursor = 0
     const calls: Array<{channel: string; payload: unknown}> = []
-    const react = {
-      useState(initial: unknown) {
-        const index = cursor++
-        if (!(index in states)) states[index] = typeof initial === "function" ? initial() : initial
-        return [states[index], (value: unknown) => { states[index] = typeof value === "function" ? value(states[index]) : value }]
-      },
-      useEffect() {}, useRef: (value: unknown) => ({current: value}),
-    }
-    const context = {
-      exports: {}, localStorage: {getItem: () => null},
-      require: (name: string) => {
-        if (name === "react") return react
-        if (name === "react/jsx-runtime") return jsx
-        if (name.endsWith("miniapp.json")) return {default: manifest, __esModule: true}
-        if (name.endsWith("/useChannel")) return {useChannel: () => ({configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"], soulConfirmed: true, soulLocked: false})}
-        if (name === "@mentra/miniapp/ui") return {useRpc: (channel: string) => async (payload: {soulId?: string}) => {
-          calls.push({channel, payload})
-          return channel === "openalma:set-soul" ? {soulId: payload.soulId, created: payload.soulId !== "Quill"} : {ok: true}
-        }}
-        return {default: "", __esModule: true}
-      },
-    }
-    const source = readFileSync(new URL("./SessionPage.tsx", import.meta.url), "utf8")
-    runInNewContext(ts.transpileModule(source, {compilerOptions: {module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX}}).outputText, context)
-    type Node = {props: Record<string, any>}
-    const render = () => { cursor = 0; return (context.exports as {default: () => Node}).default() }
-    const nodes = (tree: any): Node[] => !tree || typeof tree !== "object" ? []
-      : Array.isArray(tree) ? tree.flatMap(nodes) : [tree, ...nodes(tree.props?.children)]
+    const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"], soulConfirmed: true, soulLocked: false}
+    const render = renderPage(snapshot, async (channel, payload) => {
+      calls.push({channel, payload})
+      return channel === "openalma:set-soul" ? {soulId: payload.soulId, created: payload.soulId !== "Quill"} : {ok: true}
+    })
     const soulInput = (tree: Node) => nodes(tree).find(node => node.props?.onFocus && node.props?.value !== undefined)!
     const arrow = (tree: Node) => nodes(tree).find(node => node.props?.["aria-label"] === "Use soul")!
     const start = (tree: Node) => nodes(tree).find(node => node.props?.className === "sitting-button")!
@@ -90,31 +98,8 @@ describe("SessionPage state projection", () => {
       connectionProfile: {baseUrl: "http://test.example", userId: "Test User", deviceSessionId: "test-phone"},
       lastError: "Installation report failed (409): Setup ticket is unavailable or already used. Make a new Stock Install QR in the OpenAlma launcher, then install Iris from that QR.",
     }
-    const states: unknown[] = []
-    let cursor = 0
     const calls: Array<{channel: string; payload: unknown}> = []
-    const context = {
-      exports: {}, localStorage: {getItem: () => null},
-      require: (name: string) => {
-        if (name === "react") return {
-          useState(initial: unknown) {
-            const index = cursor++
-            if (!(index in states)) states[index] = typeof initial === "function" ? initial() : initial
-            return [states[index], (value: unknown) => {states[index] = typeof value === "function" ? value(states[index]) : value}]
-          },
-          useEffect() {}, useRef: (value: unknown) => ({current: value}),
-        }
-        if (name === "react/jsx-runtime") return jsx
-        if (name.endsWith("/useChannel")) return {useChannel: () => snapshot}
-        if (name === "@mentra/miniapp/ui") return {useRpc: (channel: string) => async (payload: unknown) => {calls.push({channel, payload}); return {ok: true}}}
-        return {default: "", __esModule: true}
-      },
-    }
-    const source = readFileSync(new URL("./SessionPage.tsx", import.meta.url), "utf8")
-    runInNewContext(ts.transpileModule(source, {compilerOptions: {module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX}}).outputText, context)
-    const render = () => {cursor = 0; return (context.exports as {default: () => any}).default()}
-    const nodes = (tree: any): any[] => !tree || typeof tree !== "object" ? []
-      : Array.isArray(tree) ? tree.flatMap(nodes) : [tree, ...nodes(tree.props?.children)]
+    const render = renderPage(snapshot, async (channel, payload) => {calls.push({channel, payload}); return {ok: true}})
     expect(JSON.stringify(render())).toContain(snapshot.lastError)
     expect(JSON.stringify(render())).not.toContain("memU is unavailable. Start memU")
     expect(nodes(render()).find(node => node.props?.className === "sitting-button").props.disabled).toBe(true)
@@ -161,43 +146,17 @@ describe("SessionPage state projection", () => {
       test(`late stored-photo ${action} ${fails ? "failure" : "success"} after ${boundary} leaves replacement UI alone`, async () => {
         const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
           soulConfirmed: true, soulLocked: false, connection: "idle", photoRetryPending: false}
-        const states: unknown[] = []
-        const refs: Array<{current: unknown}> = []
-        let cursor = 0
-        let refCursor = 0
         const pending: Array<{resolve: () => void; reject: (error: Error) => void}> = []
         const calls: string[] = []
-        const context = {
-          exports: {}, btoa, localStorage: {getItem: () => null},
-          require: (name: string) => {
-            if (name === "react") return {
-              useState(initial: unknown) {
-                const index = cursor++
-                if (!(index in states)) states[index] = typeof initial === "function" ? initial() : initial
-                return [states[index], (value: unknown) => {states[index] = typeof value === "function" ? value(states[index]) : value}]
-              },
-              useEffect() {},
-              useRef(value: unknown) {return refs[refCursor++] ??= {current: value}},
-            }
-            if (name === "react/jsx-runtime") return jsx
-            if (name.endsWith("/useChannel")) return {useChannel: () => snapshot}
-            if (name === "@mentra/miniapp/ui") return {useRpc: (channel: string) => async () => {
-              calls.push(channel)
-              if (channel === "openalma:pending-image") {
-                return new Promise<void>((resolve, reject) => pending.push({resolve, reject}))
-              }
-              if (channel === "openalma:set-capabilities") throw new Error("Replacement setting failed")
-              if (channel === "openalma:set-soul") return {soulId: "Quill", created: false}
-              return {ok: true}
-            }}
-            return {default: "", __esModule: true}
-          },
-        }
-        const source = readFileSync(new URL("./SessionPage.tsx", import.meta.url), "utf8")
-        runInNewContext(ts.transpileModule(source, {compilerOptions: {module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX}}).outputText, context)
-        const render = () => {cursor = refCursor = 0; return (context.exports as {default: () => any}).default()}
-        const nodes = (tree: any): any[] => !tree || typeof tree !== "object" ? []
-          : Array.isArray(tree) ? tree.flatMap(nodes) : [tree, ...nodes(tree.props?.children)]
+        const render = renderPage(snapshot, async (channel) => {
+          calls.push(channel)
+          if (channel === "openalma:pending-image") {
+            return new Promise<void>((resolve, reject) => pending.push({resolve, reject}))
+          }
+          if (channel === "openalma:set-capabilities") throw new Error("Replacement setting failed")
+          if (channel === "openalma:set-soul") return {soulId: "Quill", created: false}
+          return {ok: true}
+        })
         const actions = () => nodes(render()).find(node => node.props?.className === "image-review").props.children
         const flush = () => new Promise(resolve => setTimeout(resolve, 0))
         const pickPhoto = () => nodes(render()).find(node => node.props?.type === "file").props.onChange({currentTarget: {
