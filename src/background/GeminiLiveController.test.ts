@@ -1249,23 +1249,39 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
-  test("barge-in retries the durable photo without ending the sitting", async () => {
-    const h = harness({storage: new FakeStorage()})
+  test.each([true, false])("barge-in waits for the voice reply before retrying the photo (combined=%s)", async combined => {
+    const storage = new FakeStorage()
+    const h = harness({storage})
     await start(h)
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
     h.sockets[0].message({serverContent: {
       inputTranscription: {text: "Wait, what is that?"},
       outputTranscription: {text: "It looks like..."},
       interrupted: true,
+      ...(combined ? {turnComplete: true} : {}),
     }})
-    h.sockets[0].message({serverContent: {turnComplete: true}})
+    if (!combined) h.sockets[0].message({serverContent: {turnComplete: true}})
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(h.sockets[0].sent.filter(value => JSON.parse(value).clientContent)).toHaveLength(1)
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.providerSent).toBe(false)
+    h.sockets[0].message({serverContent: {
+      inputTranscription: {text: "I was still speaking."},
+      outputTranscription: {text: "The answer to the interruption, not a photo caption."},
+      turnComplete: true,
+    }})
     await waitFor(() => h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent).length === 2)
+    expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
     h.sockets[0].message({serverContent: {
       outputTranscription: {text: "The photo shows a fictional blue square."},
       turnComplete: true,
     }})
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
-
+    expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption)
+      .toBe("The photo shows a fictional blue square.")
+    const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events)
+    expect(rows.filter(event => event.event_kind === "image")).toHaveLength(1)
+    expect(rows.some(event => event.event_kind === "transcript_gap")).toBe(false)
     expect(h.errors).toEqual([])
     await h.controller.stop()
   })

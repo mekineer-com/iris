@@ -939,7 +939,8 @@ export class GeminiLiveController {
         }),
       })
       this.providerAudioChunks = 0
-      if (this.interruptionFinalized) {
+      const interruptedTurn = this.interruptionFinalized
+      if (interruptedTurn) {
         this.interruptionFinalized = false
       } else {
         this.finalizeCompleteTurn(hasToolCall)
@@ -948,8 +949,8 @@ export class GeminiLiveController {
       this.reconnectAttempted = false
       if (this.latestUsageTotal !== null) this.callbacks.onUsage(this.latestUsageTotal)
       this.callbacks.onTurnComplete(!hasToolCall)
-      // Barge-in marks the photo unsent; this boundary is the first safe same-socket retry point.
-      void this.retryPendingImage()
+      // Barge-in completes the old response before the interrupting voice turn is finished.
+      if (!interruptedTurn) void this.retryPendingImage()
     }
   }
 
