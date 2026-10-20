@@ -138,17 +138,22 @@ Its text can settle at
 - In-process replacement preserves already-settled pending requests and does not
   repeat uncertain writes. A socket loss before native completion (including an
   in-flight continuation) cannot certify completion: its unfinished results
-  resume silently, without an invented wake.
+  resume silently, without an invented wake. Retiring a Manual request releases
+  its submitted state even if playback never began; retained settled debt stays
+  pending.
   Provider acceptance of these integrated races remains a separate gate.
 - `serverContent.turnComplete: true` closes response generation, not input
   transcription ownership. Reserve spoken input at native activity start, or
   Manual Send; the Manual echo does not create another reservation.
 - Preserve the existing normal save boundary when words are present at response
   completion. This is not proof of a native ASR final marker. If the response
-  completes first, keep an unsequenced suffix in the existing journal through
-  terminal Stop/recovery. Late fragments fill that reservation, not a later turn.
-  Overlapping admissions combine the words with an explicit uncertain-timing,
-  received-order label. No new timeout or reconstructed split is used.
+  completes first, keep an unsequenced group in the existing journal. Overlapping
+  admissions combine words with an explicit uncertain-timing, received-order
+  label. Once words are present and capture has ended, the current request's
+  normal response completion closes that group so later clean turns stay
+  separate. Older-owner completions and photo-only background completions cannot
+  close it. Stop/recovery seals any remaining group. No new timeout or
+  reconstructed split is used.
 - Only a ready prefix receives server sequences, after Unicode-safe splitting.
   Sequenced rows remain immutable, including after a lost acknowledgment. Cold
   recovery closes old drafts before new-input admission; provider resumption

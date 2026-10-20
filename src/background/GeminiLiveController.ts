@@ -1219,8 +1219,10 @@ export class GeminiLiveController {
   private finalizeCompleteTurn(): void {
     const output = this.turnAudioDelivered ? this.outputTranscript.trim() : ""
     const audible = this.turnAudioDelivered
+    const closeUncertainGroup = this.spokenRequest !== null && !this.spokenRequest.retired &&
+      this.toolBatch.request === this.spokenRequest && (!this.toolBatch.background || audible)
     this.clearTurn()
-    this.settleSpeechDraft()
+    this.settleSpeechDraft(true, closeUncertainGroup)
     this.recordAssistantOutput(output, audible, this.outputMuted)
     this.releaseImageFence()
     this.deliveredToolResultIds.clear()
@@ -1624,6 +1626,7 @@ export class GeminiLiveController {
     if (this.spokenRequest && (!this.spokenRequest.settled || this.spokenRequest.continuing)) {
       this.spokenRequest.retired = true
       this.spokenRequest = null
+      if (this.mode === "manual") this.callbacks.onTurnComplete(true)
     }
     this.toolBatch = {request: this.spokenRequest, completed: false, continuationSent: false,
       background: !this.spokenRequest, started: false}
@@ -1670,12 +1673,14 @@ export class GeminiLiveController {
     void this.persistJournal()
   }
 
-  private settleSpeechDraft(userComplete = true): void {
+  private settleSpeechDraft(userComplete = true, closeUncertainGroup = false): void {
     const speech = this.pendingSpeechDraft()
     if (!speech) return
-    // Keep the normal boundary; a late suffix has no proven ASR end marker.
-    speech.speech!.late ||= !speech.content.trim() || (this.mode === "continuous" && this.voiceActive)
-    if (!speech.speech!.late && !speech.speech!.uncertain) {
+    // A current response bounds the group, without claiming an ASR final marker.
+    const capturing = this.mode === "continuous" && this.voiceActive
+    speech.speech!.late ||= !speech.content.trim() || capturing
+    if (speech.content.trim() && !capturing &&
+        (closeUncertainGroup || (!speech.speech!.late && !speech.speech!.uncertain))) {
       speech.content = speech.content.trim()
       speech.status = userComplete ? "complete" : "interrupted"
       speech.speech!.waiting = false

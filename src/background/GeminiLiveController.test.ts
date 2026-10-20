@@ -767,12 +767,12 @@ describe("GeminiLiveController", () => {
     }
   })
 
-  test("an incomplete fresh continuation flushes SILENT after replacement without re-execution", async () => {
+  test.each(["continuous", "manual"] as const)("%s incomplete continuation retires without output and resumes tools SILENT without re-execution", async mode => {
     const h = harness()
-    await start(h)
+    await start(h, mode)
     try {
       h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "fictional-continuation-handle"}})
-      admitRequest(h, "continuous")
+      admitRequest(h, mode)
       h.sockets[0].message({toolCall: {functionCalls: [
         {id: "completed-initial", name: "recall_memory", args: {query: "fictional first round"}},
       ]}, serverContent: {turnComplete: true}})
@@ -784,6 +784,8 @@ describe("GeminiLiveController", () => {
       await waitFor(() => h.requests.some(request => request.url.endsWith("/working-state")))
       await new Promise(resolve => setTimeout(resolve, 0))
       expect(functionResponses(h.sockets[0]).some(response => response.id === "incomplete-continuation")).toBe(false)
+      expect(h.audio).toEqual([])
+      expect(h.events.at(-1)).toBe("toolBoundary")
       h.sockets[0].close()
       await waitFor(() => h.sockets.length === 2)
       h.sockets[1].open()
@@ -793,6 +795,11 @@ describe("GeminiLiveController", () => {
       expect(functionResponses(h.sockets[1]).some(response => response.id === "completed-initial")).toBe(false)
       expect(h.requests.filter(request => request.url.endsWith("/working-state"))).toHaveLength(1)
       expect(h.requests.filter(request => request.url.endsWith("/recall"))).toHaveLength(1)
+      expect(h.events).not.toContain("interrupted")
+      if (mode === "manual") {
+        expect(h.events.at(-1)).toBe("turnComplete")
+        expect(h.events.filter(event => event === "turnComplete")).toHaveLength(1)
+      }
       expect(h.errors).toEqual([])
     } finally {
       await h.controller.stop()
@@ -911,6 +918,7 @@ describe("GeminiLiveController", () => {
       h.sockets[1].open()
       expect(JSON.parse(h.sockets[1].sent[0])).toEqual({setup: {sessionResumption: {handle: "fictional-answer-handle"}}})
       h.sockets[1].message({setupComplete: {}})
+      expect(h.events.at(-1)).toBe("toolBoundary")
       release()
       await waitFor(() => functionResponses(h.sockets[1]).some(response => response.id === "resumed-answer"))
       expect(functionResponses(h.sockets[0])).toEqual([])
@@ -1080,6 +1088,102 @@ describe("GeminiLiveController", () => {
     expect(h.errors).toEqual([])
   })
 
+  test.each(["continuous", "manual"] as const)("%s keeps uncertain overlap local, uploads clean C before Stop, and exposes missing D", async mode => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, mode)
+    try {
+      admitRequest(h, mode)
+      completeTurn(h, "Previously submitted words.", "Previously submitted answer.", true)
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/transcripts/append")))
+      const first = h.requests.find(request => request.url.endsWith("/transcripts/append"))!
+      const submitted = JSON.stringify(first.body)
+      const originals = new Map(first.body.events.map((row: any) => [row.event_id, JSON.stringify(row)]))
+      const appendCount = h.requests.filter(request => request.url.endsWith("/transcripts/append")).length
+
+      admitRequest(h, mode)
+      completeTurn(h, "", "Answer A before its transcription.")
+      admitRequest(h, mode)
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "Delayed A words. "}}})
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "B words."}}})
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(h.requests.filter(request => request.url.endsWith("/transcripts/append"))).toHaveLength(appendCount)
+      completeTurn(h, "", "Answer B at the clean native boundary.")
+
+      admitRequest(h, mode)
+      completeTurn(h, "Clean C words.", "Clean C answer.", true)
+      await waitFor(() => h.requests.some(request => request.body.events?.some((row: any) => row.content === "Clean C words.")))
+      const beforeStop = h.requests.flatMap(request => request.body.events ?? [])
+      expect(beforeStop.filter(row => row.role === "user").map(row => [row.content, row.status])).toEqual([
+        ["Previously submitted words.", "complete"],
+        ["[Turn timing uncertain; combined speech, text retained in received order.]\nDelayed A words. B words.", "complete"],
+        ["Clean C words.", "complete"],
+      ])
+      expect(h.requests.some(request => request.url.endsWith("/end"))).toBe(false)
+
+      admitRequest(h, mode)
+      completeTurn(h, "", "Answer D without its input transcription.")
+      expect(h.requests.flatMap(request => request.body.events ?? []).some(row => row.event_kind === "transcript_gap")).toBe(false)
+      await h.controller.stop()
+      const rows = h.requests.flatMap(request => request.body.events ?? [])
+      expect(rows.filter(row => row.role === "user" && row.event_kind === "transcript_gap"))
+        .toMatchObject([{content: "Transcript unavailable."}])
+      expect(rows.filter(row => row.role === "user" && row.event_kind === "transcript").map(row => row.content))
+        .toEqual(beforeStop.filter(row => row.role === "user").map(row => row.content))
+      expect(rows.filter(row => row.role === "assistant").map(row => row.content)).toEqual([
+        "Previously submitted answer.", "Answer A before its transcription.",
+        "Answer B at the clean native boundary.", "Clean C answer.", "Answer D without its input transcription.",
+      ])
+      expect(h.persistenceErrors).toContain("Some spoken words could not be transcribed")
+      expect(JSON.stringify(first.body)).toBe(submitted)
+      for (const row of rows.filter(row => originals.has(row.event_id))) {
+        expect(JSON.stringify(row)).toBe(originals.get(row.event_id))
+      }
+      expect(h.errors).toEqual([])
+    } finally {
+      await h.controller.stop()
+    }
+  })
+
+  test.each(["older-response", "background-photo"] as const)("%s completion after B END cannot seal an uncertain speech group", async boundary => {
+    const storage = new FakeStorage()
+    const h = harness({storage})
+    await start(h)
+    try {
+      admitRequest(h, "continuous")
+      if (boundary === "older-response") {
+        h.sockets[0].message({serverContent: {
+          inputTranscription: {text: "A words. "}, outputTranscription: {text: "An older A response."},
+          modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
+        }})
+      } else {
+        completeTurn(h, "", "A response before its transcription.")
+        await h.controller.sendImage({imageId: "non-speech-boundary", mimeType: "image/png", data: "AQID"})
+      }
+      admitRequest(h, "continuous")
+      if (boundary === "background-photo") {
+        h.sockets[0].message({serverContent: {inputTranscription: {text: "A words. "}}})
+      }
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "B words."}}})
+      if (boundary === "background-photo") {
+        saveCaption(h.sockets[0], "non-speech-boundary", "A fictional amber star.")
+        await waitFor(() => h.finalizations.length === 1)
+      }
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+      const drafts = JSON.parse(storage.values.get(JOURNAL_KEY)!).draftTranscripts
+      expect(drafts[0]).toMatchObject({content: "A words. B words.", speech: {waiting: true, uncertain: true, ended: true}})
+      await h.controller.stop()
+      const rows = h.requests.flatMap(request => request.body.events ?? [])
+      expect(rows.filter(row => row.role === "user" && row.event_kind === "transcript").map(row => row.content))
+        .toEqual(["[Turn timing uncertain; combined speech, text retained in received order.]\nA words. B words."])
+      expect(rows.some(row => row.event_kind === "transcript_gap")).toBe(false)
+      expect(h.errors).toEqual([])
+    } finally {
+      await h.controller.stop()
+    }
+  })
+
   test("a lost append ACK and later ambiguous draft never change previously submitted events", async () => {
     const storage = new FakeStorage()
     const options = {storage, appendAckLost: true}
@@ -1090,12 +1194,14 @@ describe("GeminiLiveController", () => {
     const first = h.requests.find(request => request.url.endsWith("/transcripts/append"))!
     const submitted = JSON.stringify(first.body)
     const originals = new Map(first.body.events.map((event: any) => [event.event_id, JSON.stringify(event)]))
-    for (const text of ["Delayed first. ", "Delayed second."]) {
+    for (const [index, text] of ["Delayed first. ", "Delayed second."].entries()) {
       h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
       h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
-      h.sockets[0].message({serverContent: {outputTranscription: {text: "Later answer."},
-        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+      const reply = {serverContent: {outputTranscription: {text: "Later answer."},
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}}
+      if (index === 0) h.sockets[0].message(reply)
       h.sockets[0].message({serverContent: {inputTranscription: {text}}})
+      if (index === 1) h.sockets[0].message(reply)
     }
     await waitFor(() => h.requests.filter(request => request.url.endsWith("/transcripts/append")).length >= 2)
     options.appendAckLost = false
@@ -1275,12 +1381,14 @@ describe("GeminiLiveController", () => {
     const fragments = ["a" + " ".repeat(16_001), "\u{1f642}".repeat(16_001) + " z"]
     const h = harness({storage: new FakeStorage()})
     await start(h)
-    for (const text of fragments) {
+    for (const [index, text] of fragments.entries()) {
       h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
       h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
-      h.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional answer."},
-        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+      const reply = {serverContent: {outputTranscription: {text: "A fictional answer."},
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}}
+      if (index === 0) h.sockets[0].message(reply)
       h.sockets[0].message({serverContent: {inputTranscription: {text}}})
+      if (index === 1) h.sockets[0].message(reply)
     }
     await h.controller.stop()
     const rows = h.requests.flatMap(request => request.body.events ?? [])
