@@ -49,6 +49,7 @@ class FakeLive {
   startGate: Promise<void> | null = null
   stopGate: Promise<void> | null = null
   audioOnStop = false
+  outputMuted = false
   persistenceOnStop: string | null = null
 
   constructor(readonly callbacks: GeminiCallbacks) {}
@@ -88,6 +89,10 @@ class FakeLive {
     if (graceful && this.audioOnStop) this.callbacks.onAudio(silentPcm())
     if (this.persistenceOnStop) this.callbacks.onPersistenceError(this.persistenceOnStop)
     if (this.stopGate) await this.stopGate
+  }
+
+  muteForStop(): void {
+    this.outputMuted = true
   }
 
   audio(data = silentPcm()): void {
@@ -1959,6 +1964,8 @@ describe("SessionController", () => {
 
     harness.live.fail("provider failed")
     await Promise.resolve()
+    expect(harness.live.outputMuted).toBe(true)
+    expect(harness.live.stops).toBe(0)
     const stop = harness.session.handlers["openalma:stop"]({})
     release()
     await stop

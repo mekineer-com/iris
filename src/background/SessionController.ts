@@ -547,6 +547,7 @@ export class SessionController {
   }
 
   private beginTeardown(kind: "stop" | "fail"): number {
+    this.liveController?.muteForStop()
     this.connection = "stopping"
     this.teardownKind = kind
     this.startGeneration += 1

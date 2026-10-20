@@ -4,20 +4,21 @@ Read this before changing `GeminiLiveController.ts` or diagnosing a Gemini
 socket failure. This is the local contract for Iris, not a copy of all Gemini
 documentation.
 
-Last verified against Google's official documentation: 2026-08-31.
+Documentation snapshots and fictional-provider observations: 2026-10-20.
 
 Source migration in progress, 2026-10-20: MCP now returns `v1beta` and Iris
 requires that constrained socket; token minting stays on `v1alpha/auth_tokens`.
 The unsupported proactivity setting and its constraint-mask entry are removed.
 These seams follow the Gemini 3.8 provider checks in `PLAN_iris_gemini38.md`.
-No model/configuration cutover has occurred. The remaining sections describe
-the earlier 2.5 contract until Slice 3's caption and settlement repairs land;
-the current source is not a release-ready migration.
+No model/configuration cutover has occurred. Photo/tool plumbing is implemented;
+speech settlement and requested-answer continuation are still incomplete.
+The current source is not a release-ready migration.
 
-## Pinned Runtime
+## Source Contract
 
-- Model: `gemini-2.5-flash-native-audio-preview-12-2025`
-- API: `v1alpha`
+- Target model: `gemini-3.8-live`; installed model settings stay unchanged until
+  coordinated acceptance/cutover in Slice 5.
+- Socket API: `v1beta`; token minting: `v1alpha/auth_tokens`.
 - Method: `BidiGenerateContentConstrained`
 - Input audio: 16 kHz PCM
 - Output audio: 24 kHz PCM
@@ -62,33 +63,44 @@ Because setup includes `sessionResumption`, Gemini may send:
 Keep only a non-empty `newHandle` when `resumable` is true. A false update
 clears the handle. The handle is provider state, never transcript content.
 
-### Deliberate image turn
+### Internal photo task
 
-Iris durably snapshots the image in OpenAlma before sending; snapshot upload and replay each allow 120 seconds:
+Iris snapshots the original in OpenAlma before provider delivery; upload and
+replay each allow 120 seconds. Between spoken turns it sends these two messages:
 
 ```json
 {
-  "clientContent": {
-    "turns": [{
-      "role": "user",
-      "parts": [
-        {"inlineData": {"data": "<base64>", "mimeType": "image/jpeg"}},
-        {"text": "Describe this image.  What do you want to remember about it?"}
-      ]
-    }],
-    "turnComplete": true
+  "realtimeInput": {
+    "video": {"data": "<base64>", "mimeType": "image/jpeg"}
   }
 }
 ```
 
-Per the API reference, `clientContent` is appended to conversation history and
-interrupts current model generation. `turnComplete: true` asks Gemini to begin
-its response. Iris sends the photo immediately; if another turn was active, it
-keeps that turn from becoming the photo caption. This is not silent context injection.
+The second message is `realtimeInput.text`, containing `image_id: <id>` and
+`PHOTO_CAPTION_INSTRUCTION`, the exact Marcos-approved wording. JPEG and PNG
+remain native inputs. Caption content comes only from `save_photo_caption`,
+never from a nearby answer or output transcription. Its `photo_caption` event
+carries the original's `media_ref` and has no spoken-transcript status.
+
+The existing append and snapshot-finalize routes acknowledge durable server
+ownership before the tool returns success or Iris clears its journal. Extraction
+continues independently; later transcript saves do not wait for it. Replays
+inspect the server filing receipt before requesting another caption, even after
+provider resumption. A different photo cannot implicitly discard pending work.
+An optional spoken description remains separate from this internal caption.
+
+Normal Stop mutes provider output before callbacks and retains the socket/lease
+for an eight-second caption handoff window. Continuous Stop flushes existing
+audio with 1.8 seconds of real-time-paced silence and `audioStreamEnd`; Manual
+Stop does not send an unsent take. An already-delivered task is not resent merely
+because Stop was pressed. Timeout is logged and retains recovery state. Optional
+reflection follows handoff, outside that caption deadline; its text can settle at
+`generationComplete` rather than waiting for delayed playback completion.
 
 ### Completion and connection rotation
 
-- `serverContent.turnComplete: true` closes the semantic turn.
+- `serverContent.turnComplete: true` closes response generation, not input
+  transcription ownership. The old ordinary-speech settlement still needs repair.
 - `serverContent.generationComplete: true` means generation has finished; it is
   not a replacement for `turnComplete` in Iris transcript finalization.
 - `goAway.timeLeft` announces a provider disconnect deadline. Iris rotates
@@ -99,6 +111,8 @@ keeps that turn from becoming the photo caption. This is not silent context inje
   to classify a provider rejection, lease expiry, or network loss.
 
 ## Behavior Proven On Gemini 2.5
+
+Historical evidence, not the current source's photo protocol:
 
 - `clientContent` with inline image and `turnComplete: true` reaches Gemini and
   produces an image description.
@@ -122,6 +136,13 @@ The last two results are why original-byte silent re-seeing remains deferred.
 Captions supplement visual embeddings; they do not prove Gemini re-saw bytes.
 
 ## Local Evidence
+
+Workspace evidence for 3.8 is in `PLAN_iris_gemini38.md` and
+`_research/gemini-3.8-live/`. Slice 2 established caption feasibility. The
+Slice 3 native-signal check observed speech activity events in both modes but
+no input transcript offsets/IDs; it did not exercise late-input overlap, photo
+handoff, interruption, reconnect or production Manual framing. Source tests and
+provider/phone acceptance remain distinct.
 
 - Image and resumption unit contract:
   `src/background/GeminiLiveController.test.ts`

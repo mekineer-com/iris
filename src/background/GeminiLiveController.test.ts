@@ -1,6 +1,6 @@
 import {describe, expect, spyOn, test} from "bun:test"
 
-import {GeminiLiveController, JOURNAL_KEY, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
+import {GeminiLiveController, JOURNAL_KEY, PHOTO_CAPTION_INSTRUCTION, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {PHOTO_RETRY_MESSAGE} from "../shared/types"
 
@@ -86,6 +86,7 @@ function harness(
     config?: OpenAlmaConfig
     heartbeatMs?: number
     setupTimeoutMs?: number
+    photoDrainTimeoutMs?: number
     heartbeatStatus?: number
     heartbeatThrows?: boolean
     heartbeatBody?: unknown
@@ -101,7 +102,7 @@ function harness(
     appendStatuses?: number[]
     appendGates?: Promise<void>[]
     appendAckLost?: boolean
-    history?: Array<{event_id: string; role: string; event_kind: string; content: string; mic_source?: string}>
+    history?: Array<{event_id: string; role: string; event_kind: string; content: string; mic_source?: string; media_ref?: string; status?: string}>
     snapshotStatus?: number
     snapshotThrows?: boolean
     snapshotGate?: Promise<void>
@@ -221,7 +222,8 @@ function harness(
       if (finalizeGates.length) await finalizeGates.shift()
       if (options.history) {
         const saved = options.history.some((event) => event.event_id === body.caption_event_id &&
-          event.role === "assistant" && event.event_kind === "transcript" && event.content === body.caption)
+          event.role === "assistant" && event.event_kind === "photo_caption" && event.content === body.caption &&
+          event.media_ref === `mentra_media/test-phone/${body.image_id}.png` && event.status === undefined)
         const result = saved ? {ok: true, durable: true, queued: true} : {ok: true, queued: false, discarded: true}
         finalizations.push(result)
         return Response.json(result)
@@ -273,6 +275,7 @@ function harness(
       },
       heartbeatMs: options.heartbeatMs,
       setupTimeoutMs: options.setupTimeoutMs,
+      photoDrainTimeoutMs: options.photoDrainTimeoutMs ?? 25,
       storage: options.storage,
     },
   )
@@ -302,6 +305,10 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   expect(predicate()).toBe(true)
 }
 
+function saveCaption(socket: FakeSocket, imageId: string, caption: string, id = `caption-${imageId}`): void {
+  socket.message({toolCall: {functionCalls: [{id, name: "save_photo_caption", args: {image_id: imageId, caption}}]}})
+}
+
 async function start(h: ReturnType<typeof harness>, mode: "continuous" | "manual" = "continuous"): Promise<void> {
   const starting = h.controller.start(mode)
   await waitFor(() => h.sockets.length === 1)
@@ -316,6 +323,7 @@ function completeTurn(h: ReturnType<typeof harness>, input = "hello", output = "
     serverContent: {
       inputTranscription: {text: input},
       outputTranscription: {text: output},
+      ...(output.trim() ? {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}} : {}),
       turnComplete: true,
     },
   })
@@ -378,18 +386,18 @@ describe("GeminiLiveController", () => {
       mime_type: "image/png",
       data: "AQID",
     })
-    expect(JSON.parse(h.sockets[0].sent.at(-1)!)).toEqual({
-      clientContent: {
-        turns: [{role: "user", parts: [
-          {inlineData: {data: "AQID", mimeType: "image/png"}},
-          {text: "Describe this image.  What do you want to remember about it?"},
-        ]}],
-        turnComplete: true,
-      },
-    })
+    expect(h.sockets[0].sent.slice(-2).map(value => JSON.parse(value))).toEqual([
+      {realtimeInput: {video: {data: "AQID", mimeType: "image/png"}}},
+      {realtimeInput: {text: `image_id: image-1\n${PHOTO_CAPTION_INSTRUCTION}`}},
+    ])
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
 
-    h.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional blue square."}, turnComplete: true}})
+    saveCaption(h.sockets[0], "image-1", "A fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
+    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
+    expect(h.sockets[0].sent.flatMap(value => JSON.parse(value).toolResponse?.functionResponses ?? []))
+      .toContainEqual({id: "caption-image-1", name: "save_photo_caption",
+        response: {ok: true, durable: true}, scheduling: "SILENT"})
     const appended = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
       .flatMap((request) => request.body.events)
     expect(appended).toContainEqual({
@@ -403,10 +411,10 @@ describe("GeminiLiveController", () => {
     expect(appended).toContainEqual({
       event_id: "sitting-1:42",
       sequence: 42,
-      event_kind: "transcript",
+      event_kind: "photo_caption",
       role: "assistant",
       content: "A fictional blue square.",
-      status: "complete",
+      media_ref: "mentra_media/test-phone/image-1.png",
     })
     expect(h.requests.find((request) => request.url.endsWith("/snapshot/finalize"))?.body).toEqual({
       user_id: "Test User",
@@ -430,9 +438,7 @@ describe("GeminiLiveController", () => {
       })
       await start(h)
       await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
-      h.sockets[0].message({serverContent: {
-        outputTranscription: {text: "A fictional blue square."}, turnComplete: true,
-      }})
+      saveCaption(h.sockets[0], "image-1", "A fictional blue square.")
       await h.controller.stop()
       const journal = JSON.parse(storage.values.get("openalma:gemini-session-v1")!)
       expect(journal.pendingImage.assistantSequence).toBe(42)
@@ -488,7 +494,131 @@ describe("GeminiLiveController", () => {
     }
   })
 
-  test("mutes photo descriptions by default and allows explicit playback", async () => {
+  test("caption tools bind the scoped original and never overwrite accepted same-ID captions", async () => {
+    const storage = new FakeStorage()
+    const history: NonNullable<Parameters<typeof harness>[0]>["history"] = []
+    const config = {...CONFIG, soulId: "Another Test Soul"}
+    const h = harness({storage, history, config})
+    await start(h)
+    await h.controller.sendImage({imageId: "square", mimeType: "image/png", data: "AQID"})
+    saveCaption(h.sockets[0], "wrong-original", "A fictional red triangle.", "wrong-image")
+    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
+    expect(history.filter(event => event.event_kind === "photo_caption")).toEqual([])
+    expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    const results = () => h.sockets[0].sent.flatMap(value => JSON.parse(value).toolResponse?.functionResponses ?? [])
+    let release!: () => void
+    storage.setGate = new Promise<void>(resolve => { release = resolve })
+    const writes = storage.setCalls
+    try {
+      saveCaption(h.sockets[0], "square", "A fictional blue square.", "first-caption")
+      await waitFor(() => storage.setCalls > writes)
+      saveCaption(h.sockets[0], "square", "A fictional blue square.", "concurrent-caption")
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(results().some(result => ["first-caption", "concurrent-caption"].includes(result.id))).toBe(false)
+      expect(history.filter(event => event.event_kind === "photo_caption")).toEqual([])
+      expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    } finally {
+      storage.setGate = null
+      release()
+    }
+    await waitFor(() => results().filter(result => ["first-caption", "concurrent-caption"].includes(result.id)).length === 2)
+    for (const id of ["first-caption", "concurrent-caption"]) {
+      expect(results().find(result => result.id === id)).toMatchObject({response: {ok: true, durable: true}, scheduling: "SILENT"})
+    }
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot/finalize"))).toHaveLength(1)
+    const accepted = history.filter(event => event.event_kind === "photo_caption")
+    expect(accepted).toHaveLength(1)
+    expect(accepted[0]).toMatchObject({role: "assistant", content: "A fictional blue square.",
+      media_ref: "mentra_media/test-phone/square.png"})
+    expect(accepted[0]).not.toHaveProperty("status")
+    const requestCount = h.requests.length
+    saveCaption(h.sockets[0], "square", "A fictional blue square.", "same-caption")
+    saveCaption(h.sockets[0], "square", "A fictional red triangle.", "conflicting-caption")
+    await waitFor(() => results().some(result => result.id === "conflicting-caption"))
+    expect(results().find(result => result.id === "same-caption")).toMatchObject({
+      response: {ok: true, durable: true}, scheduling: "SILENT",
+    })
+    expect(results().find(result => result.id === "conflicting-caption")).toMatchObject({
+      response: {ok: false, durable: false, status: "conflict"}, scheduling: "SILENT",
+    })
+    expect(h.requests).toHaveLength(requestCount)
+    expect(history.filter(event => event.event_kind === "photo_caption")).toEqual(accepted)
+    await h.controller.sendImage({imageId: "triangle", mimeType: "image/png", data: "BAUG"})
+    saveCaption(h.sockets[0], "triangle", "A fictional red triangle.", "second-photo")
+    await waitFor(() => results().some(result => result.id === "second-photo"))
+    expect(history.filter(event => event.event_kind === "photo_caption").map(event => [event.media_ref, event.content]))
+      .toEqual([["mentra_media/test-phone/square.png", "A fictional blue square."],
+        ["mentra_media/test-phone/triangle.png", "A fictional red triangle."]])
+    const filings = h.requests.filter(request => request.url.endsWith("/snapshot/finalize"))
+    expect(filings).toHaveLength(2)
+    expect(filings.every(request => request.body.user_id === config.userId && request.body.soul_id === config.soulId)).toBe(true)
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test.each(["queued", "running", "complete", "failed", "discarded"])(
+    "cold recovery reuses the accepted %s receipt without recaption or refiling", async status => {
+      const storage = new FakeStorage()
+      storage.values.set(JOURNAL_KEY, JSON.stringify({version: 1,
+        scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+        resumption: null, pendingTranscripts: [], pendingImage: {
+          imageId: "receipt-photo", mediaRef: "mentra_media/test-phone/receipt-photo.png",
+          providerSent: true, captureAfterCurrent: false, generation: 1, sessionId: "old-sitting",
+        }}))
+      const h = harness({storage, replayBodies: [{mime_type: "image/png", data: "AQID",
+        media_ref: "mentra_media/test-phone/receipt-photo.png", filing: {
+          caption: "A fictional amber star.", caption_event_id: "old-sitting:42", status,
+        }}]})
+      await start(h)
+      await waitFor(() => storage.values.get(JOURNAL_KEY) === "")
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay"))).toHaveLength(1)
+      expect(h.requests.some(request => /\/(finalize|retry|append)$/.test(request.url))).toBe(false)
+      expect(h.sockets[0].sent.map(value => JSON.parse(value))).toEqual([{setup: {sessionResumption: {}}}])
+      saveCaption(h.sockets[0], "receipt-photo", "A fictional amber star.", "recovered-duplicate")
+      await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
+      const result = h.sockets[0].sent.flatMap(value => JSON.parse(value).toolResponse?.functionResponses ?? [])
+      expect(result[0]).toMatchObject({response: {ok: true, durable: true}, scheduling: "SILENT"})
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay"))).toHaveLength(1)
+      expect(h.errors).toEqual([])
+      await h.controller.stop()
+    },
+  )
+
+  test.each([false, true])("a cold duplicate tool call checks its receipt before saving (conflict=%s)", async conflict => {
+    const h = harness({storage: new FakeStorage(), replayBodies: [{filing: {
+      caption: "A fictional amber star.", caption_event_id: "old-sitting:42", status: "complete",
+    }}]})
+    await start(h)
+    saveCaption(h.sockets[0], "receipt-photo", conflict ? "A different fictional scene." : "A fictional amber star.")
+    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
+    const result = h.sockets[0].sent.flatMap(value => JSON.parse(value).toolResponse?.functionResponses ?? [])[0]
+    expect(result.response).toEqual(conflict ? {ok: false, durable: false, status: "conflict"} : {ok: true, durable: true})
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay"))).toHaveLength(1)
+    expect(h.requests.some(request => /\/(snapshot|finalize|append)$/.test(request.url))).toBe(false)
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput)).toBe(false)
+    await h.controller.stop()
+  })
+
+  test.each([503, 401, 403, 409])("receipt lookup failure %i is not an invalid photo", async status => {
+    const h = harness({storage: new FakeStorage(), replayStatuses: [status]})
+    await start(h)
+    saveCaption(h.sockets[0], "receipt-photo", "A fictional amber star.")
+    const results = () => h.sockets[0].sent.flatMap(value => JSON.parse(value).toolResponse?.functionResponses ?? [])
+    await waitFor(() => results().length > 0 || h.errors.length > 0)
+    if (status === 503) {
+      expect(results()[0]).toMatchObject({response: {ok: false, status: "unavailable"}, scheduling: "SILENT"})
+      expect(h.errors).toEqual([])
+    } else {
+      expect(results()).toEqual([])
+      expect(h.errors).toEqual([`OpenAlma photo filing lookup failed (${status})`])
+    }
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay"))).toHaveLength(1)
+    expect(h.requests.some(request => /\/(snapshot|finalize|append)$/.test(request.url))).toBe(false)
+    await h.controller.stop()
+  })
+
+  test("saves internal perception silently and requests optional spoken description separately", async () => {
     for (const speakDescription of [false, true]) {
       const h = harness({storage: new FakeStorage()})
       await start(h)
@@ -498,16 +628,109 @@ describe("GeminiLiveController", () => {
         data: "AQID",
         speakDescription,
       })
-      h.sockets[0].message({serverContent: {
-        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
-        outputTranscription: {text: "A fictional blue square."},
-        turnComplete: true,
-      }})
+      expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
+      saveCaption(h.sockets[0], `image-${speakDescription}`, "A fictional blue square.")
+      h.sockets[0].message({serverContent: {turnComplete: true}})
       await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
-
+      await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
+      expect(h.audio).toEqual([])
+      expect(h.sockets[0].sent.filter(value => JSON.parse(value).clientContent)).toHaveLength(speakDescription ? 1 : 0)
+      if (speakDescription) h.sockets[0].message({serverContent: {
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
+        outputTranscription: {text: "Here is my spoken description."}, turnComplete: true,
+      }})
       expect(h.audio).toEqual(speakDescription ? ["AAAAAA=="] : [])
       await h.controller.stop()
     }
+  })
+
+  test.each([false, true])("an uncached receipt for A leaves pending photo B untouched (conflict=%s)", async conflict => {
+    const storage = new FakeStorage()
+    const history: NonNullable<Parameters<typeof harness>[0]>["history"] = []
+    const h = harness({storage, history, replayBodies: [{filing: {
+      caption: "A fictional amber star.", caption_event_id: "old-sitting:42", status: "complete",
+    }}]})
+    await start(h)
+    await h.controller.sendImage({imageId: "photo-b", mimeType: "image/png", data: "BAUG"})
+    await waitFor(() => history.some(event => event.event_kind === "image"))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const pendingB = JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage
+    saveCaption(h.sockets[0], "photo-a", conflict ? "A different fictional scene." : "A fictional amber star.", "duplicate-a")
+    const results = () => h.sockets[0].sent.flatMap(value => JSON.parse(value).toolResponse?.functionResponses ?? [])
+    await waitFor(() => results().some(result => result.id === "duplicate-a"))
+    expect(results().find(result => result.id === "duplicate-a").response)
+      .toEqual(conflict ? {ok: false, durable: false, status: "conflict"} : {ok: true, durable: true})
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay")).map(request => request.body))
+      .toEqual([{user_id: CONFIG.userId, soul_id: CONFIG.soulId, image_id: "photo-a"}])
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage).toEqual(pendingB)
+    expect(history.filter(event => event.event_kind === "photo_caption")).toEqual([])
+    expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
+    saveCaption(h.sockets[0], "photo-b", "A fictional blue triangle.", "caption-b")
+    await waitFor(() => results().some(result => result.id === "caption-b"))
+    expect(history.filter(event => event.event_kind === "photo_caption").map(event => [event.media_ref, event.content]))
+      .toEqual([["mentra_media/test-phone/photo-b.png", "A fictional blue triangle."]])
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot/finalize")).map(request => request.body.image_id))
+      .toEqual(["photo-b"])
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("durable caption handoff during the paced Continuous flush completes without a stale owner access", async () => {
+    const storage = new FakeStorage()
+    const h = harness({storage, photoDrainTimeoutMs: 2_500})
+    await start(h)
+    h.controller.sendAudio("AAAA")
+    await h.controller.sendImage({imageId: "midflush-photo", mimeType: "image/png", data: "AQID"})
+    const audioFrames = () => h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.audio)
+    const before = audioFrames().length
+    const stopping = h.controller.stop(true)
+    await waitFor(() => audioFrames().length > before)
+    saveCaption(h.sockets[0], "midflush-photo", "A fictional green notebook.")
+    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
+    expect(storage.values.get(JOURNAL_KEY)).toBe("")
+    expect(h.requests.some(request => request.url.endsWith("/end"))).toBe(false)
+    await stopping
+    expect(audioFrames()).toHaveLength(before + 18)
+    expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.audioStreamEnd)).toHaveLength(1)
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot/finalize"))).toHaveLength(1)
+    expect(h.photoRetryChanges).not.toContain(true)
+    expect(h.audio).toEqual([])
+    expect(h.errors).toEqual([])
+    expect(storage.values.get(JOURNAL_KEY)).toBe("")
+  })
+
+  test("Stop stays muted while timeout recovery is blocked on local storage", async () => {
+    const storage = new FakeStorage()
+    const h = harness({storage, photoDrainTimeoutMs: 5})
+    await start(h)
+    await h.controller.sendImage({imageId: "timeout-photo", mimeType: "image/png", data: "AQID"})
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/transcripts/append")))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    h.controller.muteForStop()
+    h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
+    expect(h.audio).toEqual([])
+    let release!: () => void
+    storage.setGate = new Promise<void>(resolve => { release = resolve })
+    const before = storage.setCalls
+    const stopping = h.controller.stop(true)
+    try {
+      await waitFor(() => storage.setCalls > before && h.photoRetryChanges.at(-1) === true)
+      expect(h.requests.some(request => request.url.endsWith("/end"))).toBe(false)
+      h.sockets[0].message({serverContent: {
+        modelTurn: {parts: [{inlineData: {data: "AQEBAQ=="}}]},
+        outputTranscription: {text: "Unheard timeout cleanup output."},
+      }})
+      expect(h.audio).toEqual([])
+      expect(h.errors).toEqual([])
+    } finally {
+      storage.setGate = null
+      release()
+      await stopping
+    }
+    expect(h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events).some(event => event.content === "Unheard timeout cleanup output.")).toBe(false)
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe("timeout-photo")
   })
 
   test("a silent photo does not mute the answer already in progress", async () => {
@@ -515,7 +738,7 @@ describe("GeminiLiveController", () => {
     await start(h)
     h.sockets[0].message({serverContent: {
       inputTranscription: {text: "Current question."},
-      outputTranscription: {text: "Current answer."},
+      outputTranscription: {text: "Current answer."}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
     }})
     await h.controller.sendImage({imageId: "image-queued", mimeType: "image/png", data: "AQID"})
     h.sockets[0].message({serverContent: {
@@ -523,14 +746,11 @@ describe("GeminiLiveController", () => {
       outputTranscription: {text: "Current answer finished."},
       turnComplete: true,
     }})
-    h.sockets[0].message({serverContent: {
-      modelTurn: {parts: [{inlineData: {data: "AQEBAQ=="}}]},
-      outputTranscription: {text: "A fictional blue square."},
-      turnComplete: true,
-    }})
+    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
+    saveCaption(h.sockets[0], "image-queued", "A fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
 
-    expect(h.audio).toEqual(["AAAAAA=="])
+    expect(h.audio).toEqual(["AAAAAA==", "AAAAAA=="])
     await h.controller.stop()
   })
 
@@ -549,7 +769,7 @@ describe("GeminiLiveController", () => {
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
     expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(2)
     expect(h.requests.some(request => request.url.endsWith("/snapshot/replay"))).toBe(false)
-    expect(h.sockets[0].sent).toHaveLength(2)
+    expect(h.sockets[0].sent).toHaveLength(3)
     await h.controller.stop()
   })
 
@@ -561,13 +781,23 @@ describe("GeminiLiveController", () => {
     const image = {imageId: "uncertain-photo", mimeType: "image/png" as const, data: "AQID"}
     await expect(h.controller.sendImage(image)).rejects.toThrow("acknowledgment lost")
     expect(h.photoRetryChanges.at(-1)).not.toBe(true)
+    const uncertain = options.storage.values.get(JOURNAL_KEY)
+    await expect(h.controller.sendImage({...image, imageId: "different-photo"}))
+      .rejects.toThrow("Another photo is still pending")
+    expect(options.storage.values.get(JOURNAL_KEY)).toBe(uncertain)
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
     options.snapshotThrows = false
     options.snapshotStatus = 503
     await expect(h.controller.sendImage(image)).rejects.toThrow("snapshot failed (503)")
     expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe(image.imageId)
+    const unknown = storage.values.get(JOURNAL_KEY)
+    await expect(h.controller.sendImage({...image, imageId: "different-photo"}))
+      .rejects.toThrow("Another photo is still pending")
+    expect(storage.values.get(JOURNAL_KEY)).toBe(unknown)
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(2)
     options.snapshotStatus = 200
     await h.controller.sendImage(image)
-    expect(h.sockets[0].sent.filter(value => JSON.parse(value).clientContent)).toHaveLength(1)
+    expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
     expect(h.requests.some(request => request.url.endsWith("/snapshot/replay"))).toBe(false)
     await h.controller.stop()
   })
@@ -581,25 +811,35 @@ describe("GeminiLiveController", () => {
     h.sockets[0].failAtSendCount = null
     await h.controller.sendImage(image)
     expect(h.requests.filter((request) => request.url.endsWith("/snapshot"))).toHaveLength(2)
-    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
+    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
     await h.controller.stop()
   })
 
-  test("allows a retake after provider send failure", async () => {
-    const h = harness({storage: new FakeStorage()})
+  test("requires explicit Discard before a retake replaces an accepted provider-send failure", async () => {
+    const storage = new FakeStorage()
+    const h = harness({storage})
     await start(h)
     h.sockets[0].failAtSendCount = 1
     await expect(h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"}))
       .rejects.toThrow("Gemini image send failed")
+    expect(h.photoRetryChanges.at(-1)).toBe(true)
+    const retained = storage.values.get(JOURNAL_KEY)
 
     h.sockets[0].failAtSendCount = null
+    await expect(h.controller.sendImage({imageId: "image-2", mimeType: "image/png", data: "AQID"}))
+      .rejects.toThrow("Another photo is still pending")
+    expect(storage.values.get(JOURNAL_KEY)).toBe(retained)
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
+    expect(h.photoRetryChanges.at(-1)).toBe(true)
+    await h.controller.discardImage()
+    expect(storage.values.get(JOURNAL_KEY)).toBe("")
     await h.controller.sendImage({imageId: "image-2", mimeType: "image/png", data: "AQID"})
 
-    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
+    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
     await h.controller.stop()
   })
 
-  test("replacing an unsent retry clears its projected actions", async () => {
+  test("a retained unsent retry must be explicitly discarded before replacement clears its actions", async () => {
     const storage = new FakeStorage()
     storage.values.set("openalma:gemini-session-v1", JSON.stringify({
       version: 1,
@@ -619,6 +859,15 @@ describe("GeminiLiveController", () => {
     await start(h)
     await waitFor(() => h.photoRetryChanges.at(-1) === true)
 
+    const retained = storage.values.get(JOURNAL_KEY)
+    await expect(h.controller.sendImage({imageId: "image-2", mimeType: "image/png", data: "AQID"}))
+      .rejects.toThrow("Another photo is still pending")
+    expect(storage.values.get(JOURNAL_KEY)).toBe(retained)
+    expect(h.photoRetryChanges.at(-1)).toBe(true)
+    expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+    await h.controller.discardImage()
+    expect(storage.values.get(JOURNAL_KEY)).toBe("")
+    expect(h.photoRetryChanges.at(-1)).toBe(false)
     await h.controller.sendImage({imageId: "image-2", mimeType: "image/png", data: "AQID"})
 
     expect(h.photoRetryChanges.at(-1)).toBe(false)
@@ -654,7 +903,7 @@ describe("GeminiLiveController", () => {
     expect(h.persistenceErrors.at(-1)).toContain("Photo may have been saved")
     release()
     await expect(sending).rejects.toThrow("Photo send cancelled")
-    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(0)
+    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(0)
 
     for (const [status, body] of [
       [404, null],
@@ -666,7 +915,7 @@ describe("GeminiLiveController", () => {
       const seed = harness({storage})
       await start(seed)
       await seed.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
-      await seed.controller.stop()
+      await seed.controller.stop(true)
 
       let finishReplay!: () => void
       const replayGate = new Promise<void>((resolve) => { finishReplay = resolve })
@@ -701,7 +950,7 @@ describe("GeminiLiveController", () => {
       expect(storage.values.get("openalma:gemini-session-v1")).toBe(journal)
       expect([old.photoRetryChanges.length, old.persistenceErrors.length, old.errors.length]).toEqual(callbacks)
       expect(old.errors).toEqual([])
-      expect(old.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(0)
+      expect(old.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(0)
       await replacement.controller.stop()
     }
   })
@@ -730,6 +979,12 @@ describe("GeminiLiveController", () => {
       lease_seconds: 90, session_warning_seconds: 0,
     }})
     await start(replacement)
+    const retained = storage.values.get(JOURNAL_KEY)
+    await expect(replacement.controller.sendImage({imageId: "replacement-photo", mimeType: "image/png", data: "AQID"}))
+      .rejects.toThrow("Another photo is still pending")
+    expect(storage.values.get(JOURNAL_KEY)).toBe(retained)
+    expect(replacement.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+    await replacement.controller.discardImage()
     await replacement.controller.sendImage({imageId: "replacement-photo", mimeType: "image/png", data: "AQID"})
     completeTurn(replacement, "A fictional replacement question.", "A fictional replacement caption.")
     await waitFor(() => replacement.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
@@ -749,7 +1004,7 @@ describe("GeminiLiveController", () => {
     expect([replacement.photoRetryChanges.length, replacement.persistenceErrors.length,
       replacement.errors.length]).toEqual(replacementCallbacks)
     expect(old.requests).toHaveLength(requests)
-    expect(old.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(0)
+    expect(old.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(0)
     await replacement.controller.stop()
   })
 
@@ -763,6 +1018,9 @@ describe("GeminiLiveController", () => {
     h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
     const sending = h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot")))
+    await expect(h.controller.sendImage({imageId: "overlapping-photo", mimeType: "image/png", data: "BAUG"}))
+      .rejects.toThrow("Wait for the current photo upload to finish")
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
     h.sockets[0].close()
     await waitFor(() => h.sockets.length === 2)
     h.sockets[1].open()
@@ -770,7 +1028,7 @@ describe("GeminiLiveController", () => {
     release()
     await sending
 
-    expect(h.sockets[1].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
+    expect(h.sockets[1].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
     expect(h.errors).toEqual([])
     await h.controller.stop()
   })
@@ -804,7 +1062,7 @@ describe("GeminiLiveController", () => {
     release()
     await expect(sending).rejects.toThrow("Photo send cancelled")
 
-    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(0)
+    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(0)
     await h.controller.stop()
   })
 
@@ -848,9 +1106,9 @@ describe("GeminiLiveController", () => {
     h.sockets[1].message({setupComplete: {}})
     release()
     await sending
-    await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).clientContent))
+    await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).realtimeInput?.video))
 
-    expect(h.sockets[1].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
+    expect(h.sockets[1].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
     await h.controller.stop()
   })
 
@@ -869,15 +1127,16 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.requests.filter((request) => request.url.endsWith("/transcripts/append")).length === 1)
     releaseImage()
     await new Promise((resolve) => setTimeout(resolve, 0))
-    h.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional blue square."}, turnComplete: true}})
+    saveCaption(h.sockets[0], "image-1", "A fictional blue square.")
     await waitFor(() => h.requests.filter((request) => request.url.endsWith("/transcripts/append")).length === 2)
     expect(h.requests.some((request) => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).toolResponse)).toBe(false)
     releaseCaption()
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
     await h.controller.stop()
   })
 
-  test("uses the image response as its caption when the user also asks a question", async () => {
+  test("keeps the spoken answer separate from the explicit photo perception", async () => {
     const h = harness({storage: new FakeStorage()})
     await start(h)
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
@@ -887,10 +1146,12 @@ describe("GeminiLiveController", () => {
       outputTranscription: {text: "I see a fictional blue square."},
       turnComplete: true,
     }})
+    expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    saveCaption(h.sockets[0], "image-1", "A blue square beside a fictional notebook.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
 
     expect(h.requests.find((request) => request.url.endsWith("/snapshot/finalize"))?.body.caption).toBe(
-      "I see a fictional blue square.",
+      "A blue square beside a fictional notebook.",
     )
     expect(h.audio).toEqual(["AAAAAA=="])
     expect(h.errors).toEqual([])
@@ -901,14 +1162,12 @@ describe("GeminiLiveController", () => {
     const h = harness({storage: new FakeStorage(), finalizeStatuses: Array(100).fill(503)})
     await start(h)
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
-    h.sockets[0].message({serverContent: {
-      outputTranscription: {text: "A fictional blue square."},
-      turnComplete: true,
-    }})
+    saveCaption(h.sockets[0], "image-1", "A fictional blue square.")
     await waitFor(() => h.photoRetryChanges.at(-1) === true)
     h.finalizeStatuses.splice(0, h.finalizeStatuses.length, 200)
     const attemptsBeforeRetry = h.requests.filter((request) => request.url.endsWith("/snapshot/finalize")).length
 
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
     await h.controller.retryImage()
 
     expect(h.requests.filter((request) => request.url.endsWith("/snapshot/finalize"))).toHaveLength(
@@ -916,6 +1175,8 @@ describe("GeminiLiveController", () => {
     )
     expect(h.photoRetryChanges.at(-1)).toBe(false)
     expect(h.persistenceErrors.at(-1)).toBeNull()
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+    completeTurn(h, "Continue speaking during caption retry.", "The caption retry did not block us.")
     await h.controller.stop()
   })
 
@@ -924,9 +1185,7 @@ describe("GeminiLiveController", () => {
     const old = harness({storage, finalizeStatuses: Array(100).fill(503)})
     await start(old)
     await old.controller.sendImage({imageId: "retained-photo", mimeType: "image/png", data: "AQID"})
-    old.sockets[0].message({serverContent: {
-      outputTranscription: {text: "A fictional paper kite."}, turnComplete: true,
-    }})
+    saveCaption(old.sockets[0], "retained-photo", "A fictional paper kite.")
     await waitFor(() => old.photoRetryChanges.at(-1) === true)
     await old.controller.stop()
     expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.caption).toBe("A fictional paper kite.")
@@ -947,9 +1206,7 @@ describe("GeminiLiveController", () => {
       const old = harness({storage, finalizeStatuses: [503]})
       await start(old)
       await old.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
-      old.sockets[0].message({serverContent: {
-        outputTranscription: {text: "A fictional blue square."}, turnComplete: true,
-      }})
+      saveCaption(old.sockets[0], "image-1", "A fictional blue square.")
       await waitFor(() => old.photoRetryChanges.at(-1) === true)
       const captionJournal = JSON.parse(storage.values.get("openalma:gemini-session-v1")!)
       expect(captionJournal.pendingImage.caption).toBe("A fictional blue square.")
@@ -1005,7 +1262,7 @@ describe("GeminiLiveController", () => {
     const h = harness({storage: new FakeStorage(), finalizeGates: [gate]})
     await start(h)
     await h.controller.sendImage({imageId: "slow-photo", mimeType: "image/png", data: "AQID"})
-    h.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional notebook."}, turnComplete: true}})
+    saveCaption(h.sockets[0], "slow-photo", "A fictional notebook.")
     await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
     completeTurn(h, "Continue the conversation.", "We can continue.")
     await waitFor(() => h.requests.some(request => request.body.events?.some(
@@ -1042,9 +1299,7 @@ describe("GeminiLiveController", () => {
     const h = harness({storage, finalizeGates: [finalizeGate]})
     await start(h)
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
-    h.sockets[0].message({serverContent: {
-      outputTranscription: {text: "A fictional blue square."}, turnComplete: true,
-    }})
+    saveCaption(h.sockets[0], "image-1", "A fictional blue square.")
     let stopped = false
     const stopping = h.controller.stop().then(() => { stopped = true })
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
@@ -1064,15 +1319,15 @@ describe("GeminiLiveController", () => {
     expect(h.requests.some((request) => request.url.endsWith("/end"))).toBe(true)
   })
 
-  test("Stop during a photo description reports the photo instead of transcript failure", async () => {
+  test("non-graceful Stop retains the uncaptured photo without a fake transcript failure", async () => {
     const h = harness({storage: new FakeStorage()})
     await start(h)
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
     await h.controller.stop()
 
     expect(h.errors).toEqual([])
-    expect(h.persistenceErrors).toContain("Photo description was interrupted; the photo remains pending")
-    expect(h.persistenceErrors.at(-1)).toBe("Photo description was interrupted; the photo remains pending")
+    expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    expect(h.photoRetryChanges.at(-1)).not.toBe(true)
     expect(h.persistenceErrors).not.toContain("Transcript sync failed; pending turns remain saved on this device")
   })
 
@@ -1094,6 +1349,7 @@ describe("GeminiLiveController", () => {
           captureAfterCurrent: false,
           generation: 1,
           sessionId: "old-sitting",
+          retryRequested: true,
         },
       }))
       const h = harness({storage, replayStatuses: [status], replayBodies: body ? [body] : []})
@@ -1121,6 +1377,7 @@ describe("GeminiLiveController", () => {
         captureAfterCurrent: false,
         generation: 1,
         sessionId: "old-sitting",
+        retryRequested: true,
       },
     }))
     const h = harness({storage, replayStatuses: [503, 200]})
@@ -1129,9 +1386,14 @@ describe("GeminiLiveController", () => {
     await h.controller.retryImage()
     await waitFor(() => h.persistenceErrors.at(-1) === PHOTO_RETRY_MESSAGE)
     expect(h.photoRetryChanges.at(-1)).toBe(true)
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+    await expect(h.controller.retryImage()).rejects.toThrow("Wait for the current reply to finish")
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay"))).toHaveLength(1)
+    expect(h.photoRetryChanges.at(-1)).toBe(true)
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
     h.sockets[0].message({serverContent: {
       inputTranscription: {text: "A fictional question."},
-      outputTranscription: {text: "A fictional complete turn."}, turnComplete: true,
+      outputTranscription: {text: "A fictional complete turn."}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true,
     }})
     await new Promise((resolve) => setTimeout(resolve, 20))
     expect(h.requests.filter((request) => request.url.endsWith("/snapshot/replay"))).toHaveLength(1)
@@ -1150,16 +1412,13 @@ describe("GeminiLiveController", () => {
     }})
     await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse))
     await h.controller.retryImage()
-    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).realtimeInput?.video))
     h.sockets[0].message({serverContent: {
-      outputTranscription: {text: "The memory-tool follow-up."},
+      outputTranscription: {text: "The memory-tool follow-up."}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
       turnComplete: true,
     }})
     expect(h.requests.some((request) => request.url.endsWith("/snapshot/finalize"))).toBe(false)
-    h.sockets[0].message({serverContent: {
-      outputTranscription: {text: "A fictional blue square."},
-      turnComplete: true,
-    }})
+    saveCaption(h.sockets[0], "image-1", "A fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
 
     expect(h.persistenceErrors.at(-1)).toBeNull()
@@ -1204,10 +1463,7 @@ describe("GeminiLiveController", () => {
     const h = harness({storage: new FakeStorage(), finalizeStatuses: Array(10).fill(503)})
     await start(h)
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
-    h.sockets[0].message({serverContent: {
-      outputTranscription: {text: "A fictional blue square."},
-      turnComplete: true,
-    }})
+    saveCaption(h.sockets[0], "image-1", "A fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
 
     completeTurn(h, "A later question.", "A later answer.")
@@ -1235,13 +1491,10 @@ describe("GeminiLiveController", () => {
     release()
     await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse))
     h.sockets[0].message({serverContent: {
-      outputTranscription: {text: "The older tool answer."},
+      outputTranscription: {text: "The older tool answer."}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
       turnComplete: true,
     }})
-    h.sockets[0].message({serverContent: {
-      outputTranscription: {text: "The photo shows a fictional blue square."},
-      turnComplete: true,
-    }})
+    saveCaption(h.sockets[0], "image-1", "The photo shows a fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
 
     expect(h.requests.find((request) => request.url.endsWith("/snapshot/finalize"))?.body.caption).toBe(
@@ -1250,9 +1503,9 @@ describe("GeminiLiveController", () => {
     const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
       .flatMap(request => request.body.events)
     expect(rows.map(event => [event.sequence, event.event_kind, event.content])).toEqual([
-      [41, "transcript", "The older tool answer."],
-      [42, "image", "Shared a photo."],
-      [43, "transcript", "The photo shows a fictional blue square."],
+      [41, "image", "Shared a photo."],
+      [42, "transcript", "The older tool answer."],
+      [43, "photo_caption", "The photo shows a fictional blue square."],
     ])
     expect(h.errors).toEqual([])
     await h.controller.stop()
@@ -1268,6 +1521,7 @@ describe("GeminiLiveController", () => {
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
     h.sockets[0].message({
       serverContent: {
+        inputTranscription: {text: "What do you remember about this photo?"},
         outputTranscription: {text: "Let me check memory first."},
         turnComplete: true,
       },
@@ -1277,10 +1531,12 @@ describe("GeminiLiveController", () => {
     })
     release()
     await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse))
-    h.sockets[0].message({serverContent: {
-      outputTranscription: {text: "The photo shows a fictional blue square."},
-      turnComplete: true,
-    }})
+    expect(h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events).some(event => event.role === "assistant")).toBe(false)
+    expect(h.audio).toEqual([])
+    expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    expect(h.errors).toEqual([])
+    saveCaption(h.sockets[0], "image-1", "The photo shows a fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
 
     expect(h.requests.find((request) => request.url.endsWith("/snapshot/finalize"))?.body.caption).toBe(
@@ -1320,7 +1576,6 @@ describe("GeminiLiveController", () => {
     }))
     const h = harness({storage, replayGates: [replayGate]})
     await start(h)
-    const retry = h.controller.retryImage()
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/replay")))
     h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
     h.sockets[0].close()
@@ -1328,12 +1583,8 @@ describe("GeminiLiveController", () => {
     h.sockets[1].open()
     h.sockets[1].message({setupComplete: {}})
     releaseReplay()
-    await retry
-    await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).clientContent))
-    h.sockets[1].message({serverContent: {
-      outputTranscription: {text: "A fictional blue square."},
-      turnComplete: true,
-    }})
+    await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).realtimeInput?.video))
+    saveCaption(h.sockets[1], "image-1", "A fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
     const imageEvents = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
       .flatMap((request) => request.body.events)
@@ -1357,21 +1608,18 @@ describe("GeminiLiveController", () => {
     }})
     if (!combined) h.sockets[0].message({serverContent: {turnComplete: true}})
     await new Promise(resolve => setTimeout(resolve, 0))
-    expect(h.sockets[0].sent.filter(value => JSON.parse(value).clientContent)).toHaveLength(1)
+    expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
     expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.providerSent).toBe(false)
-    expect(h.photoRetryChanges.at(-1)).toBe(true)
-    expect(h.persistenceErrors.at(-1)).toBe(PHOTO_RETRY_MESSAGE)
+    expect(h.photoRetryChanges.at(-1)).not.toBe(true)
+    expect(h.persistenceErrors).not.toContain(PHOTO_RETRY_MESSAGE)
     h.sockets[0].message({serverContent: {
       inputTranscription: {text: "I was still speaking."},
-      outputTranscription: {text: "The answer to the interruption, not a photo caption."},
+      outputTranscription: {text: "The answer to the interruption, not a photo caption."}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
       turnComplete: true,
     }})
-    await waitFor(() => h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent).length === 2)
+    await waitFor(() => h.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video).length === 2)
     expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
-    h.sockets[0].message({serverContent: {
-      outputTranscription: {text: "The photo shows a fictional blue square."},
-      turnComplete: true,
-    }})
+    saveCaption(h.sockets[0], "image-1", "The photo shows a fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
     expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption)
       .toBe("The photo shows a fictional blue square.")
@@ -1383,15 +1631,44 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("native voice activity fences a stored photo before input transcription arrives", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+    await h.controller.sendImage({imageId: "native-fenced", mimeType: "image/png", data: "AQID"})
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput)).toBe(false)
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+    completeTurn(h, "A preceding spoken question.", "A preceding spoken answer.")
+    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay"))).toHaveLength(1)
+    expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput).map(value => JSON.parse(value)))
+      .toEqual([{realtimeInput: {video: {data: "AQID", mimeType: "image/png"}}},
+        {realtimeInput: {text: `image_id: native-fenced\n${PHOTO_CAPTION_INSTRUCTION}`}}])
+    saveCaption(h.sockets[0], "native-fenced", "A fictional cobalt circle.")
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+    const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events)
+    expect(rows.map(event => [event.sequence, event.event_kind, event.content])).toEqual([
+      [41, "transcript", "A preceding spoken question."], [42, "transcript", "A preceding spoken answer."],
+      [43, "image", "Shared a photo."], [44, "photo_caption", "A fictional cobalt circle."],
+    ])
+    expect(rows[2].media_ref).toBe("mentra_media/test-phone/native-fenced.png")
+    expect(rows[3].media_ref).toBe(rows[2].media_ref)
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
   test.each(["complete", "interrupted", "stop"])("orders an already-active speech turn before the image on %s", async boundary => {
     const h = harness({storage: new FakeStorage()})
     await start(h)
     h.sockets[0].message({serverContent: {
       inputTranscription: {text: "Current user turn."},
-      outputTranscription: {text: "Current answer."},
+      outputTranscription: {text: "Current answer."}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
     }})
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
-    expect(h.sockets[0].sent.filter(value => JSON.parse(value).clientContent)).toHaveLength(1)
+    expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(0)
     expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
     if (boundary === "stop") await h.controller.stop()
     else h.sockets[0].message({serverContent: {
@@ -1404,23 +1681,24 @@ describe("GeminiLiveController", () => {
     expect(preceding.map(event => [event.sequence, event.event_kind, event.content, event.status])).toEqual([
       [41, "transcript", "Current user turn.", boundary === "stop" ? "interrupted" : "complete"],
       [42, "transcript", "Current answer.", boundary === "complete" ? "complete" : "interrupted"],
-      [43, "image", "Shared a photo.", undefined],
+      ...(boundary === "complete" ? [[43, "image", "Shared a photo.", undefined]] : []),
     ])
     if (boundary === "stop") return
+    if (boundary === "interrupted") completeTurn(h, "Finish my question.", "Here is the answer.")
+    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
 
-    h.sockets[0].message({serverContent: {
-      outputTranscription: {text: "The photo shows a fictional blue square."},
-      turnComplete: true,
-    }})
+    saveCaption(h.sockets[0], "image-1", "The photo shows a fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
     expect(h.requests.find((request) => request.url.endsWith("/snapshot/finalize"))?.body.caption).toBe(
       "The photo shows a fictional blue square.",
     )
     const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
       .flatMap(request => request.body.events)
-    expect(rows.map(event => event.sequence)).toEqual([41, 42, 43, 44])
-    expect(new Set(rows.map(event => event.event_id)).size).toBe(4)
-    expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id).toBe("sitting-1:44")
+    const expectedSequences = boundary === "interrupted" ? [41, 42, 43, 44, 45, 46] : [41, 42, 43, 44]
+    expect(rows.map(event => event.sequence)).toEqual(expectedSequences)
+    expect(new Set(rows.map(event => event.event_id)).size).toBe(expectedSequences.length)
+    expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id)
+      .toBe(`sitting-1:${expectedSequences.at(-1)}`)
     expect(h.errors).toEqual([])
     await h.controller.stop()
   })
@@ -1431,52 +1709,58 @@ describe("GeminiLiveController", () => {
     const h = harness({storage})
     await start(h)
     h.sockets[0].message({serverContent: {
-      inputTranscription: {text: "Current user turn."}, outputTranscription: {text: "Current answer."},
+      inputTranscription: {text: "Current user turn."}, outputTranscription: {text: "Current answer."}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
     }})
     const before = storage.setCalls
     storage.setGate = new Promise<void>(resolve => {release = resolve})
     const sending = h.controller.sendImage({imageId: "journal-photo", mimeType: "image/png", data: "AQID"})
     await waitFor(() => storage.setCalls > before)
-    expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video)).toBe(false)
     h.sockets[0].message({serverContent: {turnComplete: true}})
     release()
     await sending
-    h.sockets[0].message({serverContent: {
-      outputTranscription: {text: "The photo shows a fictional blue square."}, turnComplete: true,
-    }})
+    saveCaption(h.sockets[0], "journal-photo", "The photo shows a fictional blue square.")
     await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
     const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
       .flatMap(request => request.body.events)
     expect(rows.map(event => [event.sequence, event.event_kind])).toEqual([
-      [41, "transcript"], [42, "transcript"], [43, "image"], [44, "transcript"],
+      [41, "transcript"], [42, "transcript"], [43, "image"], [44, "photo_caption"],
     ])
     expect(h.errors).toEqual([])
     await h.controller.stop()
   })
 
-  test.each(["empty", "input", "output", "empty-interrupted"])("retains the image marker after a preceding %s boundary", async boundary => {
+  test.each(["empty", "input", "output", "empty-interrupted"])("preserves honest photo delivery and gaps across a preceding %s boundary", async boundary => {
     const storage = new FakeStorage()
     const h = harness({storage})
     await start(h)
     h.sockets[0].message({serverContent: {
       inputTranscription: {text: boundary === "input" ? "Partial question." : " "},
       outputTranscription: {text: boundary === "output" ? "Partial answer." : " "},
+      ...(["input", "output"].includes(boundary) ? {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}} : {}),
     }})
     await h.controller.sendImage({imageId: "gap-photo", mimeType: "image/png", data: "AQID"})
     h.sockets[0].message({serverContent: {
       ...(boundary === "empty-interrupted" ? {interrupted: true} : {}), turnComplete: true,
     }})
-    await waitFor(() => h.requests.some(request => request.url.endsWith("/transcripts/append")))
+    if (boundary !== "empty-interrupted") {
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/transcripts/append")))
+    }
     const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
       .flatMap(request => request.body.events)
-    expect(rows.map(event => event.sequence)).toEqual(boundary === "empty-interrupted" ? [41] : [41, 42, 43])
-    expect(rows.at(-1)).toEqual(expect.objectContaining({event_kind: "image", content: "Shared a photo."}))
+    expect(rows.map(event => event.sequence)).toEqual(boundary === "empty-interrupted" ? [] : boundary === "empty" ? [41] : [41, 42])
+    expect(rows.filter(event => event.event_kind === "image")).toHaveLength(boundary === "empty" ? 1 : 0)
+    expect(rows.some(event => event.event_kind === "photo_caption")).toBe(false)
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video)).toBe(boundary === "empty")
+    if (boundary === "empty" || boundary === "empty-interrupted") {
+      expect(rows.some(event => event.event_kind === "transcript_gap")).toBe(false)
+    }
     expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage).toEqual(expect.objectContaining({
-      imageSequence: rows.at(-1).sequence, captureAfterCurrent: false,
+      imageId: "gap-photo", mediaRef: "mentra_media/test-phone/gap-photo.png", providerSent: boundary === "empty",
     }))
     expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
-    expect(h.errors).toEqual(boundary === "empty-interrupted" ? [] : [boundary === "empty"
-      ? "Gemini completed a turn without transcription" : "Gemini completed a turn without both transcriptions"])
+    expect(h.errors).toEqual(boundary === "empty-interrupted" || boundary === "empty" ? [] :
+      ["Gemini completed a turn without both transcriptions"])
     await h.controller.stop()
   })
 
@@ -1495,19 +1779,17 @@ describe("GeminiLiveController", () => {
     }))
     const h = harness({storage, replayGates: [replayGate], appendGates: [appendGate]})
     await start(h)
-    const retry = h.controller.retryImage()
     await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/replay")))
     h.sockets[0].message({serverContent: {
-      inputTranscription: {text: "Current user turn."}, outputTranscription: {text: "Current answer."},
+      inputTranscription: {text: "Current user turn."}, outputTranscription: {text: "Current answer."}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
     }})
     releaseReplay()
-    await retry
-    expect(h.sockets[0].sent.filter(value => JSON.parse(value).clientContent)).toHaveLength(1)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(0)
     expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
     h.sockets[0].message({serverContent: {turnComplete: true}})
-    h.sockets[0].message({serverContent: {
-      outputTranscription: {text: "The photo shows a fictional blue square."}, turnComplete: true,
-    }})
+    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
+    saveCaption(h.sockets[0], "recovered-photo", "The photo shows a fictional blue square.")
     await waitFor(() => h.requests.some(request => request.url.endsWith("/transcripts/append")))
     expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
     releaseAppend()
@@ -1746,7 +2028,7 @@ describe("GeminiLiveController", () => {
     })
     completeTurn(h, "ordinary follow-up", "ordinary answer")
     h.sockets[0].message({
-      serverContent: {outputTranscription: {text: "stale license"}, turnComplete: true},
+      serverContent: {outputTranscription: {text: "stale license"}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true},
     })
     await waitFor(
       () => h.requests
@@ -2229,24 +2511,14 @@ describe("GeminiLiveController", () => {
     expect(unknown.errors).toEqual(["Gemini returned unknown tool call"])
     await unknown.controller.stop()
 
-    let release!: () => void
-    const pendingGate = new Promise<void>((resolve) => {
-      release = resolve
+    const ordinary = harness()
+    await start(ordinary)
+    ordinary.sockets[0].message({
+      serverContent: {inputTranscription: {text: "ordinary unfinished reply"},
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true},
     })
-    const pending = harness({recallGate: pendingGate})
-    await start(pending)
-    pending.sockets[0].message({
-      toolCall: {
-        functionCalls: [{id: "pending", name: "recall_memory", args: {query: "pending"}}],
-      },
-    })
-    await waitFor(() => pending.requests.some((request) => request.url.endsWith("/recall")))
-    pending.sockets[0].message({
-      serverContent: {inputTranscription: {text: "ordinary while pending"}, turnComplete: true},
-    })
-    expect(pending.errors).toEqual(["Gemini completed a turn without both transcriptions"])
-    release()
-    await pending.controller.stop()
+    expect(ordinary.errors).toEqual(["Gemini completed a turn without both transcriptions"])
+    await ordinary.controller.stop()
   })
 
   test("interruption drops residual audio from the same server payload", async () => {
@@ -2272,7 +2544,7 @@ describe("GeminiLiveController", () => {
       await start(h)
       h.controller.sendAudio("AAAA", "glasses")
       h.sockets[0].message({serverContent: {inputTranscription: {text: "first question"}}})
-      h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
       h.sockets[0].message({serverContent: {interrupted: true}})
       h.sockets[0].message({serverContent: {turnComplete: true}})
       completeTurn(h, "second question", "second answer")
@@ -2289,7 +2561,7 @@ describe("GeminiLiveController", () => {
       expect(h.events).toEqual(["interrupted", "turnComplete", "turnComplete"])
       expect(consoleInfo).toHaveBeenCalledWith(
         expect.stringContaining("provider.interrupted"),
-        {audioChunks: 0, inputChars: 14, outputChars: 14},
+        {audioChunks: 1, inputChars: 14, outputChars: 14},
       )
       expect(consoleInfo).toHaveBeenCalledWith(
         expect.stringContaining("provider.turn_complete"),
@@ -2307,7 +2579,7 @@ describe("GeminiLiveController", () => {
     const h = harness()
     await start(h)
     h.sockets[0].message({serverContent: {inputTranscription: {text: "first question"}}})
-    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
     h.sockets[0].message({serverContent: {interrupted: true}})
     h.sockets[0].message({serverContent: {turnComplete: true}})
     completeTurn(h, "second question", "second answer")
@@ -2319,18 +2591,20 @@ describe("GeminiLiveController", () => {
     await stopping
   })
 
-  test("fails loud when a completed turn lacks either transcript side", async () => {
+  test.each([false, true])("missing assistant text is a gap only after heard PCM (audible=%s)", async audible => {
     const h = harness()
     await start(h)
     h.controller.sendAudio("AAAA", "phone")
-    h.sockets[0].message({serverContent: {inputTranscription: {text: "only one side"}, turnComplete: true}})
-    expect(h.errors).toEqual(["Gemini completed a turn without both transcriptions"])
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "only one side"},
+      ...(audible ? {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}} : {}), turnComplete: true}})
+    expect(h.audio).toEqual(audible ? ["AAAAAA=="] : [])
+    expect(h.errors).toEqual(audible ? ["Gemini completed a turn without both transcriptions"] : [])
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
     expect(h.requests.find((request) => request.url.endsWith("/transcripts/append"))?.body.events).toEqual([
       expect.objectContaining({event_kind: "transcript", role: "user", content: "only one side", mic_source: "phone"}),
-      expect.objectContaining({event_kind: "transcript_gap", role: "assistant", content: "Transcript unavailable."}),
+      ...(audible ? [expect.objectContaining({event_kind: "transcript_gap", role: "assistant", content: "Transcript unavailable."})] : []),
     ])
-    expect(h.requests.find(request => request.url.endsWith("/transcripts/append"))!.body.events[1]).not.toHaveProperty("mic_source")
+    if (audible) expect(h.requests.find(request => request.url.endsWith("/transcripts/append"))!.body.events[1]).not.toHaveProperty("mic_source")
     await h.controller.stop()
   })
 
@@ -2593,17 +2867,17 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
-  test("a refused oversized caption uses ordinary Retry without repeated finalization or losing its transcript", async () => {
+  test("a refused caption uses ordinary Retry without repeated finalization or losing its event", async () => {
     const storage = new FakeStorage()
-    const caption = "description ".repeat(1_500).trim()
+    const caption = "description ".repeat(1_300).trim()
     const h = harness({storage, finalizeStatuses: [422]})
     await start(h)
     await h.controller.sendImage({imageId: "long-caption", mimeType: "image/png", data: "AQID"})
-    h.sockets[0].message({serverContent: {outputTranscription: {text: caption}, turnComplete: true}})
+    saveCaption(h.sockets[0], "long-caption", caption)
     await waitFor(() => h.photoRetryChanges.at(-1) === true)
     const recovered = JSON.parse(storage.values.get(JOURNAL_KEY)!)
     expect(recovered.pendingImage.caption).toBe(caption)
-    expect(recovered.pendingImage.assistantSequence).toBe(43)
+    expect(recovered.pendingImage.assistantSequence).toBe(42)
     const saved = h.requests.filter(request => request.url.endsWith("/transcripts/append")).flatMap(request => request.body.events)
     expect(saved.filter(event => event.role === "assistant").map(event => event.content).join("")).toBe(caption)
     expect(storage.values.has(RECOVERED_CHATS_KEY)).toBe(false)
@@ -2636,7 +2910,7 @@ describe("GeminiLiveController", () => {
     const h = harness({storage: new FakeStorage(), finalizeStatuses: [400], appendStatuses: [200, 200, 503, 200]})
     await start(h)
     await h.controller.sendImage({imageId: "refused-photo", mimeType: "image/png", data: "AQID"})
-    h.sockets[0].message({serverContent: {outputTranscription: {text: "A small fictional square."}, turnComplete: true}})
+    saveCaption(h.sockets[0], "refused-photo", "A small fictional square.")
     await waitFor(() => h.photoRetryChanges.at(-1) === true)
     expect(h.errors).toEqual([])
     completeTurn(h, "keep talking", "still heard")
@@ -2653,7 +2927,7 @@ describe("GeminiLiveController", () => {
     const h = harness({storage: new FakeStorage(), finalizeStatuses: [503, 200], appendStatuses: [200, 200, 503]})
     await start(h)
     await h.controller.sendImage({imageId: "caption-retry", mimeType: "image/png", data: "AQID"})
-    h.sockets[0].message({serverContent: {outputTranscription: {text: "A small fictional triangle."}, turnComplete: true}})
+    saveCaption(h.sockets[0], "caption-retry", "A small fictional triangle.")
     await waitFor(() => h.photoRetryChanges.at(-1) === true)
     completeTurn(h, "later question", "later answer")
     await waitFor(() => h.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
@@ -2679,7 +2953,7 @@ describe("GeminiLiveController", () => {
     try {
       await start(h)
       await waitFor(() => h.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
-      await h.controller.retryImage()
+      await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
       expect(h.photoRetryChanges.at(-1)).toBe(false)
       expect(h.persistenceErrors.at(-1)).not.toBeNull()
     } finally {
@@ -2932,7 +3206,7 @@ describe("GeminiLiveController", () => {
     await start(h)
     h.controller.sendAudio("AAAA", "phone")
     h.sockets[0].message({serverContent: {inputTranscription: {text: "partial question"}}})
-    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
     await h.controller.stop()
 
     const append = h.requests.find((request) => request.url.endsWith("/transcripts/append"))!
@@ -2953,7 +3227,7 @@ describe("GeminiLiveController", () => {
     completeTurn(h, "two", "answer two")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
     h.sockets[0].message({serverContent: {inputTranscription: {text: "partial question"}}})
-    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
 
     await h.controller.stop(true)
     expect(h.sockets[0].sent.some((value) => JSON.parse(value).clientContent)).toBe(false)
@@ -2963,7 +3237,7 @@ describe("GeminiLiveController", () => {
     expect(events.slice(-2).map((event: any) => event.status)).toEqual(["interrupted", "interrupted"])
   })
 
-  test.each(["snapshot", "journal", "replay"])("graceful Stop preserves reflection during late photo %s", async (phase) => {
+  test.each(["snapshot", "journal", "replay"])("graceful Stop drains late photo %s before reflection", async (phase) => {
     let finishSnapshot!: () => void
     const snapshotGate = new Promise<void>((resolve) => { finishSnapshot = resolve })
     const storage = new FakeStorage()
@@ -2974,7 +3248,7 @@ describe("GeminiLiveController", () => {
         providerSent: false, captureAfterCurrent: false, generation: 1, sessionId: "old-sitting", retryRequested: true},
     }))
     const h = harness({snapshotGate: phase === "snapshot" ? snapshotGate : undefined,
-      replayGates: phase === "replay" ? [snapshotGate] : [], storage})
+      replayGates: phase === "replay" ? [snapshotGate] : [], storage, photoDrainTimeoutMs: 200})
     await start(h)
     completeTurn(h, "one", "answer one")
     completeTurn(h, "two", "answer two")
@@ -2987,11 +3261,14 @@ describe("GeminiLiveController", () => {
     await waitFor(() => phase === "journal" ? storage.setCalls > writes
       : h.requests.some((request) => request.url.endsWith(phase === "replay" ? "/snapshot/replay" : "/snapshot")))
     const stopping = h.controller.stop(true)
-    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
     finishSnapshot()
     storage.setGate = null
-    if (phase === "replay") await sending
-    else await expect(sending).rejects.toThrow("Photo send cancelled")
+    await sending
+    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
+    saveCaption(h.sockets[0], "late-photo", "An internal perception before reflection.")
+    h.sockets[0].message({serverContent: {turnComplete: true}})
+    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
     expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
     h.sockets[0].message({
       serverContent: {
@@ -3005,8 +3282,8 @@ describe("GeminiLiveController", () => {
     const appends = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
     expect(appends.at(-1)?.body.events).toEqual([
       {
-        event_id: "sitting-1:45",
-        sequence: 45,
+        event_id: "sitting-1:47",
+        sequence: 47,
         event_kind: "sitting_summary",
         role: "assistant",
         content: "I noticed warmth.",
@@ -3159,7 +3436,7 @@ describe("GeminiLiveController", () => {
     const h = harness()
     await start(h)
     h.sockets[0].message({serverContent: {inputTranscription: {text: "before drop"}}})
-    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}}})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
     h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
     h.sockets[0].error()
     await waitFor(() => h.sockets.length === 2)
@@ -3250,17 +3527,15 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.sockets.length === 2)
     h.sockets[1].open()
     h.sockets[1].message({setupComplete: {}})
-    await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).clientContent))
+    await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).realtimeInput?.video))
 
-    expect(h.sockets[1].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
-    h.sockets[1].message({serverContent: {
-      outputTranscription: {text: "The photo shows a fictional blue square."}, turnComplete: true,
-    }})
+    expect(h.sockets[1].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
+    saveCaption(h.sockets[1], "image-cold", "The photo shows a fictional blue square.")
     await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
     const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
       .flatMap(request => request.body.events)
     expect(rows.map(event => [event.sequence, event.event_kind, event.status])).toEqual([
-      [41, "transcript", "interrupted"], [42, "image", undefined], [43, "transcript", "complete"],
+      [41, "transcript", "interrupted"], [42, "image", undefined], [43, "photo_caption", undefined],
     ])
     expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id).toBe("sitting-1:43")
     expect(h.errors).toEqual([])
@@ -3359,7 +3634,7 @@ describe("GeminiLiveController", () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(h.sockets).toHaveLength(1)
     h.sockets[0].message({
-      serverContent: {outputTranscription: {text: "finished"}, turnComplete: true},
+      serverContent: {outputTranscription: {text: "finished"}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true},
     })
     await waitFor(() => h.sockets.length === 2)
     await h.controller.stop()
@@ -3508,8 +3783,7 @@ describe("GeminiLiveController", () => {
     await malformed.controller.stop()
   })
 
-  test("socket close and GoAway replay an interrupted image on the replacement", async () => {
-    for (const cause of ["close", "goAway"] as const) {
+  test.each(["close", "goAway"] as const)("%s replays an interrupted image on the replacement", async cause => {
       const h = harness({storage: new FakeStorage()})
       await start(h)
       h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
@@ -3520,16 +3794,12 @@ describe("GeminiLiveController", () => {
       await waitFor(() => h.sockets.length === 2)
       h.sockets[1].open()
       h.sockets[1].message({setupComplete: {}})
-      await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).clientContent))
-      h.sockets[1].message({serverContent: {
-        outputTranscription: {text: "The photo shows a fictional blue square."},
-        turnComplete: true,
-      }})
+      await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).realtimeInput?.video))
+      saveCaption(h.sockets[1], `image-${cause}`, "The photo shows a fictional blue square.")
       await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
 
       expect(h.errors).toEqual([])
       await h.controller.stop()
-    }
   })
 
   test("Stop during GoAway setup prevents a late replacement", async () => {
