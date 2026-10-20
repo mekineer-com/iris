@@ -470,6 +470,26 @@ describe("SessionController", () => {
     expect(requests.filter(({body}) => body)).toHaveLength(1)
   })
 
+  test.each([new Error("Network request failed"), new Error("The operation was aborted"), 502, 503])(
+    "reports unavailable memory services during first-install ticket exchange (%s)", async failure => {
+      const session = new FakeSession()
+      const requests: string[] = []
+      new SessionController(session as never, {
+        installationDefaults: {baseUrl: CONFIG.baseUrl, userId: CONFIG.userId, installationTicket: "ticket-unavailable"},
+        fetchFn: (async url => {
+          requests.push(String(url))
+          if (failure instanceof Error) throw failure
+          return new Response("unavailable", {status: failure})
+        }) as typeof fetch,
+      }).start()
+      await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+      expect(requests).toEqual([`${CONFIG.baseUrl}/integration/mentra/installation/seen`])
+      expect(lastSnapshot(session)).toMatchObject({memuAvailable: false, soulConfirmed: false,
+        lastError: failure === 503 ? "Installation report failed (503)" : "Is memU running?"})
+      expect(JSON.parse(session.stored.get("openalma.connection-profile")!).installationTicket).toBe("ticket-unavailable")
+    },
+  )
+
   test("pending exchange failure stays editable and address repair reuses its ID and ticket", async () => {
     const previous = process.env.NODE_ENV
     process.env.NODE_ENV = "production"

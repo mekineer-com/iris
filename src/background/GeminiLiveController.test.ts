@@ -1266,6 +1266,7 @@ describe("GeminiLiveController", () => {
     expect(h.sockets[0].sent.filter(value => JSON.parse(value).clientContent)).toHaveLength(1)
     expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.providerSent).toBe(false)
     expect(h.photoRetryChanges.at(-1)).toBe(true)
+    expect(h.persistenceErrors.at(-1)).toBe(PHOTO_RETRY_MESSAGE)
     h.sockets[0].message({serverContent: {
       inputTranscription: {text: "I was still speaking."},
       outputTranscription: {text: "The answer to the interruption, not a photo caption."},

@@ -35,7 +35,10 @@ export async function reportInstallation(
       version: config.version,
       ...(host ? {host_package: host.host_package, host_version: host.host_version} : {}),
     }),
+  }).catch(() => {
+    throw new Error("Is memU running?")
   })
+  if (response.status === 502) throw Object.assign(new Error("Is memU running?"), {status: 502})
   if (!response.ok) {
     const result = await response.json().catch(() => null) as {detail?: string | {message?: string}} | null
     const detail = typeof result?.detail === "string" ? result.detail : result?.detail?.message
