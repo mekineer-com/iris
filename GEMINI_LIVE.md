@@ -66,18 +66,29 @@ clears the handle. The handle is provider state, never transcript content.
 ### Internal photo task
 
 Iris snapshots the original in OpenAlma before provider delivery; upload and
-replay each allow 120 seconds. Between spoken turns it sends these two messages:
+replay each allow 120 seconds. Between spoken turns it sends one ordered content
+turn with the original bytes and the caption task:
 
 ```json
 {
-  "realtimeInput": {
-    "video": {"data": "<base64>", "mimeType": "image/jpeg"}
+  "clientContent": {
+    "turns": [{
+      "role": "user",
+      "parts": [
+        {"inlineData": {"data": "<base64>", "mimeType": "image/jpeg"}},
+        {"text": "image_id: <id>\n<PHOTO_CAPTION_INSTRUCTION>"}
+      ]
+    }],
+    "turnComplete": true
   }
 }
 ```
 
-The second message is `realtimeInput.text`, containing `image_id: <id>` and
-`PHOTO_CAPTION_INSTRUCTION`, the exact Marcos-approved wording. JPEG and PNG
+The text contains `image_id: <id>` and `PHOTO_CAPTION_INSTRUCTION`, the exact
+Marcos-approved wording. This hunk reuses Iris's earlier ordered image wire;
+3.8 provider acceptance remains open. Separate realtime image/text delivery
+failed all three cold immediate checks; diagnostic spacing passed three but is
+not a production acknowledgment or delay policy. JPEG and PNG
 remain native inputs. Caption content comes only from `save_photo_caption`,
 never from a nearby answer or output transcription. Its `photo_caption` event
 carries the original's `media_ref` and has no spoken-transcript status.
@@ -95,7 +106,10 @@ An optional spoken description remains separate from this internal caption.
 
 Normal Stop mutes provider output before callbacks and retains the socket/lease
 for an eight-second caption handoff window. Continuous Stop flushes existing
-audio with 1.8 seconds of real-time-paced silence and `audioStreamEnd`; Manual
+audio with 1.8 seconds of real-time-paced silence and `audioStreamEnd`, then
+waits for the preceding response's native completion before a new ordered image
+turn. `audioStreamEnd` alone cannot release that fence. The existing flush owner
+can wait for replacement readiness within the same drain cap. Manual
 Stop does not send an unsent take. Replay cannot deliver a task mid-flush or
 after the drain closes. An already-delivered task is not resent merely
 because Stop was pressed. Timeout is logged and retains recovery state. Optional

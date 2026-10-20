@@ -57,6 +57,23 @@ class FakeSocket {
   }
 }
 
+function photoInput(message: any): {data: string; mimeType: string} | undefined {
+  return message.clientContent?.turns?.[0]?.parts?.find((part: any) => part.inlineData)?.inlineData
+}
+
+function photoTask(message: any): string | undefined {
+  return photoInput(message) ? message.clientContent.turns[0].parts.find((part: any) => typeof part.text === "string")?.text : undefined
+}
+
+function textTurn(message: any): any {
+  return photoInput(message) ? undefined : message.clientContent
+}
+
+function photoTurn(imageId: string, data = "AQID", mimeType = "image/png") {
+  return {clientContent: {turns: [{role: "user", parts: [{inlineData: {data, mimeType}},
+    {text: `image_id: ${imageId}\n${PHOTO_CAPTION_INSTRUCTION}`}]}], turnComplete: true}}
+}
+
 class FakeStorage {
   values = new Map<string, string>()
   setCalls = 0
@@ -1526,11 +1543,9 @@ describe("GeminiLiveController", () => {
       mime_type: "image/png",
       data: "AQID",
     })
-    expect(h.sockets[0].sent.slice(-2).map(value => JSON.parse(value))).toEqual([
-      {realtimeInput: {video: {data: "AQID", mimeType: "image/png"}}},
-      {realtimeInput: {text: `image_id: image-1\n${PHOTO_CAPTION_INSTRUCTION}`}},
-    ])
-    expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
+    expect(h.sockets[0].sent.slice(-1).map(value => JSON.parse(value))).toEqual([photoTurn("image-1")])
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video || JSON.parse(value).realtimeInput?.text)).toBe(false)
+    expect(h.sockets[0].sent.some(value => textTurn(JSON.parse(value)))).toBe(false)
 
     saveCaption(h.sockets[0], "image-1", "A fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
@@ -1604,7 +1619,7 @@ describe("GeminiLiveController", () => {
     await start(h)
     try {
       await h.controller.sendImage({imageId: "skipped-caption", mimeType: "image/png", data: "AQID"})
-      expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
+      expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(1)
       if (result === "invalid") {
         saveCaption(h.sockets[0], "skipped-caption", " ")
         await waitFor(() => functionResponses(h.sockets[0]).length === 1)
@@ -1625,8 +1640,8 @@ describe("GeminiLiveController", () => {
         await h.controller.retryImage()
         expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay")).map(request => request.body.image_id))
           .toEqual(["skipped-caption"])
-        expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(2)
-        expect(h.sockets[0].sent.flatMap(value => JSON.parse(value).realtimeInput?.text ?? []))
+        expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(2)
+        expect(h.sockets[0].sent.flatMap(value => photoTask(JSON.parse(value)) ?? []))
           .toEqual(Array(2).fill(`image_id: skipped-caption\n${PHOTO_CAPTION_INSTRUCTION}`))
         expect(h.photoRetryChanges.at(-1)).toBe(false)
       }
@@ -1641,13 +1656,13 @@ describe("GeminiLiveController", () => {
         .toEqual([expect.objectContaining({image_id: "skipped-caption", caption: "A late fictional blue square."})])
       expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
       expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay"))).toHaveLength(result === "missing" ? 1 : 0)
-      expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(result === "missing" ? 2 : 1)
+      expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(result === "missing" ? 2 : 1)
       expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.event_kind === "photo_caption"))
         .toMatchObject([{content: "A late fictional blue square.", media_ref: "mentra_media/test-phone/skipped-caption.png"}])
       await h.controller.discardImage()
       expect(h.photoRetryChanges.at(-1)).toBe(false)
       await h.controller.sendImage({imageId: "next-photo", mimeType: "image/png", data: "BAUG"})
-      expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(result === "missing" ? 3 : 2)
+      expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(result === "missing" ? 3 : 2)
     } finally {
       await h.controller.stop()
     }
@@ -1721,7 +1736,7 @@ describe("GeminiLiveController", () => {
     const storage = new FakeStorage()
     const h = harness({storage})
     await start(h)
-    const images = () => h.sockets[0].sent.flatMap(value => JSON.parse(value).realtimeInput?.video ?? [])
+    const images = () => h.sockets[0].sent.flatMap(value => photoInput(JSON.parse(value)) ?? [])
     try {
       await h.controller.sendImage({imageId: "boundary-square", mimeType: "image/png", data: "AQID"})
       saveCaption(h.sockets[0], "boundary-square", "A fictional blue square.")
@@ -1745,7 +1760,7 @@ describe("GeminiLiveController", () => {
       expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay")).map(request => request.body.image_id))
         .toEqual(["boundary-triangle"])
       expect(h.photoRetryChanges).not.toContain(true)
-      const tasks = h.sockets[0].sent.flatMap(value => JSON.parse(value).realtimeInput?.text ?? [])
+      const tasks = h.sockets[0].sent.flatMap(value => photoTask(JSON.parse(value)) ?? [])
       expect(tasks).toEqual([
         `image_id: boundary-square\n${PHOTO_CAPTION_INSTRUCTION}`,
         `image_id: boundary-triangle\n${PHOTO_CAPTION_INSTRUCTION}`,
@@ -1836,13 +1851,13 @@ describe("GeminiLiveController", () => {
         data: "AQID",
         speakDescription,
       })
-      expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
+      expect(h.sockets[0].sent.some(value => textTurn(JSON.parse(value)))).toBe(false)
       saveCaption(h.sockets[0], `image-${speakDescription}`, "A fictional blue square.")
       h.sockets[0].message({serverContent: {turnComplete: true}})
       await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
       await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
       expect(h.audio).toEqual([])
-      expect(h.sockets[0].sent.filter(value => JSON.parse(value).clientContent)).toHaveLength(speakDescription ? 1 : 0)
+      expect(h.sockets[0].sent.filter(value => textTurn(JSON.parse(value)))).toHaveLength(speakDescription ? 1 : 0)
       if (speakDescription) h.sockets[0].message({serverContent: {
         modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
         outputTranscription: {text: "Here is my spoken description."}, turnComplete: true,
@@ -1873,7 +1888,7 @@ describe("GeminiLiveController", () => {
     expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage).toEqual(pendingB)
     expect(history.filter(event => event.event_kind === "photo_caption")).toEqual([])
     expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
-    expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
+    expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(1)
     saveCaption(h.sockets[0], "photo-b", "A fictional blue triangle.", "caption-b")
     await waitFor(() => results().some(result => result.id === "caption-b"))
     expect(history.filter(event => event.event_kind === "photo_caption").map(event => [event.media_ref, event.content]))
@@ -1930,7 +1945,7 @@ describe("GeminiLiveController", () => {
       expect(h.requests.some(request => request.url.endsWith("/end"))).toBe(false)
       finishReplay()
       await new Promise(resolve => setTimeout(resolve, 0))
-      expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video)).toBe(false)
+      expect(h.sockets[0].sent.some(value => photoInput(JSON.parse(value)))).toBe(false)
       expect(h.photoRetryChanges.at(-1)).toBe(true)
       h.sockets[0].message({serverContent: {
         modelTurn: {parts: [{inlineData: {data: "AQEBAQ=="}}]},
@@ -1962,7 +1977,7 @@ describe("GeminiLiveController", () => {
       outputTranscription: {text: "Current answer finished."},
       turnComplete: true,
     }})
-    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
+    await waitFor(() => h.sockets[0].sent.some(value => photoInput(JSON.parse(value))))
     saveCaption(h.sockets[0], "image-queued", "A fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
 
@@ -1985,7 +2000,8 @@ describe("GeminiLiveController", () => {
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
     expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(2)
     expect(h.requests.some(request => request.url.endsWith("/snapshot/replay"))).toBe(false)
-    expect(h.sockets[0].sent).toHaveLength(3)
+    expect(h.sockets[0].sent).toHaveLength(2)
+    expect(h.sockets[0].sent.map(value => JSON.parse(value)).filter(photoInput)).toEqual([photoTurn("image-1")])
     await h.controller.stop()
   })
 
@@ -2013,7 +2029,7 @@ describe("GeminiLiveController", () => {
     expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(2)
     options.snapshotStatus = 200
     await h.controller.sendImage(image)
-    expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
+    expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(1)
     expect(h.requests.some(request => request.url.endsWith("/snapshot/replay"))).toBe(false)
     await h.controller.stop()
   })
@@ -2027,7 +2043,7 @@ describe("GeminiLiveController", () => {
     h.sockets[0].failAtSendCount = null
     await h.controller.sendImage(image)
     expect(h.requests.filter((request) => request.url.endsWith("/snapshot"))).toHaveLength(2)
-    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
+    expect(h.sockets[0].sent.filter((value) => photoInput(JSON.parse(value)))).toHaveLength(1)
     await h.controller.stop()
   })
 
@@ -2051,7 +2067,7 @@ describe("GeminiLiveController", () => {
     expect(storage.values.get(JOURNAL_KEY)).toBe("")
     await h.controller.sendImage({imageId: "image-2", mimeType: "image/png", data: "AQID"})
 
-    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
+    expect(h.sockets[0].sent.filter((value) => photoInput(JSON.parse(value)))).toHaveLength(1)
     await h.controller.stop()
   })
 
@@ -2119,7 +2135,7 @@ describe("GeminiLiveController", () => {
     expect(h.persistenceErrors.at(-1)).toContain("Photo may have been saved")
     release()
     await expect(sending).rejects.toThrow("Photo send cancelled")
-    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(0)
+    expect(h.sockets[0].sent.filter((value) => photoInput(JSON.parse(value)))).toHaveLength(0)
 
     for (const [status, body] of [
       [404, null],
@@ -2166,7 +2182,7 @@ describe("GeminiLiveController", () => {
       expect(storage.values.get("openalma:gemini-session-v1")).toBe(journal)
       expect([old.photoRetryChanges.length, old.persistenceErrors.length, old.errors.length]).toEqual(callbacks)
       expect(old.errors).toEqual([])
-      expect(old.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(0)
+      expect(old.sockets[0].sent.filter((value) => photoInput(JSON.parse(value)))).toHaveLength(0)
       await replacement.controller.stop()
     }
   })
@@ -2220,7 +2236,7 @@ describe("GeminiLiveController", () => {
     expect([replacement.photoRetryChanges.length, replacement.persistenceErrors.length,
       replacement.errors.length]).toEqual(replacementCallbacks)
     expect(old.requests).toHaveLength(requests)
-    expect(old.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(0)
+    expect(old.sockets[0].sent.filter((value) => photoInput(JSON.parse(value)))).toHaveLength(0)
     await replacement.controller.stop()
   })
 
@@ -2244,7 +2260,7 @@ describe("GeminiLiveController", () => {
     release()
     await sending
 
-    expect(h.sockets[1].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
+    expect(h.sockets[1].sent.filter((value) => photoInput(JSON.parse(value)))).toHaveLength(1)
     expect(h.errors).toEqual([])
     await h.controller.stop()
   })
@@ -2278,7 +2294,7 @@ describe("GeminiLiveController", () => {
     release()
     await expect(sending).rejects.toThrow("Photo send cancelled")
 
-    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(0)
+    expect(h.sockets[0].sent.filter((value) => photoInput(JSON.parse(value)))).toHaveLength(0)
     await h.controller.stop()
   })
 
@@ -2322,9 +2338,9 @@ describe("GeminiLiveController", () => {
     h.sockets[1].message({setupComplete: {}})
     release()
     await sending
-    await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).realtimeInput?.video))
+    await waitFor(() => h.sockets[1].sent.some((value) => photoInput(JSON.parse(value))))
 
-    expect(h.sockets[1].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
+    expect(h.sockets[1].sent.filter((value) => photoInput(JSON.parse(value)))).toHaveLength(1)
     await h.controller.stop()
   })
 
@@ -2637,7 +2653,7 @@ describe("GeminiLiveController", () => {
     }})
     await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse))
     await h.controller.retryImage()
-    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).realtimeInput?.video))
+    await waitFor(() => h.sockets[0].sent.some((value) => photoInput(JSON.parse(value))))
     h.sockets[0].message({serverContent: {
       outputTranscription: {text: "The memory-tool follow-up."}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
       turnComplete: true,
@@ -2791,13 +2807,13 @@ describe("GeminiLiveController", () => {
       saveCaption(h.sockets[1], "resumed-photo", "A fictional green crescent.")
       await waitFor(() => h.sockets[1].sent.some(value => JSON.parse(value).toolResponse?.functionResponses?.some(
         (response: any) => response.response.durable === true)))
-      expect(h.sockets[1].sent.some(value => JSON.parse(value).realtimeInput?.video)).toBe(false)
+      expect(h.sockets[1].sent.some(value => photoInput(JSON.parse(value)))).toBe(false)
       expect(h.requests.filter(request => request.url.endsWith("/snapshot/finalize"))).toHaveLength(1)
       expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id)
         .toBe("sitting-1:photo:resumed-photo")
       releaseReplay()
       await h.controller.stop()
-      expect(h.sockets[1].sent.some(value => JSON.parse(value).realtimeInput?.video)).toBe(false)
+      expect(h.sockets[1].sent.some(value => photoInput(JSON.parse(value)))).toBe(false)
       expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.event_kind === "image"))
         .toHaveLength(1)
       expect(h.errors).toEqual([])
@@ -2844,7 +2860,7 @@ describe("GeminiLiveController", () => {
     h.sockets[1].open()
     h.sockets[1].message({setupComplete: {}})
     releaseReplay()
-    await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).realtimeInput?.video))
+    await waitFor(() => h.sockets[1].sent.some((value) => photoInput(JSON.parse(value))))
     saveCaption(h.sockets[1], "image-1", "A fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
     const imageEvents = h.requests.filter((request) => request.url.endsWith("/transcripts/append"))
@@ -2869,7 +2885,7 @@ describe("GeminiLiveController", () => {
     }})
     if (!combined) h.sockets[0].message({serverContent: {turnComplete: true}})
     await new Promise(resolve => setTimeout(resolve, 0))
-    expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
+    expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(1)
     expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.providerSent).toBe(false)
     expect(h.photoRetryChanges.at(-1)).not.toBe(true)
     expect(h.persistenceErrors).not.toContain(PHOTO_RETRY_MESSAGE)
@@ -2880,7 +2896,7 @@ describe("GeminiLiveController", () => {
       outputTranscription: {text: "The answer to the interruption, not a photo caption."}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
       turnComplete: true,
     }})
-    await waitFor(() => h.sockets[0].sent.filter((value) => JSON.parse(value).realtimeInput?.video).length === 2)
+    await waitFor(() => h.sockets[0].sent.filter((value) => photoInput(JSON.parse(value))).length === 2)
     expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
     saveCaption(h.sockets[0], "image-1", "The photo shows a fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
@@ -2904,11 +2920,10 @@ describe("GeminiLiveController", () => {
     expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
     h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
     completeTurn(h, "A preceding spoken question.", "A preceding spoken answer.", true)
-    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
+    await waitFor(() => h.sockets[0].sent.some(value => photoInput(JSON.parse(value))))
     expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay"))).toHaveLength(1)
-    expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput).map(value => JSON.parse(value)))
-      .toEqual([{realtimeInput: {video: {data: "AQID", mimeType: "image/png"}}},
-        {realtimeInput: {text: `image_id: native-fenced\n${PHOTO_CAPTION_INSTRUCTION}`}}])
+    expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value))).map(value => JSON.parse(value)))
+      .toEqual([photoTurn("native-fenced")])
     saveCaption(h.sockets[0], "native-fenced", "A fictional cobalt circle.")
     await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
     const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
@@ -2931,7 +2946,7 @@ describe("GeminiLiveController", () => {
       outputTranscription: {text: "Current answer."}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
     }})
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
-    expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(0)
+    expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(0)
     expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
     if (boundary === "stop") await h.controller.stop()
     else h.sockets[0].message({serverContent: {
@@ -2948,7 +2963,7 @@ describe("GeminiLiveController", () => {
     ])
     if (boundary === "stop") return
     if (boundary === "interrupted") completeTurn(h, "Finish my question.", "Here is the answer.")
-    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
+    await waitFor(() => h.sockets[0].sent.some(value => photoInput(JSON.parse(value))))
 
     saveCaption(h.sockets[0], "image-1", "The photo shows a fictional blue square.")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
@@ -2978,7 +2993,7 @@ describe("GeminiLiveController", () => {
     storage.setGate = new Promise<void>(resolve => {release = resolve})
     const sending = h.controller.sendImage({imageId: "journal-photo", mimeType: "image/png", data: "AQID"})
     await waitFor(() => storage.setCalls > before)
-    expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video)).toBe(false)
+    expect(h.sockets[0].sent.some(value => photoInput(JSON.parse(value)))).toBe(false)
     h.sockets[0].message({serverContent: {turnComplete: true}})
     release()
     await sending
@@ -3014,7 +3029,7 @@ describe("GeminiLiveController", () => {
     expect(rows.map(event => event.sequence)).toEqual(boundary === "empty-interrupted" ? [] : boundary === "empty" ? [41] : [41, 42])
     expect(rows.filter(event => event.event_kind === "image")).toHaveLength(["empty", "output"].includes(boundary) ? 1 : 0)
     expect(rows.some(event => event.event_kind === "photo_caption")).toBe(false)
-    expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video)).toBe(["empty", "output"].includes(boundary))
+    expect(h.sockets[0].sent.some(value => photoInput(JSON.parse(value)))).toBe(["empty", "output"].includes(boundary))
     if (boundary !== "input") {
       expect(rows.some(event => event.event_kind === "transcript_gap")).toBe(false)
     }
@@ -3047,10 +3062,10 @@ describe("GeminiLiveController", () => {
     }})
     releaseReplay()
     await new Promise(resolve => setTimeout(resolve, 0))
-    expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.video)).toHaveLength(0)
+    expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(0)
     expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
     h.sockets[0].message({serverContent: {turnComplete: true}})
-    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
+    await waitFor(() => h.sockets[0].sent.some(value => photoInput(JSON.parse(value))))
     saveCaption(h.sockets[0], "recovered-photo", "The photo shows a fictional blue square.")
     await waitFor(() => h.requests.some(request => request.url.endsWith("/transcripts/append")))
     await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
@@ -3601,7 +3616,7 @@ describe("GeminiLiveController", () => {
     expect(h.errors).toEqual([])
     expect(h.sockets[0].readyState).toBe(1)
     await h.controller.stop(true)
-    expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
+    expect(h.sockets[0].sent.some(value => textTurn(JSON.parse(value)))).toBe(false)
     expect(h.requests.some(request => request.url.endsWith('/end'))).toBe(true)
   })
 
@@ -3757,7 +3772,7 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/recall")))
 
     const stopping = h.controller.stop(true)
-    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    await waitFor(() => h.sockets[0].sent.some((value) => textTurn(JSON.parse(value))))
     release()
     await new Promise((resolve) => setTimeout(resolve, 0))
     h.sockets[0].message({
@@ -3853,7 +3868,7 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
 
     const stopping = h.controller.stop(true)
-    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    await waitFor(() => h.sockets[0].sent.some((value) => textTurn(JSON.parse(value))))
     h.sockets[0].message({serverContent: {outputTranscription: {text: "NO_SUMMARY"}, turnComplete: true}})
     await stopping
   })
@@ -3948,7 +3963,7 @@ describe("GeminiLiveController", () => {
     await discard
     await expect(sending).rejects.toThrow("Photo send cancelled")
     expect(storage.values.get(JOURNAL_KEY)).toBe("")
-    expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
+    expect(h.sockets[0].sent.some(value => textTurn(JSON.parse(value)))).toBe(false)
     await h.controller.stop()
   })
 
@@ -4201,7 +4216,7 @@ describe("GeminiLiveController", () => {
     try {
       await start(h)
       await waitFor(() => h.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
-      await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
+      await waitFor(() => h.sockets[0].sent.some(value => photoInput(JSON.parse(value))))
       expect(h.photoRetryChanges.at(-1)).toBe(false)
       expect(h.persistenceErrors.at(-1)).not.toBeNull()
     } finally {
@@ -4504,11 +4519,85 @@ describe("GeminiLiveController", () => {
     h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
 
     await h.controller.stop(true)
-    expect(h.sockets[0].sent.some((value) => JSON.parse(value).clientContent)).toBe(false)
+    expect(h.sockets[0].sent.some((value) => textTurn(JSON.parse(value)))).toBe(false)
     const events = h.requests
       .filter((request) => request.url.endsWith("/transcripts/append"))
       .flatMap((request) => request.body.events)
     expect(events.slice(-2).map((event: any) => event.status)).toEqual(["interrupted", "interrupted"])
+  })
+
+  test("Stop resumes its paced flush after reconnect and waits for the preceding native response", async () => {
+    const storage = new FakeStorage()
+    const h = harness({storage, photoDrainTimeoutMs: 3_500})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "flush-resumption"}})
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+    h.controller.sendAudio("AAAA", "phone")
+    await h.controller.sendImage({imageId: "flush-recovery", mimeType: "image/png", data: "AQID"})
+    const flushing = new Promise<void>(resolve => {
+      const send = h.sockets[0].send.bind(h.sockets[0])
+      h.sockets[0].send = data => {
+        send(data)
+        if (h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.audio).length >= 3) resolve()
+      }
+    })
+    const stopping = h.controller.stop(true)
+    try {
+      await flushing
+      h.sockets[0].close()
+      await waitFor(() => h.sockets.length === 2)
+      const flushed = new Promise<void>(resolve => {
+        const send = h.sockets[1].send.bind(h.sockets[1])
+        h.sockets[1].send = data => {
+          send(data)
+          if (JSON.parse(data).realtimeInput?.audioStreamEnd) resolve()
+        }
+      })
+      h.sockets[1].open()
+      h.sockets[1].message({setupComplete: {}})
+      await flushed
+      expect(h.sockets.flatMap(socket => socket.sent).filter(value => JSON.parse(value).realtimeInput?.audio)).toHaveLength(19)
+      expect(h.sockets.flatMap(socket => socket.sent).some(value => photoInput(JSON.parse(value)))).toBe(false)
+      h.sockets[1].message({voiceActivity: {type: "ACTIVITY_END"}})
+      h.sockets[1].message({serverContent: {inputTranscription: {text: "A late fictional question."}, generationComplete: true}})
+      expect(h.sockets[1].sent.some(value => photoInput(JSON.parse(value)))).toBe(false)
+      h.sockets[1].message({serverContent: {turnComplete: true}})
+      await waitFor(() => h.sockets[1].sent.some(value => photoInput(JSON.parse(value))))
+      saveCaption(h.sockets[1], "flush-recovery", "A fictional blue square.")
+      await waitFor(() => functionResponses(h.sockets[1]).length === 1)
+      h.sockets[1].message({serverContent: {turnComplete: true}})
+      await stopping
+      const rows = h.requests.flatMap(request => request.body.events ?? [])
+      expect(rows.some(row => row.role === "user" && row.content === "A late fictional question.")).toBe(true)
+      expect(h.finalizations.filter(result => result.durable)).toHaveLength(1)
+      expect(h.audio).toEqual([])
+      expect(h.errors).toEqual([])
+    } finally {
+      await stopping
+    }
+  })
+
+  test("confirmed interruption during Stop recovers the same photo without treating Stop itself as interruption", async () => {
+    const h = harness({storage: new FakeStorage(), photoDrainTimeoutMs: 500})
+    await start(h)
+    await h.controller.sendImage({imageId: "interrupted-drain", mimeType: "image/png", data: "AQID"})
+    const stopping = h.controller.stop(true)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(1)
+      h.sockets[0].message({serverContent: {interrupted: true, turnComplete: true}})
+      await waitFor(() => h.sockets[0].sent.filter(value => photoInput(JSON.parse(value))).length === 2)
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay")).map(request => request.body.image_id))
+        .toEqual(["interrupted-drain"])
+      saveCaption(h.sockets[0], "interrupted-drain", "A fictional blue square.")
+      await waitFor(() => functionResponses(h.sockets[0]).length === 1)
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      await stopping
+      expect(h.finalizations.filter(result => result.durable)).toHaveLength(1)
+      expect(h.errors).toEqual([])
+    } finally {
+      await stopping
+    }
   })
 
   test.each(["snapshot", "journal", "replay"])("graceful Stop drains late photo %s before reflection", async (phase) => {
@@ -4546,29 +4635,29 @@ describe("GeminiLiveController", () => {
       })
     }
     const stopping = h.controller.stop(true)
-    expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
+    expect(h.sockets[0].sent.some(value => textTurn(JSON.parse(value)))).toBe(false)
     finishSnapshot()
     storage.setGate = null
     await sending
     if (inputFlushed) {
-      expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video)).toBe(false)
+      expect(h.sockets[0].sent.some(value => photoInput(JSON.parse(value)))).toBe(false)
       await inputFlushed
     }
-    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
+    await waitFor(() => h.sockets[0].sent.some(value => photoInput(JSON.parse(value))))
     if (phase === "replay") {
       const messages = h.sockets[0].sent.map(value => JSON.parse(value))
       const streamEnd = messages.findIndex(message => message.realtimeInput?.audioStreamEnd)
-      const image = messages.findIndex(message => message.realtimeInput?.video)
-      const task = messages.findIndex(message => message.realtimeInput?.text)
+      const image = messages.findIndex(message => photoInput(message))
+      const task = messages.findIndex(message => photoTask(message))
       expect(streamEnd).toBeGreaterThan(-1)
       expect(streamEnd).toBeLessThan(image)
-      expect(image).toBeLessThan(task)
+      expect(image).toBe(task)
       expect(messages.filter(message => message.realtimeInput?.audio)).toHaveLength(19)
     }
     saveCaption(h.sockets[0], "late-photo", "An internal perception before reflection.")
     h.sockets[0].message({serverContent: {turnComplete: true}})
-    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
-    expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(1)
+    await waitFor(() => h.sockets[0].sent.some((value) => textTurn(JSON.parse(value))))
+    expect(h.sockets[0].sent.filter((value) => textTurn(JSON.parse(value)))).toHaveLength(1)
     h.sockets[0].message({
       serverContent: {
         modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
@@ -4599,7 +4688,7 @@ describe("GeminiLiveController", () => {
     completeTurn(h, "one", "answer one")
     completeTurn(h, "two", "answer two")
     await h.controller.sendImage({imageId: "ack-first", mimeType: "image/png", data: "AQID"})
-    const reflectionRequests = () => h.sockets[0].sent.filter(value => JSON.parse(value).clientContent)
+    const reflectionRequests = () => h.sockets[0].sent.filter(value => textTurn(JSON.parse(value)))
     const before = [...h.audio]
     if (timing === "after-ACK") {
       saveCaption(h.sockets[0], "ack-first", "A fictional amber star.")
@@ -4656,7 +4745,7 @@ describe("GeminiLiveController", () => {
     completeTurn(h, "two", "answer two")
     const stopping = h.controller.stop(true)
     try {
-      await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).clientContent))
+      await waitFor(() => h.sockets[0].sent.some(value => textTurn(JSON.parse(value))))
       h.sockets[0].message({serverContent: {
         outputTranscription: {text: "A reflection despite the failed upload."},
         modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true,
@@ -4710,7 +4799,7 @@ describe("GeminiLiveController", () => {
       expect(rows.some(row => row.content === "Entirely unheard caption reasoning.")).toBe(false)
       expect(rows.filter(row => row.event_kind === "photo_caption").map(row => row.content))
         .toEqual(["A fictional green notebook."])
-      expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
+      expect(h.sockets[0].sent.some(value => textTurn(JSON.parse(value)))).toBe(false)
       expect(h.requests.filter(request => request.url.endsWith("/end"))).toHaveLength(1)
     } finally {
       h.sockets[0].message({serverContent: {turnComplete: true}})
@@ -4740,7 +4829,7 @@ describe("GeminiLiveController", () => {
       expect(h.audio).toEqual(["AAAAAA=="])
       expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage)
         .toMatchObject({imageId: "heard-timeout", retryRequested: true})
-      expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
+      expect(h.sockets[0].sent.some(value => textTurn(JSON.parse(value)))).toBe(false)
       expect(h.requests.filter(request => request.url.endsWith("/end"))).toHaveLength(1)
     } finally {
       await h.controller.stop()
@@ -4755,7 +4844,7 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
 
     const stopping = h.controller.stop(true)
-    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    await waitFor(() => h.sockets[0].sent.some((value) => textTurn(JSON.parse(value))))
     h.sockets[0].message({
       serverContent: {
         modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
@@ -4780,7 +4869,7 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
 
     const stopping = h.controller.stop(true)
-    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    await waitFor(() => h.sockets[0].sent.some((value) => textTurn(JSON.parse(value))))
     const audioBefore = [...h.audio]
     if (!coPacket) {
       h.sockets[0].message({serverContent: {inputTranscription: {text: "Delayed orphan "}}})
@@ -4818,7 +4907,7 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
 
     const stopping = h.controller.stop(true)
-    await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
+    await waitFor(() => h.sockets[0].sent.some((value) => textTurn(JSON.parse(value))))
     h.sockets[0].message({serverContent: {outputTranscription: {text: "private partial"}}})
     h.sockets[0].close()
     await stopping
@@ -5003,9 +5092,9 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.sockets.length === 2)
     h.sockets[1].open()
     h.sockets[1].message({setupComplete: {}})
-    await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).realtimeInput?.video))
+    await waitFor(() => h.sockets[1].sent.some((value) => photoInput(JSON.parse(value))))
 
-    expect(h.sockets[1].sent.filter((value) => JSON.parse(value).realtimeInput?.video)).toHaveLength(1)
+    expect(h.sockets[1].sent.filter((value) => photoInput(JSON.parse(value)))).toHaveLength(1)
     saveCaption(h.sockets[1], "image-cold", "The photo shows a fictional blue square.")
     await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
     const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
@@ -5270,7 +5359,7 @@ describe("GeminiLiveController", () => {
       await waitFor(() => h.sockets.length === 2)
       h.sockets[1].open()
       h.sockets[1].message({setupComplete: {}})
-      await waitFor(() => h.sockets[1].sent.some((value) => JSON.parse(value).realtimeInput?.video))
+      await waitFor(() => h.sockets[1].sent.some((value) => photoInput(JSON.parse(value))))
       saveCaption(h.sockets[1], `image-${cause}`, "The photo shows a fictional blue square.")
       await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
 

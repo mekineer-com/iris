@@ -599,16 +599,19 @@ export class GeminiLiveController {
     if ((this.draining && !this.drainInputFlushed) || (this.stopPromise && !this.draining)) return false
     const pending = this.pendingImage!
     socket.send(JSON.stringify({
-      realtimeInput: {video: {data, mimeType}},
+      clientContent: {
+        turns: [{role: "user", parts: [{inlineData: {data, mimeType}},
+          {text: `image_id: ${pending.imageId}\n${PHOTO_CAPTION_INSTRUCTION}`}]}],
+        turnComplete: true,
+      },
     }))
-    socket.send(JSON.stringify({realtimeInput: {text: `image_id: ${pending.imageId}\n${PHOTO_CAPTION_INSTRUCTION}`}}))
     this.toolBatch = {request: null, completed: false, continuationSent: false, background: true, started: true}
     this.photoBatch = this.toolBatch
     return true
   }
 
   private photoDeliveryFenced(): boolean {
-    return (this.turnActive && !this.draining) ||
+    return this.turnActive ||
       (this.photoBatch === this.toolBatch && !this.photoBatch.completed) ||
       Boolean(this.toolBatch.started && this.toolBatch.request && !this.toolBatch.request.retired)
   }
@@ -808,12 +811,18 @@ export class GeminiLiveController {
         const pending = this.pendingImage
         if (this.mode === "continuous" && this.audioFramesSent > 0) {
           const silence = btoa("\0".repeat(3200))
-          for (let frame = 0; frame < 18; frame += 1) {
-            if (!this.draining || !this.ready || this.socket?.readyState !== WS_OPEN) return
-            this.sendAudioToSocket(this.socket, silence)
+          for (let frame = 0; frame < 18;) {
+            if (!this.draining) return
+            if (this.ready && this.socket?.readyState === WS_OPEN) {
+              this.sendAudioToSocket(this.socket, silence)
+              frame += 1
+            }
             await new Promise(resolve => setTimeout(resolve, 100))
           }
-          if (!this.draining || !this.ready || this.socket?.readyState !== WS_OPEN) return
+          while (this.draining && (!this.ready || this.socket?.readyState !== WS_OPEN)) {
+            await new Promise(resolve => setTimeout(resolve, 100))
+          }
+          if (!this.draining || !this.socket) return
           this.socket.send(JSON.stringify({realtimeInput: {audioStreamEnd: true}}))
         }
         if (!this.draining) return
@@ -1639,7 +1648,7 @@ export class GeminiLiveController {
     this.settleSpeechDraft(userComplete)
     this.recordAssistantOutput(output, audible, true)
     this.interruptionFinalized = true
-    if (!this.stopPromise && this.pendingImage?.providerSent && !this.pendingImage.caption) {
+    if ((!this.stopPromise || (this.draining && userComplete)) && this.pendingImage?.providerSent && !this.pendingImage.caption) {
       this.pendingImage.providerSent = false
       this.pendingImage.retryRequested = false
       void this.persistJournal()
