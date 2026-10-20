@@ -6,6 +6,14 @@ documentation.
 
 Last verified against Google's official documentation: 2026-08-31.
 
+Source migration in progress, 2026-10-20: MCP now returns `v1beta` and Iris
+requires that constrained socket; token minting stays on `v1alpha/auth_tokens`.
+The unsupported proactivity setting and its constraint-mask entry are removed.
+These seams follow the Gemini 3.8 provider checks in `PLAN_iris_gemini38.md`.
+No model/configuration cutover has occurred. The remaining sections describe
+the earlier 2.5 contract until Slice 3's caption and settlement repairs land;
+the current source is not a release-ready migration.
+
 ## Pinned Runtime
 
 - Model: `gemini-2.5-flash-native-audio-preview-12-2025`

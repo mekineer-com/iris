@@ -169,7 +169,7 @@ function harness(
           next_transcript_sequence: options.startSequence ?? 41,
           ephemeral_token: "ephemeral/test",
           websocket: {
-            api_version: "v1alpha",
+            api_version: "v1beta",
             method: "BidiGenerateContentConstrained",
             input_audio_rate_hz: 16000,
             output_audio_rate_hz: 24000,
@@ -445,7 +445,7 @@ describe("GeminiLiveController", () => {
         next_transcript_sequence: recovery === "rekey" ? 41 : 45,
         ephemeral_token: "ephemeral/test",
         websocket: {
-          api_version: "v1alpha", method: "BidiGenerateContentConstrained",
+          api_version: "v1beta", method: "BidiGenerateContentConstrained",
           input_audio_rate_hz: 16000, output_audio_rate_hz: 24000,
         },
         lease_seconds: 90,
@@ -725,7 +725,7 @@ describe("GeminiLiveController", () => {
 
     const replacement = harness({storage, appendStatuses: Array(100).fill(503), startBody: {
       session_id: "replacement-sitting", next_transcript_sequence: 41, ephemeral_token: "ephemeral/test",
-      websocket: {api_version: "v1alpha", method: "BidiGenerateContentConstrained",
+      websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
         input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
       lease_seconds: 90, session_warning_seconds: 0,
     }})
@@ -806,6 +806,27 @@ describe("GeminiLiveController", () => {
 
     expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(0)
     await h.controller.stop()
+  })
+
+  test("a new photo cannot replace an accepted photo during automatic replay", async () => {
+    let release!: () => void
+    const replayGate = new Promise<void>((resolve) => { release = resolve })
+    const storage = new FakeStorage()
+    const h = harness({storage, replayGates: [replayGate]})
+    try {
+      await start(h)
+      await h.controller.sendImage({imageId: "original-photo", mimeType: "image/png", data: "AQID"})
+      h.sockets[0].message({serverContent: {interrupted: true, turnComplete: true}})
+      completeTurn(h)
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/replay")))
+      await expect(h.controller.sendImage({imageId: "new-photo", mimeType: "image/jpeg", data: "AQID"}))
+        .rejects.toThrow("Another photo is still pending")
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe("original-photo")
+    } finally {
+      release()
+      await h.controller.stop()
+    }
   })
 
   test("reconnect during journal write sends one photo", async () => {
@@ -950,7 +971,7 @@ describe("GeminiLiveController", () => {
 
       const replacement = harness({storage, appendStatuses: Array(100).fill(503), startBody: {
         session_id: "replacement-sitting", next_transcript_sequence: 43, ephemeral_token: "ephemeral/test",
-        websocket: {api_version: "v1alpha", method: "BidiGenerateContentConstrained",
+        websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
           input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
         lease_seconds: 90, session_warning_seconds: 0,
       }})
@@ -1523,6 +1544,9 @@ describe("GeminiLiveController", () => {
     expect(h.requests.filter((request) => request.url.endsWith("/sitting-1/end"))).toHaveLength(1)
     expect(h.requests.every((request) => request.authorization === null)).toBe(true)
     expect(new URL(h.socketUrls[0]).searchParams.get("access_token")).toBe("ephemeral/test")
+    expect(new URL(h.socketUrls[0]).pathname).toBe(
+      "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained",
+    )
   })
 
   test("sends one buffered Manual activity in order", async () => {
@@ -1612,7 +1636,7 @@ describe("GeminiLiveController", () => {
             next_transcript_sequence: 42,
             ephemeral_token: "ephemeral/retry",
             websocket: {
-              api_version: "v1alpha",
+              api_version: "v1beta",
               method: "BidiGenerateContentConstrained",
               input_audio_rate_hz: 16000,
               output_audio_rate_hz: 24000,
@@ -2541,7 +2565,7 @@ describe("GeminiLiveController", () => {
         imageSequence: 41, caption: "A retained description", assistantSequence: 42}})
     storage.values.set(JOURNAL_KEY, raw)
     const h = harness({storage, startBody: {session_id: "restored", next_transcript_sequence: 1,
-      ephemeral_token: "ephemeral/test", websocket: {api_version: "v1alpha", method: "BidiGenerateContentConstrained",
+      ephemeral_token: "ephemeral/test", websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
         input_audio_rate_hz: 16000, output_audio_rate_hz: 24000}, lease_seconds: 90, session_warning_seconds: 0}})
     await start(h)
     expect(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)).toEqual([raw])
@@ -2710,7 +2734,7 @@ describe("GeminiLiveController", () => {
         next_transcript_sequence: 41,
         ephemeral_token: "ephemeral/test",
         websocket: {
-          api_version: "v1alpha",
+          api_version: "v1beta",
           method: "BidiGenerateContentConstrained",
           input_audio_rate_hz: 16000,
           output_audio_rate_hz: 24000,
@@ -2755,7 +2779,7 @@ describe("GeminiLiveController", () => {
     storage.values.set("openalma:gemini-session-v1", JSON.stringify(recovery))
     const gap = harness({storage, startBody: {
       session_id: "different-history", next_transcript_sequence: 39, ephemeral_token: "ephemeral/test",
-      websocket: {api_version: "v1alpha", method: "BidiGenerateContentConstrained",
+      websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
         input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
       lease_seconds: 90, session_warning_seconds: 0,
     }})

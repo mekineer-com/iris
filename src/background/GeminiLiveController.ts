@@ -392,7 +392,8 @@ export class GeminiLiveController {
     if (!this.ready || this.stopping || !socket || socket.readyState !== WS_OPEN) {
       throw new Error("Gemini socket is not ready")
     }
-    if (this.pendingImage?.providerSent && this.pendingImage.imageId !== image.imageId) {
+    if (this.pendingImage && (this.pendingImage.providerSent || !this.pendingImage.retryRequested) &&
+        this.pendingImage.imageId !== image.imageId) {
       throw new Error("Another photo is still pending")
     }
     if (this.pendingImage && this.pendingImage.imageId !== image.imageId) {
@@ -717,7 +718,7 @@ export class GeminiLiveController {
       typeof body.ephemeral_token !== "string" ||
       !body.ephemeral_token ||
       !ws ||
-      ws.api_version !== "v1alpha" ||
+      ws.api_version !== "v1beta" ||
       ws.method !== "BidiGenerateContentConstrained" ||
       ws.input_audio_rate_hz !== 16000 ||
       ws.output_audio_rate_hz !== 24000 ||
@@ -737,7 +738,7 @@ export class GeminiLiveController {
   private async connectSocket(handle: string, timeoutMs = this.setupTimeoutMs): Promise<SocketLike> {
     const url =
       "wss://generativelanguage.googleapis.com/ws/" +
-      "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained" +
+      "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained" +
       `?access_token=${encodeURIComponent(this.token)}`
     const socket = this.openSocket(url)
     this.socket = socket
