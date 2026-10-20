@@ -48,6 +48,13 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
 }
 
 describe("SessionPage state projection", () => {
+  test("server-owned photo Retry and Discard are enabled while idle", () => {
+    const render = renderPage({configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+      connection: "idle", photoRetryPending: true, failedPhotos: ["server-photo"]}, async () => ({ok: true}))
+    const actions = nodes(render()).find(node => node.props?.className === "image-review").props.children
+    expect(actions.map((button: any) => button.props.disabled)).toEqual([false, false])
+    expect(JSON.stringify(render())).toContain("Photo filing failed")
+  })
 
   test("submitted manual recording names the selected Soul", () => {
     for (const soulId of ["Quill", "Paper Moon"]) {

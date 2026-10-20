@@ -579,12 +579,14 @@ export default function SessionPage() {
       {imageStatus ? <p role="status">{imageStatus}</p> : null}
       {photoRetryPending ? (
         <div>
-          <p role="status">{visible === "idle" || visible === "error"
+          <p role="status">{snapshot?.failedPhotos?.length
+            ? "Photo filing failed. Retry or discard it here."
+            : visible === "idle" || visible === "error"
             ? "Start Iris to retry or discard the pending photo"
             : PHOTO_RETRY_MESSAGE}</p>
           <div className="image-review">
-            <button type="button" disabled={imagePending || !voiceReady} onClick={() => void handleStoredPhoto("retry")}>Retry</button>
-            <button type="button" disabled={imagePending || !voiceReady} onClick={() => void handleStoredPhoto("discard")}>Discard</button>
+            <button type="button" disabled={imagePending || stopping || (!voiceReady && !snapshot?.failedPhotos?.length)} onClick={() => void handleStoredPhoto("retry")}>Retry</button>
+            <button type="button" disabled={imagePending || stopping || (!voiceReady && !snapshot?.failedPhotos?.length)} onClick={() => void handleStoredPhoto("discard")}>Discard</button>
           </div>
         </div>
       ) : null}

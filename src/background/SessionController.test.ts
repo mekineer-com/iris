@@ -15,11 +15,12 @@ const CONFIG: OpenAlmaConfig = {
   version: "0.1.0",
 }
 
-function withOwnerDiscovery(fetchFn: typeof fetch, userId = CONFIG.userId): typeof fetch {
+function withOwnerDiscovery(fetchFn: typeof fetch, userId = CONFIG.userId, failedPhotos: string[] = []): typeof fetch {
   return (async (url, init) => {
     if (String(url).endsWith("/integration/mentra/owner") && !init?.method) {
       return Response.json({user_id: userId})
     }
+    if (String(url).includes("/integration/mentra/status?")) return Response.json({failed_photos: failedPhotos})
     return fetchFn(url, init)
   }) as typeof fetch
 }
@@ -291,6 +292,28 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
 }
 
 describe("SessionController", () => {
+  test.each(["retry", "discard"])("server-owned failed photo supports idle %s without starting voice", async action => {
+    const session = new FakeSession()
+    session.stored.set("openalma.soul-id", CONFIG.soulId)
+    const failed = ["server-photo"]
+    const actions: Array<{url: string; body: unknown}> = []
+    const fetchFn = withOwnerDiscovery((async (url, init) => {
+      if (String(url).includes("/photos/")) {
+        actions.push({url: String(url), body: JSON.parse(String(init?.body))})
+        failed.splice(0)
+        return Response.json({ok: true})
+      }
+      return Response.json({souls: [CONFIG.soulId]})
+    }) as typeof fetch, CONFIG.userId, failed)
+    new SessionController(session as never, {config: CONFIG, fetchFn,
+      createLiveController: () => {throw new Error("Photo recovery must not start Gemini")}}).start()
+    await session.handlers["openalma:set-capabilities"]({cameraEnabled: true})
+    expect(lastSnapshot(session)).toMatchObject({connection: "idle", photoRetryPending: true, failedPhotos: ["server-photo"]})
+    await session.handlers["openalma:pending-image"]({action})
+    expect(actions).toEqual([{url: `${CONFIG.baseUrl}/integration/mentra/photos/server-photo/${action}`,
+      body: {user_id: CONFIG.userId, soul_id: CONFIG.soulId}}])
+    expect(lastSnapshot(session)).toMatchObject({connection: "idle", photoRetryPending: false, failedPhotos: []})
+  })
   test("does no network work until a phone-local profile is saved", async () => {
     const session = new FakeSession()
     let requests = 0
@@ -591,6 +614,7 @@ describe("SessionController", () => {
     const fetchFn = (async (url, init) => {
       if (String(url).startsWith(saved.baseUrl)) throw new Error("Old address is unreachable")
       expect(String(url).startsWith(installationDefaults.baseUrl)).toBe(true)
+      if (String(url).includes("/integration/mentra/status?")) return Response.json({failed_photos: []})
       if (init?.method) {
         const body = JSON.parse(String(init.body))
         reports.push(body)
@@ -1534,6 +1558,7 @@ describe("SessionController", () => {
       microphoneEnabled: true,
       cameraEnabled: true,
       photoRetryPending: false,
+      failedPhotos: [],
       lastError: null,
       usageTotalTokens: null,
       durationWarning: false,

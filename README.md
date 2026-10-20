@@ -25,8 +25,10 @@ PNG. Photos send immediately unless you enable preview, which offers Send or
 Retake. Files over 1 MB show a dismissible cost and latency warning. Her spoken
 description becomes the saved caption.
 
-Unconfirmed photo recovery stays on the phone after Stop. Start Iris again before
-using Retry or Discard.
+Unconfirmed uploads stay in phone recovery after Stop; Start Iris again to check
+the saved original. Once the server accepts a caption for filing, it owns that
+work. Failed server filings can be retried or discarded while Iris is idle,
+including after reopening the app. Discard does not delete the original image.
 
 ## Memory Processing
 

@@ -74,6 +74,7 @@ export class SessionController {
   private cameraEnabled = true
   private preferencesLoaded: Promise<void> = Promise.resolve()
   private photoRetryPending = false
+  private failedPhotos: string[] = []
   private manualAudio: string[] = []
   private manualAudioBytes = 0
   private manualMicSource: MicSource | undefined
@@ -138,7 +139,13 @@ export class SessionController {
 
     this.send = ui.send
     this.preferencesLoaded = this.loadPreferences()
-    this.unsubs.push(ui.onOpen(() => this.pushSnapshot()))
+    this.unsubs.push(ui.onOpen(() => {
+      this.pushSnapshot()
+      void this.preferencesLoaded.then(() => this.refreshFailedPhotos()).catch((error) => {
+        this.lastError = error instanceof Error ? error.message : String(error)
+        this.pushSnapshot()
+      })
+    }))
     this.unsubs.push(
       ui.handle("openalma:set-profile", async (payload) => {
         await this.preferencesLoaded
@@ -224,7 +231,9 @@ export class SessionController {
           await this.session.storage.set(SOUL_ID_KEY, selectedSoul)
           this.soulId = selectedSoul
           this.soulConfirmed = true
+          this.failedPhotos = []
           if (!this.souls.includes(selectedSoul)) this.souls = [...this.souls, selectedSoul]
+          await this.refreshFailedPhotos()
           await this.reportSelectedSoul()
           return {soulId: selectedSoul, created: result.created}
         } finally {
@@ -243,6 +252,17 @@ export class SessionController {
       ui.handle("openalma:pending-image", async (payload) => {
         const action = (payload as {action?: string} | null)?.action
         await this.preferencesLoaded
+        if (this.failedPhotos.length && (action === "retry" || action === "discard")) {
+          const config = this.currentConfig()
+          const soulId = this.soulId
+          const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/photos/${this.failedPhotos[0]}/${action}`, {
+            method: "POST", signal: timeoutSignal(10_000), headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({user_id: config.userId, soul_id: soulId}),
+          })
+          if (!response.ok) throw new Error(`Photo ${action} failed (${response.status})`)
+          if (this.soulId === soulId && this.config?.baseUrl === config.baseUrl) await this.refreshFailedPhotos()
+          return {ok: true as const}
+        }
         if (!this.liveController) throw new Error("Start Iris to retry or discard the pending photo")
         if (action === "retry") await this.liveController.retryImage()
         else if (action === "discard") await this.liveController.discardImage()
@@ -388,7 +408,8 @@ export class SessionController {
       manualPhase: this.manualPhase,
       microphoneEnabled: this.microphoneEnabled,
       cameraEnabled: this.cameraEnabled,
-      photoRetryPending: this.photoRetryPending,
+      photoRetryPending: this.photoRetryPending || this.failedPhotos.length > 0,
+      failedPhotos: [...this.failedPhotos],
       lastError: this.liveController?.activityPauseReason || this.lastError,
       usageTotalTokens: this.usageTotalTokens,
       durationWarning: this.durationWarning,
@@ -608,6 +629,10 @@ export class SessionController {
     if (generation !== this.startGeneration) return
 
     await this.refreshRecoveryLock()
+    void this.refreshFailedPhotos().catch((error) => {
+      this.lastError = error instanceof Error ? error.message : String(error)
+      this.pushSnapshot()
+    })
 
     if (this.teardownKind === "stop") {
       try {
@@ -935,6 +960,7 @@ export class SessionController {
       this.config = {...config, userId: identity.config.userId}
       this.souls = identity.souls
       this.memuAvailable = true
+      await this.refreshFailedPhotos()
     } catch (error) {
       this.memuAvailable = false
       this.lastError = error instanceof Error ? error.message : String(error)
@@ -1000,6 +1026,31 @@ export class SessionController {
     if (!this.config || this.installationPending()) return
     const journal = await readSessionJournal(this.session.storage)
     if (!journal.unreadable) this.recoverySoulId = journalSoulId(journal.raw, this.currentConfig())
+  }
+
+  private async refreshFailedPhotos(): Promise<void> {
+    if (!this.config || !this.soulId || this.installationPending()) return
+    const config = this.config
+    const soulId = this.soulId
+    const generation = this.startGeneration
+    const query = new URLSearchParams({user_id: config.userId, soul_id: soulId})
+    const current = () => this.soulId === soulId && this.config === config && generation === this.startGeneration
+    try {
+      const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/status?${query}`, {
+        signal: timeoutSignal(10_000),
+      })
+      if (!response.ok) throw new Error(`Photo recovery status failed (${response.status})`)
+      const result = await response.json() as {failed_photos?: unknown}
+      const photos = result.failed_photos ?? []
+      if (!Array.isArray(photos) || photos.some(id => typeof id !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(id))) {
+        throw new Error("Invalid photo recovery status")
+      }
+      if (!current()) return
+      this.failedPhotos = photos
+      this.pushSnapshot()
+    } catch (error) {
+      if (current()) throw error
+    }
   }
 
   private resetManualState(): void {

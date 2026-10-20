@@ -31,6 +31,7 @@ export interface SessionSnapshot {
   microphoneEnabled: boolean
   cameraEnabled: boolean
   photoRetryPending: boolean
+  failedPhotos?: string[]
   lastError: string | null
   usageTotalTokens: number | null
   durationWarning: boolean
