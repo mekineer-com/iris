@@ -1,6 +1,6 @@
 import {describe, expect, spyOn, test} from "bun:test"
 
-import {GeminiLiveController, JOURNAL_KEY, PHOTO_CAPTION_INSTRUCTION, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
+import {GeminiLiveController, journalSoulId, JOURNAL_KEY, PHOTO_CAPTION_INSTRUCTION, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {PHOTO_RETRY_MESSAGE} from "../shared/types"
 
@@ -135,7 +135,7 @@ function harness(
   const errors: string[] = []
   const persistenceErrors: Array<string | null> = []
   const photoRetryChanges: boolean[] = []
-  const finalizations: Array<{ok: boolean; queued: boolean; discarded?: boolean}> = []
+  const finalizations: Array<{ok: boolean; durable: boolean; queued: boolean}> = []
   const reconnecting: boolean[] = []
   const usage: number[] = []
   let durationWarnings = 0
@@ -208,6 +208,10 @@ function harness(
     }
     if (url.endsWith("/transcripts/append")) {
       await appendGates.shift()
+      const sitting = decodeURIComponent(new URL(url).pathname.match(/\/session\/([^/]+)\/transcripts\/append$/)![1])
+      if (body.events.some((event: any) => event.event_id !== `${sitting}:${event.sequence}`)) {
+        return Response.json({detail: "Transcript event ID does not match sitting and sequence"}, {status: 409})
+      }
       const status = appendStatuses.shift() ?? 200
       if (status === 200) {
         options.history?.push(...body.events)
@@ -220,15 +224,10 @@ function harness(
     }
     if (url.endsWith("/snapshot/finalize")) {
       if (finalizeGates.length) await finalizeGates.shift()
-      if (options.history) {
-        const saved = options.history.some((event) => event.event_id === body.caption_event_id &&
-          event.role === "assistant" && event.event_kind === "photo_caption" && event.content === body.caption &&
-          event.media_ref === `mentra_media/test-phone/${body.image_id}.png` && event.status === undefined)
-        const result = saved ? {ok: true, durable: true, queued: true} : {ok: true, queued: false, discarded: true}
-        finalizations.push(result)
-        return Response.json(result)
-      }
-      return Response.json({ok: true, durable: true}, {status: finalizeStatuses.shift() ?? 200})
+      const status = finalizeStatuses.shift() ?? 200
+      const result = {ok: status === 200, durable: status === 200, queued: status === 200}
+      finalizations.push(result)
+      return Response.json(result, {status})
     }
     if (url.endsWith("/snapshot/replay")) {
       await replayGates.shift()
@@ -318,7 +317,11 @@ async function start(h: ReturnType<typeof harness>, mode: "continuous" | "manual
   await starting
 }
 
-function completeTurn(h: ReturnType<typeof harness>, input = "hello", output = "hi"): void {
+function completeTurn(h: ReturnType<typeof harness>, input = "hello", output = "hi", activityStarted = false): void {
+  if (input.trim()) {
+    if (!activityStarted) h.sockets.at(-1)!.message({voiceActivity: {type: "ACTIVITY_START"}})
+    h.sockets.at(-1)!.message({voiceActivity: {type: "ACTIVITY_END"}})
+  }
   h.sockets.at(-1)!.message({
     serverContent: {
       inputTranscription: {text: input},
@@ -330,6 +333,338 @@ function completeTurn(h: ReturnType<typeof harness>, input = "hello", output = "
 }
 
 describe("GeminiLiveController", () => {
+  test.each([["continuous", false], ["manual", false], ["continuous", true]] as const)(
+    "%s publishes normal speech without waiting for Stop (input before START=%s)", async (mode, inputBeforeStart) => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, mode)
+    if (mode === "manual") h.controller.sendActivity(["AAAA"], "phone")
+    else h.controller.sendAudio("AAAA", "phone")
+    if (inputBeforeStart) h.sockets[0].message({serverContent: {inputTranscription: {text: "A fictional "}}})
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+    if (!inputBeforeStart) h.sockets[0].message({serverContent: {inputTranscription: {text: "A fictional "}}})
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "normal question."}}})
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "A normal answer."},
+      modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/transcripts/append")))
+    const rows = h.requests.flatMap(request => request.body.events ?? [])
+    expect(rows.map(row => [row.role, row.content, row.status])).toEqual([
+      ["user", "A fictional normal question.", "complete"], ["assistant", "A normal answer.", "complete"],
+    ])
+    expect(rows[0].mic_source).toBe("phone")
+    expect(h.requests.some(request => request.url.endsWith("/end"))).toBe(false)
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("Continuous reply completion cannot finalize words while native capture is still active", async () => {
+    const storage = new FakeStorage()
+    const h = harness({storage})
+    await start(h)
+    h.controller.sendAudio("AAAA", "phone")
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "Keep these first "}}})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "A reply before capture ended."},
+      modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+    await waitFor(() => {
+      const drafts = JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").draftTranscripts
+      return drafts?.length === 2 && drafts[0].speech?.waiting === true
+    })
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    expect(h.errors).toEqual([])
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "and remaining words."}}})
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+    await h.controller.stop()
+    const rows = h.requests.flatMap(request => request.body.events ?? [])
+    expect(rows.map(row => [row.event_kind, row.role, row.content, row.status])).toEqual([
+      ["transcript", "user", "Keep these first and remaining words.", "complete"],
+      ["transcript", "assistant", "A reply before capture ended.", "complete"],
+    ])
+    expect(rows[0].mic_source).toBe("phone")
+    expect(h.persistenceErrors).not.toContain("Some spoken words could not be transcribed")
+    expect(h.errors).toEqual([])
+  })
+
+  test("a lost append ACK and later ambiguous draft never change previously submitted events", async () => {
+    const storage = new FakeStorage()
+    const options = {storage, appendAckLost: true}
+    const h = harness(options)
+    await start(h)
+    completeTurn(h, "Already submitted question.", "Already submitted answer.")
+    await waitFor(() => h.persistenceErrors.includes("Transcript sync failed; retrying"))
+    const first = h.requests.find(request => request.url.endsWith("/transcripts/append"))!
+    const submitted = JSON.stringify(first.body)
+    const originals = new Map(first.body.events.map((event: any) => [event.event_id, JSON.stringify(event)]))
+    for (const text of ["Delayed first. ", "Delayed second."]) {
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "Later answer."},
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+      h.sockets[0].message({serverContent: {inputTranscription: {text}}})
+    }
+    await waitFor(() => h.requests.filter(request => request.url.endsWith("/transcripts/append")).length >= 2)
+    options.appendAckLost = false
+    await h.controller.stop()
+    expect(JSON.stringify(first.body)).toBe(submitted)
+    const rows = h.requests.flatMap(request => request.body.events ?? [])
+    for (const row of rows.filter(row => originals.has(row.event_id))) {
+      expect(JSON.stringify(row)).toBe(originals.get(row.event_id))
+    }
+    expect(rows.some(row => row.content ===
+      "[Turn timing uncertain; combined speech, text retained in received order.]\nDelayed first. Delayed second.")).toBe(true)
+    expect(h.errors).toEqual([])
+  })
+
+  test.each(["reservation", "partial-text"] as const)("cold recovery seals a crashed %s before admitting new speech", async crash => {
+    const storage = new FakeStorage()
+    const old = harness({storage})
+    await start(old)
+    old.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+    if (crash === "partial-text") {
+      old.sockets[0].message({serverContent: {inputTranscription: {text: "Retained unfinished words."}}})
+    } else {
+      old.sockets[0].message({serverContent: {outputTranscription: {text: "An answer before the crash."},
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+    }
+    await waitFor(() => {
+      const drafts = JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").draftTranscripts
+      return drafts?.[0]?.speech?.waiting &&
+        (crash === "partial-text" ? drafts[0].content === "Retained unfinished words." : drafts.length === 2)
+    })
+    const restored = new FakeStorage()
+    restored.values.set(JOURNAL_KEY, storage.values.get(JOURNAL_KEY)!)
+    await old.controller.stop()
+    const next = harness({storage: restored})
+    await start(next)
+    next.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+    next.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+    completeTurn(next, "Entirely new speech.", "A new answer.", true)
+    await next.controller.stop()
+    const rows = next.requests.flatMap(request => request.body.events ?? [])
+    expect(rows.filter(row => row.role === "user" && row.event_kind === "transcript").map(row => row.content))
+      .toEqual(crash === "partial-text" ? ["Retained unfinished words.", "Entirely new speech."] : ["Entirely new speech."])
+    if (crash === "reservation") {
+      expect(rows.some(row => row.event_kind === "transcript_gap" && row.role === "user")).toBe(true)
+      expect(next.persistenceErrors).toContain("Some spoken words could not be transcribed")
+      expect(next.persistenceErrors.at(-1)).toBe("Some spoken words could not be transcribed")
+    } else expect(rows.find(row => row.content === "Retained unfinished words.").status).toBe("interrupted")
+    expect(next.errors).toEqual([])
+  })
+
+  test.each([false, true])("a v2 draft-only backup preserves words unless history resets (reset=%s)", async reset => {
+    const storage = new FakeStorage()
+    const old = harness({storage})
+    await start(old)
+    if (reset) old.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "reset-history-handle"}})
+    old.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+    old.sockets[0].message({serverContent: {inputTranscription: {text: "Words from replaced history."}}})
+    await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").draftTranscripts?.[0]?.content ===
+      "Words from replaced history.")
+    const raw = storage.values.get(JOURNAL_KEY)!
+    expect(JSON.parse(raw).version).toBe(2)
+    expect(journalSoulId(raw, CONFIG)).toBe(CONFIG.soulId)
+    expect(JSON.parse(raw).pendingTranscripts).toEqual([])
+    expect(JSON.parse(raw).nextTranscriptSequence).toBe(41)
+    const restored = new FakeStorage()
+    restored.values.set(JOURNAL_KEY, raw)
+    await old.controller.stop()
+    const next = harness({storage: restored, startSequence: reset ? 39 : 41})
+    await start(next)
+    expect(JSON.parse(next.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
+    if (reset) {
+      expect(JSON.parse(restored.values.get(RECOVERED_CHATS_KEY)!)).toEqual([raw])
+      expect(next.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    } else {
+      await waitFor(() => next.requests.some(request => request.body.events?.some(
+        (row: any) => row.content === "Words from replaced history.")))
+      expect(restored.values.has(RECOVERED_CHATS_KEY)).toBe(false)
+    }
+    completeTurn(next, "New history question.", "New history answer.")
+    await next.controller.stop()
+    expect(next.requests.flatMap(request => request.body.events ?? []).map(row => [row.sequence, row.content]))
+      .toEqual(reset ? [[39, "New history question."], [40, "New history answer."]] :
+        [[41, "Words from replaced history."], [42, "New history question."], [43, "New history answer."]])
+    expect(next.errors).toEqual([])
+  })
+
+  test("admitted missing speech produces a gap only at Stop even without an assistant reply", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    expect(h.persistenceErrors).not.toContain("Some spoken words could not be transcribed")
+    await h.controller.stop()
+    expect(h.requests.flatMap(request => request.body.events ?? [])).toEqual([
+      {event_id: "sitting-1:41", sequence: 41, event_kind: "transcript_gap", role: "user", content: "Transcript unavailable."},
+    ])
+    expect(h.persistenceErrors.at(-1)).toBe("Some spoken words could not be transcribed")
+    expect(h.audio).toEqual([])
+    expect(h.errors).toEqual([])
+  })
+
+  test.each(["", " \n "])("raw silence without speech admission creates no fake gaps (%j)", async text => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    h.sockets[0].message({serverContent: {inputTranscription: {text}, outputTranscription: {text}, turnComplete: true}})
+    await h.controller.stop()
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    expect(h.persistenceErrors).not.toContain("Some spoken words could not be transcribed")
+    expect(h.audio).toEqual([])
+    expect(h.errors).toEqual([])
+  })
+
+  test("resumed reconnect leaves late speech unresolved until Stop", async () => {
+    const storage = new FakeStorage()
+    const h = harness({storage})
+    await start(h)
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "late-speech-handle"}})
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "An answer before reconnect."},
+      modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+    h.sockets[0].close()
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    expect(JSON.parse(h.sockets[1].sent[0])).toEqual({setup: {sessionResumption: {handle: "late-speech-handle"}}})
+    h.sockets[1].message({setupComplete: {}})
+    await waitFor(() => h.reconnecting.at(-1) === false)
+    h.sockets[1].message({serverContent: {inputTranscription: {text: "Late words after reconnect."}}})
+    await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").draftTranscripts?.[0]?.content ===
+      "Late words after reconnect.")
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).draftTranscripts[0].speech.waiting).toBe(true)
+    await h.controller.stop()
+    expect(h.requests.flatMap(request => request.body.events ?? []).map(row => [row.role, row.content])).toEqual([
+      ["user", "Late words after reconnect."], ["assistant", "An answer before reconnect."],
+    ])
+    expect(h.errors).toEqual([])
+  })
+
+  test("an unresolved speech draft permits durable photo ACK before any timeline append", async () => {
+    const storage = new FakeStorage()
+    const history: NonNullable<Parameters<typeof harness>[0]>["history"] = []
+    const h = harness({storage, history})
+    await start(h)
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "A reply with delayed input."},
+      modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+    await h.controller.sendImage({imageId: "late-photo", mimeType: "image/png", data: "AQID"})
+    saveCaption(h.sockets[0], "late-photo", "A fictional striped oval.")
+    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse?.functionResponses?.some(
+      (response: any) => response.id === "caption-late-photo" && response.response.durable === true)))
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    expect(history).toEqual([])
+    const upload = h.requests.findIndex(request => request.url.endsWith("/snapshot"))
+    const finalize = h.requests.findIndex(request => request.url.endsWith("/snapshot/finalize"))
+    expect(upload).toBeGreaterThanOrEqual(0)
+    expect(finalize).toBeGreaterThan(upload)
+    expect(h.requests[finalize].body).toEqual({user_id: CONFIG.userId, soul_id: CONFIG.soulId,
+      image_id: "late-photo", caption: "A fictional striped oval.", caption_event_id: "sitting-1:photo:late-photo"})
+    await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage === null)
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).draftTranscripts.map((draft: any) => draft.event_kind))
+      .toEqual(["transcript", "transcript", "image", "photo_caption"])
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "The delayed photo question."}}})
+    await h.controller.stop()
+    expect(history.map(row => [row.event_kind, row.content])).toEqual([
+      ["transcript", "The delayed photo question."], ["transcript", "A reply with delayed input."],
+      ["image", "Shared a photo."], ["photo_caption", "A fictional striped oval."],
+    ])
+    expect(history.filter(row => ["image", "photo_caption"].includes(row.event_kind)).map(row => row.event_id))
+      .toEqual(["sitting-1:43", "sitting-1:44"])
+    expect(h.errors).toEqual([])
+  })
+
+  test("chunks uncertain combined Unicode speech within 16000 characters without losing words or prefix", async () => {
+    const fragments = ["a" + " ".repeat(16_001), "\u{1f642}".repeat(16_001) + " z"]
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    for (const text of fragments) {
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional answer."},
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+      h.sockets[0].message({serverContent: {inputTranscription: {text}}})
+    }
+    await h.controller.stop()
+    const rows = h.requests.flatMap(request => request.body.events ?? [])
+    const users = rows.filter(row => row.role === "user")
+    expect(users.length).toBeGreaterThan(2)
+    expect(users.every(row => Array.from(row.content).length <= 16_000)).toBe(true)
+    expect(users.map(row => row.content).join("")).toBe(
+      "[Turn timing uncertain; combined speech, text retained in received order.]\n" + fragments.join(""))
+    expect(new Set(rows.map(row => row.event_id)).size).toBe(rows.length)
+    expect(rows.map(row => row.sequence)).toEqual(rows.map((_, index) => 41 + index))
+    expect(h.errors).toEqual([])
+  })
+
+  test.each(["alone", "unheard output", "heard reply"] as const)("orphan input is uncertain when co-delivered with %s", async packet => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    completeTurn(h, "An already settled question.", "Its settled answer.")
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/transcripts/append")))
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "Orphan words."},
+      ...(packet !== "alone" ? {outputTranscription: {text: "Another reply."}, turnComplete: true} : {}),
+      ...(packet === "heard reply" ? {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}} : {}),
+    }})
+    await h.controller.stop()
+    expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.role === "user")
+      .map(row => row.content)).toEqual(["An already settled question.",
+        "[Turn timing uncertain; combined speech, text retained in received order.]\nOrphan words."])
+    expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.role === "assistant")
+      .map(row => row.content)).toEqual(packet === "heard reply" ? ["Its settled answer.", "Another reply."] : ["Its settled answer."])
+    expect(h.errors).toEqual([])
+  })
+
+  test.each(["continuous", "manual"] as const)("%s preserves late fragmented speech before its answer", async mode => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, mode)
+    if (mode === "manual") h.controller.sendActivity(["AAAA"], "phone")
+    else h.controller.sendAudio("AAAA", "phone")
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START", audioOffset: "0s"}})
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END", audioOffset: "1s"}})
+    h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
+      outputTranscription: {text: "The fictional badge is blue."}, turnComplete: true}})
+    expect(h.errors).toEqual([])
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "What color "}}})
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "is the badge?"}}})
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+    const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events)
+    expect(rows.map(row => [row.role, row.content])).toEqual([
+      ["user", "What color is the badge?"], ["assistant", "The fictional badge is blue."],
+    ])
+    expect(rows[0].mic_source).toBe("phone")
+    expect(rows.every(row => row.event_kind === "transcript")).toBe(true)
+  })
+
+  test("overlapping late speech is combined with uncertain timing, not assigned to a later reply", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    for (const answer of ["A fictional blue square.", "A fictional red triangle."]) {
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+      h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
+        outputTranscription: {text: answer}, turnComplete: true}})
+    }
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "First question. "}}})
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "Second question."}}})
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+    const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
+      .flatMap(request => request.body.events)
+    const users = rows.filter(row => row.role === "user")
+    expect(users).toHaveLength(1)
+    expect(users[0].content).toContain("Turn timing uncertain")
+    expect(users[0].content).toContain("text retained in received order")
+    expect(users[0].content).toEndWith("First question. Second question.")
+    expect(rows.filter(row => row.role === "assistant").map(row => row.content))
+      .toEqual(["A fictional blue square.", "A fictional red triangle."])
+    expect(rows.some(row => row.event_kind === "transcript_gap")).toBe(false)
+  })
+
   test("production traces contain lengths, never transcripts or recalled memory", async () => {
     const previousEnv = process.env.NODE_ENV
     const logs = spyOn(console, "info").mockImplementation(() => {})
@@ -421,77 +756,41 @@ describe("GeminiLiveController", () => {
       soul_id: "Test Soul",
       image_id: "image-1",
       caption: "A fictional blue square.",
-      caption_event_id: "sitting-1:42",
+      caption_event_id: "sitting-1:photo:image-1",
     })
     await h.controller.stop()
   })
 
-  test("photo journal distinguishes discarded captions, lost ACKs and queued caption rekeys", async () => {
-    for (const recovery of ["discarded", "lost-ack", "rekey"] as const) {
-      const storage = new FakeStorage()
-      const history: NonNullable<Parameters<typeof harness>[0]>["history"] = []
-      const h = harness({
-        storage,
-        history,
-        appendStatuses: recovery === "lost-ack" ? [] : Array(100).fill(503),
-        appendAckLost: recovery === "lost-ack",
-      })
-      await start(h)
-      await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
-      saveCaption(h.sockets[0], "image-1", "A fictional blue square.")
-      await h.controller.stop()
-      const journal = JSON.parse(storage.values.get("openalma:gemini-session-v1")!)
-      expect(journal.pendingImage.assistantSequence).toBe(42)
-      expect(journal.pendingImage.sessionId).toBe("sitting-1")
-      expect(journal.pendingTranscripts.some((event: any) => event.event_id === "sitting-1:42")).toBe(true)
-      expect(h.finalizations).toEqual([])
-
-      const replacementStart = {
-        session_id: "replacement-sitting",
-        next_transcript_sequence: recovery === "rekey" ? 41 : 45,
-        ephemeral_token: "ephemeral/test",
-        websocket: {
-          api_version: "v1beta", method: "BidiGenerateContentConstrained",
-          input_audio_rate_hz: 16000, output_audio_rate_hz: 24000,
-        },
-        lease_seconds: 90,
-        session_warning_seconds: 0,
-      }
-      if (recovery !== "rekey") {
-        const otherPhone = harness({
-          config: {...CONFIG, deviceSessionId: "other-test-phone"},
-          history,
-          startBody: {...replacementStart, session_id: "other-phone-sitting",
-            next_transcript_sequence: recovery === "lost-ack" ? 43 : 41},
-        })
-        await start(otherPhone)
-        if (recovery === "discarded") completeTurn(otherPhone, "First fictional question", "First fictional answer")
-        completeTurn(otherPhone, "Another fictional question", "Another fictional answer")
-        await otherPhone.controller.stop()
-        expect(history.some((event) => event.event_id === "other-phone-sitting:44")).toBe(true)
-      }
-      const recovered = harness({storage, history, startBody: replacementStart})
-      await start(recovered)
-      await waitFor(() => recovered.finalizations.length === 1 &&
-        (recovery === "discarded" ? recovered.photoRetryChanges.at(-1) === true :
-          storage.values.get("openalma:gemini-session-v1") === "" && recovered.photoRetryChanges.at(-1) === false))
-      const finalize = recovered.requests.find((request) => request.url.endsWith("/snapshot/finalize"))!
-      expect(finalize.url).toContain("/session/replacement-sitting/")
-      expect(finalize.body.caption_event_id).toBe(
-        recovery === "rekey" ? "replacement-sitting:42" : "sitting-1:42",
-      )
-      expect(recovered.finalizations).toEqual([
-        recovery === "discarded" ? {ok: true, queued: false, discarded: true} : {ok: true, durable: true, queued: true},
-      ])
-      expect(recovered.requests.filter((request) => request.url.endsWith("/transcripts/append")))
-        .toHaveLength(recovery === "rekey" ? 1 : 0)
-      expect(recovered.requests.some((request) => request.url.endsWith("/snapshot/replay"))).toBe(false)
-      expect(recovered.photoRetryChanges.at(-1)).toBe(recovery === "discarded")
-      expect(recovered.persistenceErrors.at(-1)).toBe(recovery === "discarded" ? PHOTO_RETRY_MESSAGE : null)
-      expect(recovered.errors).toEqual([])
-      await recovered.controller.stop()
-      expect(recovered.finalizations).toHaveLength(1)
-    }
+  test.each(["lost-ack", "rekey", "advanced"] as const)("durable photo receipt survives %s transcript recovery without refiling", async recovery => {
+    const storage = new FakeStorage()
+    const history: NonNullable<Parameters<typeof harness>[0]>["history"] = []
+    const h = harness({storage, history,
+      appendStatuses: recovery === "lost-ack" ? [] : Array(100).fill(503),
+      appendAckLost: recovery === "lost-ack"})
+    await start(h)
+    await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    saveCaption(h.sockets[0], "image-1", "A fictional blue square.")
+    await waitFor(() => h.finalizations.length === 1)
+    await h.controller.stop()
+    const journal = JSON.parse(storage.values.get(JOURNAL_KEY)!)
+    expect(journal.pendingImage).toBeNull()
+    expect(journal.pendingTranscripts.find((event: any) => event.event_kind === "photo_caption").event_id)
+      .toBe("sitting-1:42")
+    expect(h.finalizations).toEqual([{ok: true, durable: true, queued: true}])
+    const recovered = harness({storage, history, startBody: {
+      session_id: "replacement-sitting", next_transcript_sequence: recovery === "rekey" ? 41 : 45,
+      ephemeral_token: "ephemeral/test", websocket: {api_version: "v1beta",
+        method: "BidiGenerateContentConstrained", input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
+      lease_seconds: 90, session_warning_seconds: 0,
+    }})
+    await start(recovered)
+    await recovered.controller.stop()
+    expect(recovered.requests.some(request => request.url.endsWith("/snapshot/finalize") ||
+      request.url.endsWith("/snapshot/replay"))).toBe(false)
+    const captions = recovered.requests.flatMap(request => request.body.events ?? [])
+      .filter(event => event.event_kind === "photo_caption")
+    expect(captions.map(event => event.event_id)).toEqual(recovery === "rekey" ? ["replacement-sitting:42"] : [])
+    expect(recovered.errors).toEqual([])
   })
 
   test("caption tools bind the scoped original and never overwrite accepted same-ID captions", async () => {
@@ -568,7 +867,7 @@ describe("GeminiLiveController", () => {
         }}))
       const h = harness({storage, replayBodies: [{mime_type: "image/png", data: "AQID",
         media_ref: "mentra_media/test-phone/receipt-photo.png", filing: {
-          caption: "A fictional amber star.", caption_event_id: "old-sitting:42", status,
+          caption: "A fictional amber star.", caption_event_id: "old-sitting:photo:receipt-photo", status,
         }}]})
       await start(h)
       await waitFor(() => storage.values.get(JOURNAL_KEY) === "")
@@ -587,7 +886,7 @@ describe("GeminiLiveController", () => {
 
   test.each([false, true])("a cold duplicate tool call checks its receipt before saving (conflict=%s)", async conflict => {
     const h = harness({storage: new FakeStorage(), replayBodies: [{filing: {
-      caption: "A fictional amber star.", caption_event_id: "old-sitting:42", status: "complete",
+      caption: "A fictional amber star.", caption_event_id: "old-sitting:photo:receipt-photo", status: "complete",
     }}]})
     await start(h)
     saveCaption(h.sockets[0], "receipt-photo", conflict ? "A different fictional scene." : "A fictional amber star.")
@@ -648,7 +947,7 @@ describe("GeminiLiveController", () => {
     const storage = new FakeStorage()
     const history: NonNullable<Parameters<typeof harness>[0]>["history"] = []
     const h = harness({storage, history, replayBodies: [{filing: {
-      caption: "A fictional amber star.", caption_event_id: "old-sitting:42", status: "complete",
+      caption: "A fictional amber star.", caption_event_id: "old-sitting:photo:photo-a", status: "complete",
     }}]})
     await start(h)
     await h.controller.sendImage({imageId: "photo-b", mimeType: "image/png", data: "BAUG"})
@@ -1112,7 +1411,7 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
-  test("retains image finalization until the caption transcript is acknowledged", async () => {
+  test("acknowledges durable photo filing before the caption timeline append", async () => {
     let releaseImage!: () => void
     let releaseCaption!: () => void
     const imageGate = new Promise<void>((resolve) => {
@@ -1129,8 +1428,8 @@ describe("GeminiLiveController", () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     saveCaption(h.sockets[0], "image-1", "A fictional blue square.")
     await waitFor(() => h.requests.filter((request) => request.url.endsWith("/transcripts/append")).length === 2)
-    expect(h.requests.some((request) => request.url.endsWith("/snapshot/finalize"))).toBe(false)
-    expect(h.sockets[0].sent.some(value => JSON.parse(value).toolResponse)).toBe(false)
+    await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
+    expect(h.requests.some((request) => request.url.endsWith("/snapshot/finalize"))).toBe(true)
     releaseCaption()
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
     await h.controller.stop()
@@ -1176,7 +1475,7 @@ describe("GeminiLiveController", () => {
     expect(h.photoRetryChanges.at(-1)).toBe(false)
     expect(h.persistenceErrors.at(-1)).toBeNull()
     h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
-    completeTurn(h, "Continue speaking during caption retry.", "The caption retry did not block us.")
+    completeTurn(h, "Continue speaking during caption retry.", "The caption retry did not block us.", true)
     await h.controller.stop()
   })
 
@@ -1210,7 +1509,7 @@ describe("GeminiLiveController", () => {
       await waitFor(() => old.photoRetryChanges.at(-1) === true)
       const captionJournal = JSON.parse(storage.values.get("openalma:gemini-session-v1")!)
       expect(captionJournal.pendingImage.caption).toBe("A fictional blue square.")
-      expect(captionJournal.pendingImage.assistantSequence).toBe(42)
+      expect(captionJournal.pendingImage.captionEventId).toBe("sitting-1:photo:image-1")
       expect(captionJournal.pendingTranscripts).toEqual([])
 
       let finishFinalize!: () => void
@@ -1223,7 +1522,7 @@ describe("GeminiLiveController", () => {
       const retrying = old.controller.retryImage()
       await waitFor(() => old.requests.filter((request) => request.url.endsWith("/snapshot/finalize"))
         .length === attempts + 1)
-      expect(old.requests.at(-1)!.body.caption_event_id).toBe("sitting-1:42")
+      expect(old.requests.at(-1)!.body.caption_event_id).toBe("sitting-1:photo:image-1")
       await old.controller.stop()
 
       const replacement = harness({storage, appendStatuses: Array(100).fill(503), startBody: {
@@ -1546,6 +1845,42 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test("a resumed caption uses recorded delivery while photo replay is still pending", async () => {
+    let releaseReplay!: () => void
+    const replayGate = new Promise<void>(resolve => {releaseReplay = resolve})
+    const storage = new FakeStorage()
+    const h = harness({storage, replayGates: [replayGate]})
+    try {
+      await start(h)
+      h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "photo-delivery-handle"}})
+      await h.controller.sendImage({imageId: "resumed-photo", mimeType: "image/png", data: "AQID"})
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage?.imageRecorded === true)
+      h.sockets[0].close()
+      await waitFor(() => h.sockets.length === 2)
+      h.sockets[1].open()
+      expect(JSON.parse(h.sockets[1].sent[0])).toEqual({setup: {sessionResumption: {handle: "photo-delivery-handle"}}})
+      h.sockets[1].message({setupComplete: {}})
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/replay")))
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage?.providerSent === false)
+      saveCaption(h.sockets[1], "resumed-photo", "A fictional green crescent.")
+      await waitFor(() => h.sockets[1].sent.some(value => JSON.parse(value).toolResponse?.functionResponses?.some(
+        (response: any) => response.response.durable === true)))
+      expect(h.sockets[1].sent.some(value => JSON.parse(value).realtimeInput?.video)).toBe(false)
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot/finalize"))).toHaveLength(1)
+      expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id)
+        .toBe("sitting-1:photo:resumed-photo")
+      releaseReplay()
+      await h.controller.stop()
+      expect(h.sockets[1].sent.some(value => JSON.parse(value).realtimeInput?.video)).toBe(false)
+      expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.event_kind === "image"))
+        .toHaveLength(1)
+      expect(h.errors).toEqual([])
+    } finally {
+      releaseReplay()
+      await h.controller.stop()
+    }
+  })
+
   test("hydrates an uncaptioned image for same-id retry without duplicating its event", async () => {
     let releaseReplay!: () => void
     const replayGate = new Promise<void>((resolve) => {
@@ -1612,6 +1947,8 @@ describe("GeminiLiveController", () => {
     expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.providerSent).toBe(false)
     expect(h.photoRetryChanges.at(-1)).not.toBe(true)
     expect(h.persistenceErrors).not.toContain(PHOTO_RETRY_MESSAGE)
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
     h.sockets[0].message({serverContent: {
       inputTranscription: {text: "I was still speaking."},
       outputTranscription: {text: "The answer to the interruption, not a photo caption."}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
@@ -1640,7 +1977,7 @@ describe("GeminiLiveController", () => {
     expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput)).toBe(false)
     expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
     h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
-    completeTurn(h, "A preceding spoken question.", "A preceding spoken answer.")
+    completeTurn(h, "A preceding spoken question.", "A preceding spoken answer.", true)
     await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
     expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay"))).toHaveLength(1)
     expect(h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput).map(value => JSON.parse(value)))
@@ -1698,7 +2035,7 @@ describe("GeminiLiveController", () => {
     expect(rows.map(event => event.sequence)).toEqual(expectedSequences)
     expect(new Set(rows.map(event => event.event_id)).size).toBe(expectedSequences.length)
     expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id)
-      .toBe(`sitting-1:${expectedSequences.at(-1)}`)
+      .toBe("sitting-1:photo:image-1")
     expect(h.errors).toEqual([])
     await h.controller.stop()
   })
@@ -1735,8 +2072,8 @@ describe("GeminiLiveController", () => {
     const h = harness({storage})
     await start(h)
     h.sockets[0].message({serverContent: {
-      inputTranscription: {text: boundary === "input" ? "Partial question." : " "},
-      outputTranscription: {text: boundary === "output" ? "Partial answer." : " "},
+      inputTranscription: {text: boundary === "input" ? "Partial question." : ""},
+      outputTranscription: {text: boundary === "output" ? "Partial answer." : ""},
       ...(["input", "output"].includes(boundary) ? {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}} : {}),
     }})
     await h.controller.sendImage({imageId: "gap-photo", mimeType: "image/png", data: "AQID"})
@@ -1749,22 +2086,21 @@ describe("GeminiLiveController", () => {
     const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
       .flatMap(request => request.body.events)
     expect(rows.map(event => event.sequence)).toEqual(boundary === "empty-interrupted" ? [] : boundary === "empty" ? [41] : [41, 42])
-    expect(rows.filter(event => event.event_kind === "image")).toHaveLength(boundary === "empty" ? 1 : 0)
+    expect(rows.filter(event => event.event_kind === "image")).toHaveLength(["empty", "output"].includes(boundary) ? 1 : 0)
     expect(rows.some(event => event.event_kind === "photo_caption")).toBe(false)
-    expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video)).toBe(boundary === "empty")
-    if (boundary === "empty" || boundary === "empty-interrupted") {
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video)).toBe(["empty", "output"].includes(boundary))
+    if (boundary !== "input") {
       expect(rows.some(event => event.event_kind === "transcript_gap")).toBe(false)
     }
     expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage).toEqual(expect.objectContaining({
-      imageId: "gap-photo", mediaRef: "mentra_media/test-phone/gap-photo.png", providerSent: boundary === "empty",
+      imageId: "gap-photo", mediaRef: "mentra_media/test-phone/gap-photo.png", providerSent: ["empty", "output"].includes(boundary),
     }))
     expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
-    expect(h.errors).toEqual(boundary === "empty-interrupted" || boundary === "empty" ? [] :
-      ["Gemini completed a turn without both transcriptions"])
+    expect(h.errors).toEqual(boundary === "input" ? ["Gemini completed audible speech without its transcription"] : [])
     await h.controller.stop()
   })
 
-  test("defers a recovered photo marker during speech and finalizes only after caption ACK", async () => {
+  test("defers a recovered photo marker during speech but files before timeline ACK", async () => {
     let releaseReplay!: () => void
     let releaseAppend!: () => void
     const replayGate = new Promise<void>(resolve => {releaseReplay = resolve})
@@ -1791,16 +2127,17 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.video))
     saveCaption(h.sockets[0], "recovered-photo", "The photo shows a fictional blue square.")
     await waitFor(() => h.requests.some(request => request.url.endsWith("/transcripts/append")))
-    expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
-    releaseAppend()
     await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+    releaseAppend()
+    await waitFor(() => h.requests.some(request => request.body.events?.some(
+      (event: any) => event.event_kind === "photo_caption")))
     const rows = h.requests.filter(request => request.url.endsWith("/transcripts/append"))
       .flatMap(request => request.body.events)
     expect(rows.map(event => [event.sequence, event.content])).toEqual([
       [41, "Current user turn."], [42, "Current answer."], [43, "Shared a photo."],
       [44, "The photo shows a fictional blue square."],
     ])
-    expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id).toBe("sitting-1:44")
+    expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id).toBe("sitting-1:photo:recovered-photo")
     expect(h.errors).toEqual([])
     await h.controller.stop()
   })
@@ -1991,7 +2328,6 @@ describe("GeminiLiveController", () => {
 
     h.sockets[0].message({
       serverContent: {
-        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
         inputTranscription: {text: "remember the beacon"},
         turnComplete: true,
       },
@@ -2000,14 +2336,14 @@ describe("GeminiLiveController", () => {
       },
     })
     expect(h.events).toEqual(["toolBoundary"])
-    expect(h.audio).toEqual(["AAAAAA=="])
+    expect(h.audio).toEqual([])
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/recall")))
     const recall = h.requests.find((request) => request.url.endsWith("/recall"))!
     expect(recall.body).toEqual({user_id: "Test User", soul_id: "Test Soul", query: "beacon"})
     expect(recall.authorization).toBeNull()
 
     h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
-    expect(h.audio).toEqual(["AAAAAA==", "AAAAAA=="])
+    expect(h.audio).toEqual(["AAAAAA=="])
     expect(h.sockets[0].sent.some((value) => JSON.parse(value).toolResponse)).toBe(false)
 
     release()
@@ -2033,7 +2369,7 @@ describe("GeminiLiveController", () => {
     await waitFor(
       () => h.requests
         .filter((request) => request.url.endsWith("/transcripts/append"))
-        .flatMap((request) => request.body.events).length === 6,
+        .flatMap((request) => request.body.events).length === 5,
     )
     const events = h.requests
       .filter((request) => request.url.endsWith("/transcripts/append"))
@@ -2043,11 +2379,10 @@ describe("GeminiLiveController", () => {
       ["assistant", "I remembered it.", "complete"],
       ["user", "ordinary follow-up", "complete"],
       ["assistant", "ordinary answer", "complete"],
-      ["user", "Transcript unavailable.", undefined],
       ["assistant", "stale license", "complete"],
     ])
-    expect(events.map((event: any) => event.mic_source)).toEqual(["bluetoothClassic", undefined, undefined, undefined, undefined, undefined])
-    expect(h.errors).toEqual(["Gemini completed a turn without both transcriptions"])
+    expect(events.map((event: any) => event.mic_source)).toEqual(["bluetoothClassic", undefined, undefined, undefined, undefined])
+    expect(h.errors).toEqual([])
     await h.controller.stop()
   })
 
@@ -2502,7 +2837,7 @@ describe("GeminiLiveController", () => {
     expect(h.errors).toEqual([])
   })
 
-  test("malformed and ordinary one-sided turns still fail loud", async () => {
+  test("unknown tools and heard replies without assistant transcription fail loud", async () => {
     const unknown = harness()
     await start(unknown)
     unknown.sockets[0].message({
@@ -2517,7 +2852,7 @@ describe("GeminiLiveController", () => {
       serverContent: {inputTranscription: {text: "ordinary unfinished reply"},
         modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true},
     })
-    expect(ordinary.errors).toEqual(["Gemini completed a turn without both transcriptions"])
+    expect(ordinary.errors).toEqual(["Gemini completed audible speech without its transcription"])
     await ordinary.controller.stop()
   })
 
@@ -2598,7 +2933,7 @@ describe("GeminiLiveController", () => {
     h.sockets[0].message({serverContent: {inputTranscription: {text: "only one side"},
       ...(audible ? {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}} : {}), turnComplete: true}})
     expect(h.audio).toEqual(audible ? ["AAAAAA=="] : [])
-    expect(h.errors).toEqual(audible ? ["Gemini completed a turn without both transcriptions"] : [])
+    expect(h.errors).toEqual(audible ? ["Gemini completed audible speech without its transcription"] : [])
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
     expect(h.requests.find((request) => request.url.endsWith("/transcripts/append"))?.body.events).toEqual([
       expect.objectContaining({event_kind: "transcript", role: "user", content: "only one side", mic_source: "phone"}),
@@ -2848,25 +3183,6 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
-  test("a rejected lower-numbered photo caption is archived without abandoning recovery", async () => {
-    const storage = new FakeStorage()
-    storage.values.set(JOURNAL_KEY, JSON.stringify({version: 1,
-      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
-      resumption: null, pendingTranscripts: [], pendingImage: {
-        imageId: "older-photo", mediaRef: "mentra_media/test-phone/older-photo.png",
-        providerSent: true, captureAfterCurrent: false, generation: 1, sessionId: "old",
-        imageSequence: 39, caption: "A retained old description", assistantSequence: 40}}))
-    const h = harness({storage, history: []})
-    await start(h)
-    await waitFor(() => h.photoRetryChanges.at(-1) === true)
-    const archived = JSON.parse(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)[0])
-    expect(archived.pendingImage.caption).toBe("A retained old description")
-    expect(archived.pendingImage.assistantSequence).toBe(40)
-    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe("older-photo")
-    expect(h.finalizations).toEqual([{ok: true, queued: false, discarded: true}])
-    await h.controller.stop()
-  })
-
   test("a refused caption uses ordinary Retry without repeated finalization or losing its event", async () => {
     const storage = new FakeStorage()
     const caption = "description ".repeat(1_300).trim()
@@ -2877,7 +3193,7 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.photoRetryChanges.at(-1) === true)
     const recovered = JSON.parse(storage.values.get(JOURNAL_KEY)!)
     expect(recovered.pendingImage.caption).toBe(caption)
-    expect(recovered.pendingImage.assistantSequence).toBe(42)
+    expect(recovered.pendingImage.captionEventId).toBe("sitting-1:photo:long-caption")
     const saved = h.requests.filter(request => request.url.endsWith("/transcripts/append")).flatMap(request => request.body.events)
     expect(saved.filter(event => event.role === "assistant").map(event => event.content).join("")).toBe(caption)
     expect(storage.values.has(RECOVERED_CHATS_KEY)).toBe(false)
@@ -3167,6 +3483,31 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test.each(["duplicate reservations", "preassigned draft ID"] as const)("archives malformed draft journal: %s", async malformed => {
+    const reservation = {event_kind: "transcript", role: "user", content: "", status: "complete",
+      speech: {waiting: true, late: true, uncertain: false, ended: true, admitted: true}}
+    const drafts = malformed === "duplicate reservations" ? [reservation, reservation] : [{
+      event_id: "old:photo:premature", event_kind: "photo_caption", role: "assistant",
+      content: "A caption with a premature timeline ID.", media_ref: "mentra_media/test-phone/premature.png",
+    }]
+    const raw = JSON.stringify({version: 1,
+      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+      resumption: {handle: "must-not-resume", updatedAt: Date.now()},
+      pendingTranscripts: [], draftTranscripts: drafts, nextTranscriptSequence: 41})
+    const storage = new FakeStorage()
+    storage.values.set(JOURNAL_KEY, raw)
+    const h = harness({storage})
+    await start(h)
+    expect(JSON.parse(h.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
+    expect(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)).toEqual([raw])
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    completeTurn(h, "A new fictional question.", "An unrelated answer.")
+    await h.controller.stop()
+    expect(h.requests.flatMap(request => request.body.events ?? []).map(row => row.content))
+      .toEqual(["A new fictional question.", "An unrelated answer."])
+    expect(h.errors).toEqual([])
+  })
+
   test("drains a retained queue in server-sized batches", async () => {
     const h = harness({appendStatuses: [503, 200, 200]})
     await start(h)
@@ -3226,6 +3567,7 @@ describe("GeminiLiveController", () => {
     completeTurn(h, "one", "answer one")
     completeTurn(h, "two", "answer two")
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
+    h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
     h.sockets[0].message({serverContent: {inputTranscription: {text: "partial question"}}})
     h.sockets[0].message({serverContent: {outputTranscription: {text: "partial answer"}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
 
@@ -3318,8 +3660,8 @@ describe("GeminiLiveController", () => {
     expect(h.audio.at(-1)).toBe("AAAAAA==")
   })
 
-  test("unexpected input during reflection ends reflection immediately", async () => {
-    const h = harness()
+  test.each([false, true])("late input during reflection preserves orphan speech and summary (co-packet=%s)", async coPacket => {
+    const h = harness({storage: new FakeStorage()})
     await start(h)
     completeTurn(h, "one", "answer one")
     completeTurn(h, "two", "answer two")
@@ -3327,10 +3669,32 @@ describe("GeminiLiveController", () => {
 
     const stopping = h.controller.stop(true)
     await waitFor(() => h.sockets[0].sent.some((value) => JSON.parse(value).clientContent))
-    h.sockets[0].message({serverContent: {inputTranscription: {text: "unexpected"}}})
+    const audioBefore = [...h.audio]
+    if (!coPacket) {
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "Delayed orphan "}}})
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "words."}}})
+    }
+    expect(h.errors).toEqual([])
+    expect(h.audio).toEqual(audioBefore)
+    expect(h.requests.some(request => request.url.endsWith("/end"))).toBe(false)
+    h.sockets[0].message({serverContent: {
+      ...(coPacket ? {inputTranscription: {text: "Delayed orphan words."}} : {}),
+      modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
+      outputTranscription: {text: "I noticed a quiet sense of connection."}, turnComplete: true,
+    }})
     await stopping
 
-    expect(h.errors).toContain("Gemini returned input transcription during reflection")
+    const events = h.requests.flatMap(request => request.body.events ?? [])
+    expect(events.slice(-2)).toEqual([
+      {event_id: "sitting-1:45", sequence: 45, event_kind: "transcript", role: "user", status: "interrupted",
+        content: "[Turn timing uncertain; combined speech, text retained in received order.]\nDelayed orphan words."},
+      {event_id: "sitting-1:46", sequence: 46, event_kind: "sitting_summary", role: "assistant",
+        content: "I noticed a quiet sense of connection."},
+    ])
+    expect(events.filter(event => event.role === "assistant" && event.event_kind === "transcript")
+      .map(event => event.content)).toEqual(["answer one", "answer two"])
+    expect(h.audio).toEqual([...audioBefore, "AAAAAA=="])
+    expect(h.errors).toEqual([])
     expect(h.requests.filter((request) => request.url.endsWith("/end"))).toHaveLength(1)
   })
 
@@ -3537,7 +3901,7 @@ describe("GeminiLiveController", () => {
     expect(rows.map(event => [event.sequence, event.event_kind, event.status])).toEqual([
       [41, "transcript", "interrupted"], [42, "image", undefined], [43, "photo_caption", undefined],
     ])
-    expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id).toBe("sitting-1:43")
+    expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id).toBe("sitting-1:photo:image-cold")
     expect(h.errors).toEqual([])
     await h.controller.stop()
   })

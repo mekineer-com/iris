@@ -41,6 +41,10 @@ type TranscriptEvent = {
   mic_source?: MicSource
 }
 
+type TranscriptDraft = Omit<TranscriptEvent, "sequence" | "event_id"> & {
+  speech?: {waiting: boolean; late: boolean; uncertain: boolean; ended: boolean; admitted: boolean}
+}
+
 type PendingImage = {
   imageId: string
   mediaRef: string
@@ -51,6 +55,8 @@ type PendingImage = {
   imageSequence?: number
   caption?: string
   assistantSequence?: number
+  imageRecorded?: boolean
+  captionEventId?: string
   speakDescription?: boolean
   retryRequested?: boolean
 }
@@ -62,10 +68,12 @@ type StorageLike = {
 }
 
 type SessionJournal = {
-  version: 1
+  version: 1 | 2
   scope: {userId: string; soulId: string; deviceSessionId: string}
   resumption: {handle: string; updatedAt: number} | null
   pendingTranscripts: TranscriptEvent[]
+  draftTranscripts?: TranscriptDraft[]
+  nextTranscriptSequence?: number
   pendingImage?: PendingImage | null
 }
 
@@ -116,6 +124,7 @@ export const SITTING_REFLECTION_PROMPT =
   "Reflect briefly in first person on the emotional tone, subtext, or meaningful shift in this sitting that the literal transcript may not preserve. Do not recap the conversation. Respond with one or two natural sentences, or exactly NO_SUMMARY if nothing worthwhile would be added."
 export const PHOTO_CAPTION_INSTRUCTION =
   "If a photo successfully arrives, use save_photo_caption(image_id, caption) to save your perception of the photo, so you will remember what this moment was about later on. Do not speak the caption out loud."
+const UNCERTAIN_SPEECH_PREFIX = "[Turn timing uncertain; combined speech, text retained in received order.]\n"
 
 function selectJournalKey(keys: string[], fresh = false): string {
   const prefix = `${JOURNAL_KEY}:`
@@ -154,14 +163,14 @@ export function journalSoulId(raw: string | null, config: Pick<OpenAlmaConfig, "
     const journal = JSON.parse(raw ?? "") as Partial<SessionJournal>
     const scope = journal.scope
     if (
-      journal.version !== 1 ||
+      (journal.version !== 1 && journal.version !== 2) ||
       scope?.userId !== config.userId ||
       scope.deviceSessionId !== config.deviceSessionId ||
       typeof scope.soulId !== "string" ||
       !scope.soulId.trim()
     ) return null
     if (
-      !journal.pendingTranscripts?.length && !journal.pendingImage &&
+      !journal.pendingTranscripts?.length && !journal.draftTranscripts?.length && !journal.pendingImage &&
       !(journal.resumption?.handle?.trim() && Number.isFinite(journal.resumption.updatedAt) &&
         Date.now() - journal.resumption.updatedAt <= RESUMPTION_MAX_AGE_MS)
     ) return null
@@ -202,7 +211,6 @@ export class GeminiLiveController {
   activityPauseReason: string | null = null
   private reconnecting = false
   private errorReported = false
-  private inputTranscript = ""
   private outputTranscript = ""
   private turnMicSource: MicSource | undefined
   private interruptionFinalized = false
@@ -213,10 +221,11 @@ export class GeminiLiveController {
   private hasCompletedProviderTurn = false
   private completeUserTurns = 0
   private pendingEvents: TranscriptEvent[] = []
+  private draftEvents: TranscriptDraft[] = []
+  private missingSpeech = false
   private pendingImage: PendingImage | null = null
   private acceptedCaptions = new Map<string, string>()
   private spokenPhotos: string[] = []
-  private describingPhoto = false
   private imageUpload: Promise<void> | null = null
   private draining = false
   private outputMuted = false
@@ -281,10 +290,11 @@ export class GeminiLiveController {
     this.hasCompletedProviderTurn = false
     this.completeUserTurns = 0
     this.pendingEvents = []
+    this.draftEvents = []
+    this.missingSpeech = false
     this.pendingImage = null
     this.acceptedCaptions.clear()
     this.spokenPhotos = []
-    this.describingPhoto = false
     this.imageUpload = null
     this.draining = false
     this.outputMuted = false
@@ -388,6 +398,7 @@ export class GeminiLiveController {
     try {
       socket.send(JSON.stringify({realtimeInput: {activityStart: {}}}))
       started = true
+      this.reserveSpeech(micSource)
       this.turnActive = true
       for (const chunk of audioChunks) {
         if (socket.readyState !== WS_OPEN) throw new Error("socket closed during Manual activity")
@@ -397,6 +408,8 @@ export class GeminiLiveController {
       if (socket.readyState !== WS_OPEN) throw new Error("socket closed during Manual activity")
       socket.send(JSON.stringify({realtimeInput: {activityEnd: {}}}))
       ended = true
+      const speech = this.pendingSpeechDraft()
+      if (speech) speech.speech!.ended = true
     } catch {
       if (started && !ended && socket.readyState === WS_OPEN) {
         try {
@@ -637,8 +650,9 @@ export class GeminiLiveController {
 
   private enqueueImageMarker(): void {
     const pending = this.pendingImage
-    if (pending?.providerSent && !pending.captureAfterCurrent && pending.imageSequence === undefined) {
-      pending.imageSequence = this.enqueueEvent("image", "user", "Shared a photo.", undefined, pending.mediaRef).sequence
+    if (pending?.providerSent && !pending.captureAfterCurrent && !pending.imageRecorded) {
+      pending.imageRecorded = true
+      this.enqueueEvent("image", "user", "Shared a photo.", undefined, pending.mediaRef)
     }
   }
 
@@ -675,7 +689,7 @@ export class GeminiLiveController {
       const stoppedMidTurn = this.turnActive
       const drainAttempted = graceful && Boolean(this.pendingImage && (this.imageUpload || !this.pendingImage.retryRequested))
       if (drainAttempted) await this.drainPhoto()
-      if (stoppedMidTurn || this.inputTranscript.trim() || this.outputTranscript.trim()) {
+      if (stoppedMidTurn || this.outputTranscript.trim()) {
         this.finalizeInterruptedTurn()
         this.interruptionFinalized = false
       }
@@ -687,6 +701,7 @@ export class GeminiLiveController {
           this.enqueueEvent("sitting_summary", "assistant", reflection)
         }
       }
+      this.sealSpeechDrafts()
       this.stopping = true
       this.ready = false
       await this.appendTail
@@ -919,7 +934,13 @@ export class GeminiLiveController {
       const type = message.voiceActivity?.type
       if (type !== "ACTIVITY_START" && type !== "ACTIVITY_END") throw new Error("Gemini returned malformed voice activity")
       this.voiceActive = type === "ACTIVITY_START"
-      if (this.voiceActive) this.turnActive = true
+      if (this.voiceActive) {
+        if (this.mode === "continuous") this.reserveSpeech()
+        this.turnActive = true
+      } else {
+        const speech = this.pendingSpeechDraft()
+        if (speech) speech.speech!.ended = true
+      }
     }
     const usage = message.usageMetadata
     if (
@@ -990,7 +1011,7 @@ export class GeminiLiveController {
     const sessionId = this.sessionId
     const oldSocket = this.socket
     try {
-      if (this.turnActive || this.inputTranscript.trim() || this.outputTranscript.trim()) {
+      if (this.turnActive || this.outputTranscript.trim()) {
         this.finalizeInterruptedTurn()
         this.interruptionFinalized = false
         this.turnActive = false
@@ -1019,11 +1040,25 @@ export class GeminiLiveController {
     const interrupted = content.interrupted === true
     const parts = content.modelTurn?.parts
     if (parts !== undefined && !Array.isArray(parts)) throw new Error("Gemini returned malformed model parts")
-    if (content.modelTurn !== undefined || content.inputTranscription !== undefined || content.outputTranscription !== undefined) {
-      this.turnActive = true
-    }
     const input = this.transcriptText(content.inputTranscription, "input")
     const output = this.transcriptText(content.outputTranscription, "output")
+    if (input && !this.pendingSpeechDraft()) {
+      this.reserveSpeech(this.turnMicSource, false)
+      const speech = this.pendingSpeechDraft()!
+      if (this.hasCompletedProviderTurn || this.reflecting) {
+        speech.speech!.late = true
+        speech.speech!.uncertain = true
+      }
+    }
+    if (content.modelTurn !== undefined || content.outputTranscription !== undefined ||
+        (input && !this.pendingSpeechDraft()?.speech?.late)) this.turnActive = true
+    if (input) {
+      const speech = this.pendingSpeechDraft()
+      if (speech) {
+        speech.content += input
+        void this.persistJournal()
+      }
+    }
     for (const part of interrupted ? [] : (parts ?? [])) {
       const inline = part?.inlineData
       if (inline === undefined) continue
@@ -1044,7 +1079,6 @@ export class GeminiLiveController {
     }
 
     if (this.reflecting) {
-      if (input) throw new Error("Gemini returned input transcription during reflection")
       this.outputTranscript += output
       if (interrupted) {
         trace("provider.reflection.interrupted")
@@ -1057,12 +1091,11 @@ export class GeminiLiveController {
       return
     }
 
-    this.inputTranscript += input
     if (!this.outputMuted) this.outputTranscript += output
     if (interrupted) {
       trace("provider.interrupted", {
         audioChunks: this.providerAudioChunks,
-        inputChars: this.inputTranscript.length,
+        inputChars: this.pendingSpeechDraft()?.content.length ?? 0,
         outputChars: this.outputTranscript.length,
       })
       this.finalizeInterruptedTurn(true)
@@ -1077,7 +1110,7 @@ export class GeminiLiveController {
         interrupted: this.interruptionFinalized,
         ...(this.interruptionFinalized ? {} : {
           audioChunks: this.providerAudioChunks,
-          inputChars: this.inputTranscript.length,
+          inputChars: this.pendingSpeechDraft()?.content.length ?? 0,
           outputChars: this.outputTranscript.length,
         }),
       })
@@ -1086,14 +1119,13 @@ export class GeminiLiveController {
       if (interruptedTurn) {
         this.interruptionFinalized = false
       } else {
-        this.finalizeCompleteTurn(hasToolCall)
+        this.finalizeCompleteTurn()
       }
       this.turnActive = this.voiceActive
       this.turnHasToolCall = false
       this.reconnectAttempted = false
       if (this.latestUsageTotal !== null) this.callbacks.onUsage(this.latestUsageTotal)
       this.callbacks.onTurnComplete(!messageHasToolCall)
-      this.describingPhoto = false
       this.requestSpokenPhotoDescription()
       // Barge-in completes the old response before the interrupting voice turn is finished.
       if (!interruptedTurn) void this.retryPendingImage()
@@ -1108,39 +1140,17 @@ export class GeminiLiveController {
     return (value as {text: string}).text
   }
 
-  private finalizeCompleteTurn(toolCallBoundary = false): void {
-    const input = this.inputTranscript.trim()
+  private finalizeCompleteTurn(): void {
     const output = this.turnAudioDelivered ? this.outputTranscript.trim() : ""
-    const micSource = this.turnMicSource
     const audible = this.turnAudioDelivered
     this.clearTurn()
-    if (!input && !output) {
-      if (!audible) return
-      this.enqueueEvent("transcript_gap", "user", "Transcript unavailable.")
-      this.enqueueEvent("transcript_gap", "assistant", "Transcript unavailable.")
-      this.releaseImageFence()
-      this.scheduleAppend()
-      throw new Error("Gemini completed a turn without transcription")
-    }
-    const followsToolResult = !input && output && (this.describingPhoto || this.deliveredToolResultIds.size > 0)
-    if ((!input || !output) && !(input && (toolCallBoundary || !audible)) && !followsToolResult) {
-      if (input) {
-        this.enqueueEvent("transcript", "user", input, "complete", undefined, micSource)
-        this.completeUserTurns += 1
-      } else {
-        this.enqueueEvent("transcript_gap", "user", "Transcript unavailable.")
-      }
-      if (output) this.enqueueEvent("transcript", "assistant", output, "complete")
-      else this.enqueueEvent("transcript_gap", "assistant", "Transcript unavailable.")
-      this.releaseImageFence()
-      this.scheduleAppend()
-      throw new Error("Gemini completed a turn without both transcriptions")
-    }
-    if (input) {
-      this.enqueueEvent("transcript", "user", input, "complete", undefined, micSource)
-      this.completeUserTurns += 1
-    }
+    this.settleSpeechDraft()
     if (output) this.enqueueEvent("transcript", "assistant", output, "complete")
+    else if (audible) {
+      this.enqueueEvent("transcript_gap", "assistant", "Transcript unavailable.")
+      this.scheduleAppend()
+      throw new Error("Gemini completed audible speech without its transcription")
+    }
     this.releaseImageFence()
     this.deliveredToolResultIds.clear()
     this.scheduleAppend()
@@ -1334,7 +1344,7 @@ export class GeminiLiveController {
       return
     }
     const image = this.pendingImage
-    if (!image?.mediaRef || image.imageId !== imageId || (!image.providerSent && image.imageSequence === undefined) ||
+    if (!image?.mediaRef || image.imageId !== imageId || (!image.providerSent && !image.imageRecorded) ||
         (image.caption !== undefined && image.caption !== caption)) {
       this.completeToolCall(id, call, {ok: false, status: "invalid", message: "Photo does not match the pending original."}, false)
       return
@@ -1345,11 +1355,11 @@ export class GeminiLiveController {
     }
     if (!image.caption) {
       image.caption = caption
-      image.assistantSequence = this.enqueueEvent("photo_caption", "assistant", caption, undefined, image.mediaRef).sequence
+      image.captionEventId = `${image.sessionId}:photo:${image.imageId}`
+      this.enqueueEvent("photo_caption", "assistant", caption, undefined, image.mediaRef)
       await this.persistJournal()
     }
     this.scheduleAppend()
-    await this.appendTail
     await this.scheduleImageFinalize()
     this.completeToolCall(id, call, {ok: this.acceptedCaptions.get(imageId) === caption,
       durable: this.acceptedCaptions.get(imageId) === caption}, false)
@@ -1459,13 +1469,10 @@ export class GeminiLiveController {
   }
 
   private finalizeInterruptedTurn(userComplete = false): void {
-    const input = this.inputTranscript.trim()
     const output = this.turnAudioDelivered ? this.outputTranscript.trim() : ""
-    const micSource = this.turnMicSource
     this.clearTurn()
-    if (input) this.enqueueEvent("transcript", "user", input, userComplete ? "complete" : "interrupted", undefined, micSource)
+    this.settleSpeechDraft(userComplete)
     if (output) this.enqueueEvent("transcript", "assistant", output, "interrupted")
-    if (input && userComplete) this.completeUserTurns += 1
     this.interruptionFinalized = true
     if (!this.stopPromise && this.pendingImage?.providerSent && !this.pendingImage.caption) {
       this.pendingImage.providerSent = false
@@ -1477,10 +1484,84 @@ export class GeminiLiveController {
   }
 
   private clearTurn(): void {
-    this.inputTranscript = ""
     this.outputTranscript = ""
     this.turnMicSource = undefined
     this.turnAudioDelivered = false
+  }
+
+  private pendingSpeechDraft(): TranscriptDraft | undefined {
+    return this.draftEvents.find(event => event.speech?.waiting)
+  }
+
+  private reserveSpeech(micSource = this.turnMicSource, admitted = true): void {
+    const existing = this.pendingSpeechDraft()
+    if (existing) {
+      if (existing.speech!.admitted) existing.speech!.uncertain = true
+      existing.speech!.admitted ||= admitted
+      existing.speech!.ended = false
+      if (existing.mic_source !== micSource) delete existing.mic_source
+    } else {
+      this.draftEvents.push({event_kind: "transcript", role: "user", content: "", status: "complete",
+        ...(micSource ? {mic_source: micSource} : {}),
+        speech: {waiting: true, late: false, uncertain: false, ended: false, admitted}})
+    }
+    void this.persistJournal()
+  }
+
+  private settleSpeechDraft(userComplete = true): void {
+    const speech = this.pendingSpeechDraft()
+    if (!speech) return
+    // Keep the normal boundary; a late suffix has no proven ASR end marker.
+    speech.speech!.late ||= !speech.content.trim() || (this.mode === "continuous" && this.voiceActive)
+    if (!speech.speech!.late && !speech.speech!.uncertain) {
+      speech.content = speech.content.trim()
+      speech.status = userComplete ? "complete" : "interrupted"
+      speech.speech!.waiting = false
+      this.materializeDrafts()
+      if (userComplete) this.completeUserTurns += 1
+    }
+    void this.persistJournal()
+  }
+
+  private sealSpeechDrafts(): void {
+    const speech = this.pendingSpeechDraft()
+    if (speech) {
+      speech.content = speech.content.trim()
+      speech.speech!.waiting = false
+      if (!speech.speech!.ended) speech.status = "interrupted"
+      if (!speech.content) {
+        if (!speech.speech!.admitted) this.draftEvents.splice(this.draftEvents.indexOf(speech), 1)
+        else {
+          speech.event_kind = "transcript_gap"
+          speech.content = "Transcript unavailable."
+          delete speech.status
+          delete speech.mic_source
+          this.missingSpeech = true
+          console.error("[OpenAlma] Sitting ended before admitted speech was transcribed")
+          this.callbacks.onPersistenceError("Some spoken words could not be transcribed")
+        }
+      }
+    }
+    this.materializeDrafts()
+  }
+
+  private materializeDrafts(): void {
+    while (this.draftEvents.length && !this.draftEvents[0].speech?.waiting) {
+      const draft = this.draftEvents.shift()!
+      const content = (draft.speech?.uncertain && draft.event_kind === "transcript" && draft.content ? UNCERTAIN_SPEECH_PREFIX : "") + draft.content
+      const characters = Array.from(content)
+      for (let offset = 0; offset < characters.length; offset += TRANSCRIPT_CONTENT_LIMIT) {
+        const sequence = this.nextTranscriptSequence++
+        this.pendingEvents.push({
+          event_id: `${this.sessionId}:${sequence}`, sequence,
+          event_kind: draft.event_kind, role: draft.role,
+          content: characters.slice(offset, offset + TRANSCRIPT_CONTENT_LIMIT).join(""),
+          ...(draft.status ? {status: draft.status} : {}),
+          ...(draft.media_ref ? {media_ref: draft.media_ref} : {}),
+          ...(draft.mic_source ? {mic_source: draft.mic_source} : {}),
+        })
+      }
+    }
   }
 
   private enqueueEvent(
@@ -1490,25 +1571,12 @@ export class GeminiLiveController {
     status?: TranscriptEvent["status"],
     mediaRef?: string,
     micSource?: MicSource,
-  ): TranscriptEvent {
-    const characters = Array.from(content)
-    let event!: TranscriptEvent
-    for (let offset = 0; offset < characters.length; offset += TRANSCRIPT_CONTENT_LIMIT) {
-      const sequence = this.nextTranscriptSequence++
-      event = {
-        event_id: `${this.sessionId}:${sequence}`,
-        sequence,
-        event_kind: eventKind,
-        role,
-        content: characters.slice(offset, offset + TRANSCRIPT_CONTENT_LIMIT).join(""),
-        ...(status ? {status} : {}),
-        ...(mediaRef ? {media_ref: mediaRef} : {}),
-        ...(micSource ? {mic_source: micSource} : {}),
-      }
-      this.pendingEvents.push(event)
-    }
+  ): void {
+    this.draftEvents.push({event_kind: eventKind, role, content,
+      ...(status ? {status} : {}), ...(mediaRef ? {media_ref: mediaRef} : {}),
+      ...(micSource ? {mic_source: micSource} : {})})
+    this.materializeDrafts()
     void this.persistJournal()
-    return event
   }
 
   private scheduleAppend(): void {
@@ -1560,7 +1628,7 @@ export class GeminiLiveController {
   }
 
   private clearPersistenceErrorIfSynced(): void {
-    if (!this.pendingEvents.length && !this.journalUnavailable) this.callbacks.onPersistenceError(null)
+    if (!this.pendingEvents.length && !this.missingSpeech && !this.journalUnavailable) this.callbacks.onPersistenceError(null)
   }
 
   private async requestPhotoRetry(pending: PendingImage): Promise<void> {
@@ -1573,8 +1641,7 @@ export class GeminiLiveController {
 
   private scheduleImageFinalize(userRequested = false): Promise<void> {
     const pending = this.pendingImage
-    if (!pending?.caption || (pending.retryRequested && !userRequested) || !pending.assistantSequence ||
-        this.pendingEvents.some(event => event.sequence <= pending.assistantSequence!)) return Promise.resolve()
+    if (!pending?.caption || (pending.retryRequested && !userRequested) || !pending.captionEventId) return Promise.resolve()
     if (this.imageFinalization) return this.imageFinalization
     this.imageFinalizationExplicit = userRequested
     const finalization = this.finalizePendingImage(pending).finally(() => {
@@ -1589,6 +1656,8 @@ export class GeminiLiveController {
 
   private async finalizePendingImage(pending: PendingImage): Promise<void> {
     const generation = this.generation
+    await this.persistJournal()
+    if (generation !== this.generation || this.pendingImage !== pending) return
     let response: Response
     try {
       response = await this.request(`/integration/mentra/session/${this.sessionId}/snapshot/finalize`, {
@@ -1596,7 +1665,7 @@ export class GeminiLiveController {
         soul_id: this.config.soulId,
         image_id: pending.imageId,
         caption: pending.caption,
-        caption_event_id: `${pending.sessionId}:${pending.assistantSequence}`,
+        caption_event_id: pending.captionEventId,
       })
     } catch {
       if (generation !== this.generation || this.pendingImage !== pending) return
@@ -1608,18 +1677,9 @@ export class GeminiLiveController {
       await this.requestPhotoRetry(pending)
       return
     }
-    const result = await response.json().catch(() => null) as {ok?: boolean; durable?: boolean; discarded?: boolean} | null
+    const result = await response.json().catch(() => null) as {ok?: boolean; durable?: boolean} | null
     if (generation !== this.generation || this.pendingImage !== pending) return
     if (result?.ok !== true) {
-      await this.requestPhotoRetry(pending)
-      return
-    }
-    if (result.discarded === true) {
-      try { await this.archiveJournal(this.journalSnapshot()) } catch {
-        if (generation === this.generation && this.pendingImage === pending) await this.requestPhotoRetry(pending)
-        return
-      }
-      if (generation !== this.generation || this.pendingImage !== pending) return
       await this.requestPhotoRetry(pending)
       return
     }
@@ -1641,7 +1701,6 @@ export class GeminiLiveController {
     if (!this.spokenPhotos.length || this.turnActive || this.stopPromise || this.stopping || this.reflecting ||
         !this.ready || this.socket?.readyState !== WS_OPEN) return
     const imageId = this.spokenPhotos.shift()!
-    this.describingPhoto = true
     this.socket.send(JSON.stringify({clientContent: {
       turns: [{role: "user", parts: [{text: `image_id: ${imageId}\nDescribe this image.  What do you want to remember about it?`}]}],
       turnComplete: true,
@@ -1676,11 +1735,14 @@ export class GeminiLiveController {
     const scope = journal?.scope
     if (
       !journal ||
-      journal.version !== 1 ||
+      (journal.version !== 1 && journal.version !== 2) ||
       scope?.userId !== this.config.userId ||
       scope.soulId !== this.config.soulId ||
       scope.deviceSessionId !== this.config.deviceSessionId ||
       !this.validPendingEvents(journal.pendingTranscripts) ||
+      !this.validDraftEvents(journal.draftTranscripts) ||
+      (Boolean(journal.draftTranscripts?.length) &&
+        (!Number.isSafeInteger(journal.nextTranscriptSequence) || Number(journal.nextTranscriptSequence) < 1)) ||
       !this.validPendingImage(journal.pendingImage)
     ) {
       await this.preserveJournal(raw, generation)
@@ -1690,7 +1752,13 @@ export class GeminiLiveController {
       return
     }
     this.pendingEvents = journal.pendingTranscripts.map((event) => ({...event}))
+    this.draftEvents = journal.draftTranscripts ?? []
     this.pendingImage = journal.pendingImage ? {...journal.pendingImage} : null
+    if (this.pendingImage) {
+      const image = this.pendingImage
+      if (image.imageRecorded === undefined && image.imageSequence !== undefined) image.imageRecorded = true
+      if (!image.captionEventId && image.assistantSequence !== undefined) image.captionEventId = `${image.sessionId}:${image.assistantSequence}`
+    }
     if (this.pendingImage?.retryRequested) {
       this.callbacks.onPhotoRetryChange(true)
       this.callbacks.onPersistenceError(this.pendingImage.mediaRef ? PHOTO_RETRY_MESSAGE : PHOTO_UPLOAD_UNCONFIRMED_MESSAGE)
@@ -1755,6 +1823,22 @@ export class GeminiLiveController {
     )
   }
 
+  private validDraftEvents(value: unknown): value is TranscriptDraft[] | undefined {
+    if (value === undefined) return true
+    if (!Array.isArray(value) || value.filter(draft => draft?.speech?.waiting).length > 1) return false
+    return value.every(draft => {
+      if (!draft || typeof draft !== "object" || typeof draft.content !== "string") return false
+      if (Object.keys(draft).some(key => !["event_kind", "role", "content", "status", "media_ref", "mic_source", "speech"].includes(key))) return false
+      const speech = draft.speech
+      if (speech !== undefined && (!speech || typeof speech !== "object" || draft.role !== "user" || draft.event_kind !== "transcript" ||
+          Object.keys(speech).length !== 5 || ["waiting", "late", "uncertain", "ended", "admitted"].some(key => typeof speech[key] !== "boolean"))) return false
+      if (!draft.content && !speech?.waiting) return false
+      const {speech: _speech, ...event} = draft
+      return this.validPendingEvents([{...event, event_id: "draft", sequence: 1,
+        content: Array.from(draft.content || " ").slice(0, TRANSCRIPT_CONTENT_LIMIT).join("")}])
+    })
+  }
+
   private validPendingImage(value: unknown): value is PendingImage | null | undefined {
     if (value === undefined || value === null) return true
     if (!value || typeof value !== "object") return false
@@ -1769,6 +1853,9 @@ export class GeminiLiveController {
       (image.imageSequence === undefined || (Number.isSafeInteger(image.imageSequence) && image.imageSequence > 0)) &&
       (image.caption === undefined || (typeof image.caption === "string" && image.caption.length > 0)) &&
       (image.assistantSequence === undefined || (Number.isSafeInteger(image.assistantSequence) && image.assistantSequence > 0)) &&
+      (image.imageRecorded === undefined || typeof image.imageRecorded === "boolean") &&
+      (image.captionEventId === undefined || (typeof image.captionEventId === "string" &&
+        !!image.captionEventId.trim() && image.captionEventId.length <= 256)) &&
       (image.retryRequested === undefined || typeof image.retryRequested === "boolean") &&
       (image.speakDescription === undefined || typeof image.speakDescription === "boolean")
   }
@@ -1785,13 +1872,16 @@ export class GeminiLiveController {
     }
     const photoOutsideHistory = [this.pendingImage?.imageSequence, this.pendingImage?.assistantSequence]
       .some(sequence => sequence !== undefined && sequence >= this.nextTranscriptSequence + keep)
-    if (this.loadedJournal !== null && (keep !== this.pendingEvents.length || photoOutsideHistory)) {
+    const draftBoundaryChanged = Boolean(this.draftEvents.length && this.loadedJournal &&
+      JSON.parse(this.loadedJournal).nextTranscriptSequence !== this.nextTranscriptSequence + keep)
+    if (this.loadedJournal !== null && (keep !== this.pendingEvents.length || photoOutsideHistory || draftBoundaryChanged)) {
       await this.preserveJournal(this.loadedJournal, generation)
     }
-    if (keep !== pendingEvents.length || photoOutsideHistory) {
+    if (keep !== pendingEvents.length || photoOutsideHistory || draftBoundaryChanged) {
       this.resumptionHandle = ""
       this.resumptionUpdatedAt = 0
       this.pendingImage = null
+      this.draftEvents = []
       this.callbacks.onPhotoRetryChange(false)
     }
     this.pendingEvents = pendingEvents.slice(0, keep)
@@ -1806,6 +1896,7 @@ export class GeminiLiveController {
       event_id: `${this.sessionId}:${event.sequence}`,
     }))
     this.nextTranscriptSequence += this.pendingEvents.length
+    this.sealSpeechDrafts()
     if (this.pendingImage && !this.pendingImage.caption) {
       this.pendingImage.providerSent = false
       this.pendingImage.captureAfterCurrent = false
@@ -1821,7 +1912,7 @@ export class GeminiLiveController {
       if (!this.storage || !this.journalLoaded) return
       try {
         this.journalKey ??= selectJournalKey(await this.storage.keys(), true)
-        const empty = !this.resumptionHandle && !this.pendingEvents.length && !this.pendingImage
+        const empty = !this.resumptionHandle && !this.pendingEvents.length && !this.draftEvents.length && !this.pendingImage
         await this.storage.set(this.journalKey, empty ? "" : this.journalSnapshot())
         this.journalUnavailable = false
       } catch {
@@ -1835,7 +1926,7 @@ export class GeminiLiveController {
 
   private journalSnapshot(): string {
     const journal: SessionJournal = {
-      version: 1,
+      version: 2,
       scope: {
         userId: this.config.userId,
         soulId: this.config.soulId,
@@ -1845,6 +1936,8 @@ export class GeminiLiveController {
         ? {handle: this.resumptionHandle, updatedAt: this.resumptionUpdatedAt}
         : null,
       pendingTranscripts: this.pendingEvents,
+      draftTranscripts: this.draftEvents,
+      nextTranscriptSequence: this.nextTranscriptSequence,
       pendingImage: this.pendingImage,
     }
     return JSON.stringify(journal)
@@ -1921,7 +2014,7 @@ export class GeminiLiveController {
         this.finishReflection(null)
         return
       }
-      const interrupted = this.turnActive || Boolean(this.inputTranscript.trim() || this.outputTranscript.trim())
+    const interrupted = this.turnActive || Boolean(this.outputTranscript.trim())
       try {
         if (interrupted) {
           this.finalizeInterruptedTurn()

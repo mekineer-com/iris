@@ -10,8 +10,8 @@ Source migration in progress, 2026-10-20: MCP now returns `v1beta` and Iris
 requires that constrained socket; token minting stays on `v1alpha/auth_tokens`.
 The unsupported proactivity setting and its constraint-mask entry are removed.
 These seams follow the Gemini 3.8 provider checks in `PLAN_iris_gemini38.md`.
-No model/configuration cutover has occurred. Photo/tool plumbing is implemented;
-speech settlement and requested-answer continuation are still incomplete.
+No model/configuration cutover has occurred. Photo/tool plumbing and late-speech
+reservations are implemented; requested-answer continuation is still incomplete.
 The current source is not a release-ready migration.
 
 ## Source Contract
@@ -82,9 +82,13 @@ remain native inputs. Caption content comes only from `save_photo_caption`,
 never from a nearby answer or output transcription. Its `photo_caption` event
 carries the original's `media_ref` and has no spoken-transcript status.
 
-The existing append and snapshot-finalize routes acknowledge durable server
-ownership before the tool returns success or Iris clears its journal. Extraction
-continues independently; later transcript saves do not wait for it. Replays
+The existing snapshot-finalize route acknowledges durable server ownership from
+the scoped original and caption independently of transcript append. Its stable
+image-based caption ID is journaled before submission; it need not wait for a
+timeline sequence. That receipt ID is not a timeline ID: every timeline event
+still uses its required sitting/sequence ID. The acknowledgment clears photo-filing responsibility, not
+the pending caption timeline event. Extraction continues independently; later
+transcript saves do not wait for it. Replays
 inspect the server filing receipt before requesting another caption, even after
 provider resumption. A different photo cannot implicitly discard pending work.
 An optional spoken description remains separate from this internal caption.
@@ -100,7 +104,23 @@ reflection follows handoff, outside that caption deadline; its text can settle a
 ### Completion and connection rotation
 
 - `serverContent.turnComplete: true` closes response generation, not input
-  transcription ownership. The old ordinary-speech settlement still needs repair.
+  transcription ownership. Reserve spoken input at native activity start, or
+  Manual Send; the Manual echo does not create another reservation.
+- Preserve the existing normal save boundary when words are present at response
+  completion. This is not proof of a native ASR final marker. If the response
+  completes first, keep an unsequenced suffix in the existing journal through
+  terminal Stop/recovery. Late fragments fill that reservation, not a later turn.
+  Overlapping admissions combine the words with an explicit uncertain-timing,
+  received-order label. No new timeout or reconstructed split is used.
+- Only a ready prefix receives server sequences, after Unicode-safe splitting.
+  Sequenced rows remain immutable, including after a lost acknowledgment. Cold
+  recovery closes old drafts before new-input admission; provider resumption
+  does not close them. Drafts retain the expected sequence boundary, so a reset
+  position archives them instead of mixing old speech into replacement history.
+  Fresh cold-bootstrap context is still Slice 4 work.
+- The journal writes payload version 2 under the existing storage key and reads
+  existing version 1 at the boundary. Older clients already archive unknown
+  versions; they must not treat drafts as ignorable version-1 extension fields.
 - `serverContent.generationComplete: true` means generation has finished; it is
   not a replacement for `turnComplete` in Iris transcript finalization.
 - `goAway.timeLeft` announces a provider disconnect deadline. Iris rotates
