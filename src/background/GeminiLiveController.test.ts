@@ -103,6 +103,7 @@ function harness(
     appendAckLost?: boolean
     history?: Array<{event_id: string; role: string; event_kind: string; content: string; mic_source?: string}>
     snapshotStatus?: number
+    snapshotThrows?: boolean
     snapshotGate?: Promise<void>
     snapshotResponse?: Response
     replayGates?: Promise<void>[]
@@ -236,6 +237,7 @@ function harness(
       )
     }
     if (url.endsWith("/snapshot")) {
+      if (options.snapshotThrows) throw new Error("fictional upload acknowledgment lost")
       if (options.snapshotGate) await options.snapshotGate
       if (options.snapshotResponse) return options.snapshotResponse
       const extension = body.mime_type === "image/jpeg" ? "jpg" : "png"
@@ -532,13 +534,41 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
-  test("does not send Gemini when durable snapshot fails", async () => {
-    const h = harness({storage: new FakeStorage(), snapshotStatus: 503})
+  test.each([413, 422, 503])("a rejected snapshot (%i) keeps the original upload retry available", async status => {
+    const options = {storage: new FakeStorage(), snapshotStatus: status}
+    const h = harness(options)
     await start(h)
     await expect(h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})).rejects.toThrow(
-      "OpenAlma snapshot failed (503)",
+      `OpenAlma snapshot failed (${status})`,
     )
     expect(h.sockets[0].sent).toHaveLength(1)
+    expect(h.photoRetryChanges.at(-1)).not.toBe(true)
+    if (status < 500) expect(options.storage.values.get(JOURNAL_KEY)).toBe("")
+    else expect(JSON.parse(options.storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe("image-1")
+    options.snapshotStatus = 200
+    await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(2)
+    expect(h.requests.some(request => request.url.endsWith("/snapshot/replay"))).toBe(false)
+    expect(h.sockets[0].sent).toHaveLength(2)
+    await h.controller.stop()
+  })
+
+  test("an uncertain upload keeps its identity through a failed resend", async () => {
+    const storage = new FakeStorage()
+    const options = {storage, snapshotThrows: true, snapshotStatus: 200}
+    const h = harness(options)
+    await start(h)
+    const image = {imageId: "uncertain-photo", mimeType: "image/png" as const, data: "AQID"}
+    await expect(h.controller.sendImage(image)).rejects.toThrow("acknowledgment lost")
+    expect(h.photoRetryChanges.at(-1)).not.toBe(true)
+    options.snapshotThrows = false
+    options.snapshotStatus = 503
+    await expect(h.controller.sendImage(image)).rejects.toThrow("snapshot failed (503)")
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe(image.imageId)
+    options.snapshotStatus = 200
+    await h.controller.sendImage(image)
+    expect(h.sockets[0].sent.filter(value => JSON.parse(value).clientContent)).toHaveLength(1)
+    expect(h.requests.some(request => request.url.endsWith("/snapshot/replay"))).toBe(false)
     await h.controller.stop()
   })
 
@@ -616,11 +646,12 @@ describe("GeminiLiveController", () => {
     await start(h)
     const sending = h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot")))
+    expect(h.photoRetryChanges.at(-1)).not.toBe(true)
     await h.controller.stop()
     expect(JSON.parse(uploadStorage.values.get(JOURNAL_KEY)!).pendingImage).toEqual(expect.objectContaining({
       imageId: "image-1", providerSent: false,
     }))
-    expect(h.persistenceErrors.at(-1)).toContain("Photo upload was not confirmed")
+    expect(h.persistenceErrors.at(-1)).toContain("Photo may have been saved")
     release()
     await expect(sending).rejects.toThrow("Photo send cancelled")
     expect(h.sockets[0].sent.filter((value) => JSON.parse(value).clientContent)).toHaveLength(0)

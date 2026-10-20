@@ -25,7 +25,7 @@ export interface Channels {
   }, {ok: true}>
   "openalma:manual-action": Rpc<{action: ManualAction}, {ok: true}>
   "openalma:image": Rpc<ImageRequest, {ok: true}>
-  "openalma:pending-image": Rpc<{action: "retry" | "discard"}, {ok: true}>
+  "openalma:pending-image": Rpc<{action: "retry" | "discard"; imageId?: string}, {ok: true}>
 }
 
 declare global {

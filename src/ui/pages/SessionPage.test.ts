@@ -50,10 +50,23 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
 describe("SessionPage state projection", () => {
   test("server-owned photo Retry and Discard are enabled while idle", () => {
     const render = renderPage({configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
-      connection: "idle", photoRetryPending: true, failedPhotos: ["server-photo"]}, async () => ({ok: true}))
-    const actions = nodes(render()).find(node => node.props?.className === "image-review").props.children
+      connection: "idle", photoRetryPending: false, failedPhotos: ["server-photo"]}, async () => ({ok: true}))
+    const actions = nodes(render()).filter(node => /^(Retry|Discard) failed photo/.test(node.props?.["aria-label"] ?? ""))
     expect(actions.map((button: any) => button.props.disabled)).toEqual([false, false])
-    expect(JSON.stringify(render())).toContain("Photo filing failed")
+    expect(JSON.stringify(render())).toContain("filing failed")
+  })
+
+  test("server failures do not block capture and actions target their chosen photo", async () => {
+    const calls: unknown[] = []
+    const render = renderPage({configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+      connection: "listening", photoRetryPending: false, failedPhotos: ["older-photo", "chosen-photo"]},
+      async (channel, payload) => {calls.push({channel, payload}); return {ok: true}})
+    expect(nodes(render()).filter(node => node.props?.type === "file").map(node => node.props.disabled))
+      .toEqual([false, false])
+    await nodes(render()).find(node => node.props?.["aria-label"] === "Retry failed photo 2").props.onClick()
+    expect(calls).toEqual([{channel: "openalma:pending-image", payload: {action: "retry", imageId: "chosen-photo"}}])
+    expect(nodes(render()).filter(node => node.props?.type === "file").map(node => node.props.disabled))
+      .toEqual([false, false])
   })
 
   test("submitted manual recording names the selected Soul", () => {

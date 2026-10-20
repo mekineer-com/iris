@@ -241,6 +241,7 @@ function setup(
     stored?: Record<string, string>
     unreadableJournal?: boolean
     fetchFn?: typeof fetch
+    failedPhotos?: string[]
   } = {},
 ) {
   const session = new FakeSession()
@@ -268,7 +269,7 @@ function setup(
       return new Response(JSON.stringify({soul_id: body.soul_id, created: !body.use_existing}), {
         headers: {"Content-Type": "application/json"},
       })
-    }) as typeof fetch),
+    }) as typeof fetch, CONFIG.userId, options.failedPhotos),
     createLiveController: (config, callbacks) => {
       configs.push(config)
       live = new FakeLive(callbacks)
@@ -308,11 +309,48 @@ describe("SessionController", () => {
     new SessionController(session as never, {config: CONFIG, fetchFn,
       createLiveController: () => {throw new Error("Photo recovery must not start Gemini")}}).start()
     await session.handlers["openalma:set-capabilities"]({cameraEnabled: true})
-    expect(lastSnapshot(session)).toMatchObject({connection: "idle", photoRetryPending: true, failedPhotos: ["server-photo"]})
-    await session.handlers["openalma:pending-image"]({action})
+    expect(lastSnapshot(session)).toMatchObject({connection: "idle", photoRetryPending: false, failedPhotos: ["server-photo"]})
+    await session.handlers["openalma:pending-image"]({action, imageId: "server-photo"})
     expect(actions).toEqual([{url: `${CONFIG.baseUrl}/integration/mentra/photos/server-photo/${action}`,
       body: {user_id: CONFIG.userId, soul_id: CONFIG.soulId}}])
     expect(lastSnapshot(session)).toMatchObject({connection: "idle", photoRetryPending: false, failedPhotos: []})
+  })
+
+  test("photo status failure does not fail connection discovery or a saved Soul switch", async () => {
+    const session = new FakeSession()
+    session.stored.set("openalma.soul-id", CONFIG.soulId)
+    const selected = "Another Soul"
+    const fetchFn = (async (url, init) => {
+      const path = String(url)
+      if (path.endsWith("/owner")) return Response.json({user_id: CONFIG.userId})
+      if (path.includes("/status?")) return Response.json({detail: "fictional receipt read failure"}, {status: 503})
+      if (path.endsWith("/souls")) {
+        if (init?.method === "POST") return Response.json({soul_id: selected, created: false})
+        return Response.json({souls: [CONFIG.soulId, selected]})
+      }
+      return Response.json({ok: true})
+    }) as typeof fetch
+    new SessionController(session as never, {config: CONFIG, fetchFn}).start()
+    await session.handlers["openalma:set-capabilities"]({cameraEnabled: true})
+    expect(lastSnapshot(session)).toMatchObject({memuAvailable: true, soulConfirmed: true})
+    expect(lastSnapshot(session)?.lastError).toContain("Photo recovery status")
+    expect(await session.handlers["openalma:set-soul"]({soulId: selected, useExisting: true}))
+      .toEqual({soulId: selected, created: false})
+    expect(session.stored.get("openalma.soul-id")).toBe(selected)
+    expect(lastSnapshot(session)).toMatchObject({soulId: selected, memuAvailable: true, soulConfirmed: true})
+  })
+
+  test("an older failed filing never takes over the current photo's recovery action", async () => {
+    const h = setup({failedPhotos: ["older-photo"]})
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(lastSnapshot(h.session)).toMatchObject({photoRetryPending: false, failedPhotos: ["older-photo"]})
+    await h.session.handlers["openalma:image"]({imageId: "current-photo", mimeType: "image/png", data: "AQID"})
+    expect(h.live.images).toHaveLength(1)
+    h.live.photoRetry(true)
+    await h.session.handlers["openalma:pending-image"]({action: "retry"})
+    expect(h.live.imageRetries).toBe(1)
+    expect(lastSnapshot(h.session)?.failedPhotos).toEqual(["older-photo"])
+    await h.session.handlers["openalma:stop"]({})
   })
   test("does no network work until a phone-local profile is saved", async () => {
     const session = new FakeSession()

@@ -75,6 +75,7 @@ export class SessionController {
   private preferencesLoaded: Promise<void> = Promise.resolve()
   private photoRetryPending = false
   private failedPhotos: string[] = []
+  private photoStatusError: string | null = null
   private manualAudio: string[] = []
   private manualAudioBytes = 0
   private manualMicSource: MicSource | undefined
@@ -251,11 +252,14 @@ export class SessionController {
     this.unsubs.push(
       ui.handle("openalma:pending-image", async (payload) => {
         const action = (payload as {action?: string} | null)?.action
+        const imageId = (payload as {imageId?: unknown} | null)?.imageId
         await this.preferencesLoaded
-        if (this.failedPhotos.length && (action === "retry" || action === "discard")) {
+        if (action !== "retry" && action !== "discard") throw new Error("Unknown pending photo action")
+        if (imageId !== undefined) {
+          if (typeof imageId !== "string" || !this.failedPhotos.includes(imageId)) throw new Error("Unknown failed photo")
           const config = this.currentConfig()
           const soulId = this.soulId
-          const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/photos/${this.failedPhotos[0]}/${action}`, {
+          const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/photos/${encodeURIComponent(imageId)}/${action}`, {
             method: "POST", signal: timeoutSignal(10_000), headers: {"Content-Type": "application/json"},
             body: JSON.stringify({user_id: config.userId, soul_id: soulId}),
           })
@@ -408,9 +412,9 @@ export class SessionController {
       manualPhase: this.manualPhase,
       microphoneEnabled: this.microphoneEnabled,
       cameraEnabled: this.cameraEnabled,
-      photoRetryPending: this.photoRetryPending || this.failedPhotos.length > 0,
+      photoRetryPending: this.photoRetryPending,
       failedPhotos: [...this.failedPhotos],
-      lastError: this.liveController?.activityPauseReason || this.lastError,
+      lastError: this.liveController?.activityPauseReason || this.lastError || this.photoStatusError,
       usageTotalTokens: this.usageTotalTokens,
       durationWarning: this.durationWarning,
     }
@@ -629,10 +633,7 @@ export class SessionController {
     if (generation !== this.startGeneration) return
 
     await this.refreshRecoveryLock()
-    void this.refreshFailedPhotos().catch((error) => {
-      this.lastError = error instanceof Error ? error.message : String(error)
-      this.pushSnapshot()
-    })
+    void this.refreshFailedPhotos()
 
     if (this.teardownKind === "stop") {
       try {
@@ -1047,9 +1048,12 @@ export class SessionController {
       }
       if (!current()) return
       this.failedPhotos = photos
+      this.photoStatusError = null
       this.pushSnapshot()
     } catch (error) {
-      if (current()) throw error
+      if (!current()) return
+      this.photoStatusError = error instanceof Error ? error.message : String(error)
+      this.pushSnapshot()
     }
   }
 

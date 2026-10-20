@@ -100,7 +100,7 @@ const WS_OPEN = 1
 const REQUEST_TIMEOUT_MS = 10_000
 const TRANSCRIPT_CONTENT_LIMIT = 16_000
 const SNAPSHOT_TIMEOUT_MS = 120_000
-const PHOTO_UPLOAD_UNCONFIRMED_MESSAGE = "Photo upload was not confirmed. Retry checks whether the original was saved."
+const PHOTO_UPLOAD_UNCONFIRMED_MESSAGE = "Photo may have been saved. Retry checks the original."
 const TOOL_TIMEOUT_MS = 30_000
 const WRITE_UNCERTAINTY_MESSAGE =
   "Write outcome is uncertain; it may have saved. Read current working state before deciding whether to try again."
@@ -403,7 +403,8 @@ export class GeminiLiveController {
 
     const generation = this.generation
     const sessionId = this.sessionId
-    const pending: PendingImage = this.pendingImage ?? {
+    const pendingBeforeUpload = this.pendingImage
+    const pending: PendingImage = pendingBeforeUpload ?? {
       imageId: image.imageId, mediaRef: "", providerSent: false, captureAfterCurrent: false,
       generation, sessionId,
     }
@@ -415,7 +416,6 @@ export class GeminiLiveController {
     if (this.stopping || this.reflecting || generation !== this.generation || this.pendingImage !== pending) {
       throw new Error("Photo send cancelled")
     }
-    this.callbacks.onPhotoRetryChange(true)
     const response = await this.request(`/integration/mentra/session/${this.sessionId}/snapshot`, {
       user_id: this.config.userId,
       soul_id: this.config.soulId,
@@ -423,7 +423,15 @@ export class GeminiLiveController {
       mime_type: image.mimeType,
       data: image.data,
     }, SNAPSHOT_TIMEOUT_MS)
-    if (!response.ok) throw new Error(`OpenAlma snapshot failed (${response.status})`)
+    if (!response.ok) {
+      if (!this.stopping && !this.reflecting && generation === this.generation &&
+          this.pendingImage === pending && !pending.mediaRef && !pendingBeforeUpload &&
+          response.status >= 400 && response.status < 500) {
+        this.pendingImage = null
+        await this.persistJournal()
+      }
+      throw new Error(`OpenAlma snapshot failed (${response.status})`)
+    }
     const result = (await response.json()) as {media_ref?: unknown}
     if (
       this.stopping || this.reflecting || generation !== this.generation || sessionId !== this.sessionId
@@ -650,7 +658,10 @@ export class GeminiLiveController {
         : "Transcript sync failed; pending turns remain saved on this device")
       this.reportError(error instanceof Error ? error : new Error(String(error)))
     } finally {
-      if (this.pendingImage?.mediaRef === "") this.callbacks.onPersistenceError(PHOTO_UPLOAD_UNCONFIRMED_MESSAGE)
+      if (this.pendingImage?.mediaRef === "") {
+        this.callbacks.onPhotoRetryChange(true)
+        this.callbacks.onPersistenceError(PHOTO_UPLOAD_UNCONFIRMED_MESSAGE)
+      }
       this.generation += 1
       this.stopping = true
       this.ready = false

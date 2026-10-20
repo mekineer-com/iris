@@ -111,6 +111,7 @@ export default function SessionPage() {
   )
   const [pendingPhoto, setPendingPhoto] = useState<PendingPhoto | null>(null)
   const [imagePending, setImagePending] = useState(false)
+  const [filingPending, setFilingPending] = useState<string | null>(null)
   const [imageStatus, setImageStatus] = useState<string | null>(null)
   const [rpcError, setRpcError] = useState<string | null>(null)
   const [profilePending, setProfilePending] = useState(false)
@@ -123,6 +124,7 @@ export default function SessionPage() {
   })
   const startOwner = useRef(0)
   const imageOwner = useRef(0)
+  const filingOwner = useRef(0)
 
   useEffect(() => {
     if (settingsOpen && !editingConnection) {
@@ -140,6 +142,8 @@ export default function SessionPage() {
     setPendingNewSoul(null)
     setShowNewSoulInfo(false)
     imageOwner.current += 1
+    filingOwner.current += 1
+    setFilingPending(null)
     setPendingPhoto(null)
     setImagePending(false)
     setImageStatus(null)
@@ -210,6 +214,8 @@ export default function SessionPage() {
   const onStart = async () => {
     const owner = ++startOwner.current
     imageOwner.current += 1
+    filingOwner.current += 1
+    setFilingPending(null)
     setImagePending(false)
     setRpcError(null)
     setStartPending(true)
@@ -234,6 +240,8 @@ export default function SessionPage() {
     setRpcError(null)
     setStopPending(true)
     imageOwner.current += 1
+    filingOwner.current += 1
+    setFilingPending(null)
     setImagePending(false)
     discardPhoto()
     try {
@@ -337,19 +345,24 @@ export default function SessionPage() {
     setLargeImageWarningDismissed(true)
   }
 
-  const handleStoredPhoto = async (action: "retry" | "discard") => {
-    const owner = ++imageOwner.current
-    setImagePending(true)
+  const handleStoredPhoto = async (action: "retry" | "discard", imageId?: string) => {
+    const ownerRef = imageId === undefined ? imageOwner : filingOwner
+    const owner = ++ownerRef.current
+    if (imageId === undefined) setImagePending(true)
+    else setFilingPending(imageId)
     setRpcError(null)
     try {
-      await pendingImageRpc({action})
-      if (owner !== imageOwner.current) return
-      if (action === "discard") setImageStatus(null)
+      await pendingImageRpc({action, ...(imageId === undefined ? {} : {imageId})})
+      if (owner !== ownerRef.current) return
+      if (action === "discard" && imageId === undefined) setImageStatus(null)
     } catch (error) {
-      if (owner !== imageOwner.current) return
+      if (owner !== ownerRef.current) return
       setRpcError(error instanceof Error ? error.message : String(error))
     } finally {
-      if (owner === imageOwner.current) setImagePending(false)
+      if (owner === ownerRef.current) {
+        if (imageId === undefined) setImagePending(false)
+        else setFilingPending(null)
+      }
     }
   }
 
@@ -579,16 +592,29 @@ export default function SessionPage() {
       {imageStatus ? <p role="status">{imageStatus}</p> : null}
       {photoRetryPending ? (
         <div>
-          <p role="status">{snapshot?.failedPhotos?.length
-            ? "Photo filing failed. Retry or discard it here."
-            : visible === "idle" || visible === "error"
+          <p role="status">{visible === "idle" || visible === "error"
             ? "Start Iris to retry or discard the pending photo"
             : PHOTO_RETRY_MESSAGE}</p>
           <div className="image-review">
-            <button type="button" disabled={imagePending || stopping || (!voiceReady && !snapshot?.failedPhotos?.length)} onClick={() => void handleStoredPhoto("retry")}>Retry</button>
-            <button type="button" disabled={imagePending || stopping || (!voiceReady && !snapshot?.failedPhotos?.length)} onClick={() => void handleStoredPhoto("discard")}>Discard</button>
+            <button type="button" disabled={imagePending || stopping || !voiceReady} onClick={() => void handleStoredPhoto("retry")}>Retry</button>
+            <button type="button" disabled={imagePending || stopping || !voiceReady} onClick={() => void handleStoredPhoto("discard")}>Discard</button>
           </div>
         </div>
+      ) : null}
+      {snapshot?.failedPhotos?.length ? (
+        <section aria-label="Failed photo filings">
+          {snapshot.failedPhotos.map((imageId, index) => (
+            <div className="image-review" key={imageId}>
+              <span>Photo {index + 1}: filing failed.</span>
+              <button type="button" aria-label={`Retry failed photo ${index + 1}`}
+                disabled={filingPending !== null || stopping}
+                onClick={() => void handleStoredPhoto("retry", imageId)}>Retry</button>
+              <button type="button" aria-label={`Discard failed photo ${index + 1}`}
+                disabled={filingPending !== null || stopping}
+                onClick={() => void handleStoredPhoto("discard", imageId)}>Discard</button>
+            </div>
+          ))}
+        </section>
       ) : null}
       {snapshot?.memuAvailable !== false && snapshot?.lastError && snapshot.lastError !== PHOTO_RETRY_MESSAGE
         ? <p role="alert">{snapshot.lastError}</p> : null}
