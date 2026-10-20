@@ -323,7 +323,7 @@ describe("SessionController", () => {
       .rejects.toThrow("cannot change the owner or installation ID")
   })
 
-  test.each([new Error("Network request failed"), new Error("The operation was aborted"), 409, 503])(
+  test.each([new Error("Network request failed"), new Error("The operation was aborted"), 409, 502, 503])(
     "distinguishes discovery transport failures from server responses (%s)", async failure => {
       const session = new FakeSession()
       new SessionController(session as never, {
@@ -335,7 +335,7 @@ describe("SessionController", () => {
       }).start()
       await new Promise(resolve => setTimeout(resolve, 0))
       expect(lastSnapshot(session)).toMatchObject({memuAvailable: false,
-        lastError: failure instanceof Error ? "Is memU running?" : `Owner discovery failed (${failure})`})
+        lastError: failure instanceof Error || failure === 502 ? "Is memU running?" : `Owner discovery failed (${failure})`})
     },
   )
 

@@ -963,6 +963,7 @@ export class SessionController {
     }).catch(() => {
       throw new Error("Is memU running?")
     })
+    if (ownerResponse.status === 502) throw new Error("Is memU running?")
     if (!ownerResponse.ok) throw new Error(`Owner discovery failed (${ownerResponse.status})`)
     const ownerResult = await ownerResponse.json() as Partial<{user_id: unknown}>
     if (ownerResult.user_id !== null && typeof ownerResult.user_id !== "string") {
