@@ -97,7 +97,14 @@ type PendingToolCall = {
   generation: number
   sessionId: string
   batch: ToolBatch
+  dispatched: boolean
   response?: string | Record<string, unknown>
+}
+
+function isUncertainWrite(call: PendingToolCall): boolean {
+  return (call.name === "save_working_thought" || call.name === "annul_intention") &&
+    ((call.dispatched && call.response === undefined) ||
+      (typeof call.response === "object" && call.response.status === "uncertain"))
 }
 
 function trace(event: string, detail: Record<string, unknown> = {}): void {
@@ -999,9 +1006,10 @@ export class GeminiLiveController {
     this.handlingMessage = true
     try {
       // Register the whole batch before a co-packet completion can settle it.
-      if (hasToolCall) this.handleToolCall(message.toolCall)
+      const dispatch = hasToolCall ? this.handleToolCall(message.toolCall) : null
       if (message.toolCallCancellation !== undefined) this.handleToolCancellation(message.toolCallCancellation)
       if (message.serverContent !== undefined) this.handleServerContent(message.serverContent, hasToolCall)
+      dispatch?.()
     } finally {
       this.handlingMessage = false
     }
@@ -1203,7 +1211,7 @@ export class GeminiLiveController {
     this.scheduleAppend()
   }
 
-  private handleToolCall(value: unknown): void {
+  private handleToolCall(value: unknown): () => void {
     if (this.stopping || this.reflecting) throw new Error("Gemini requested memory during teardown")
     if (!value || typeof value !== "object") throw new Error("Gemini returned malformed tool call")
     const calls = (value as {functionCalls?: unknown}).functionCalls
@@ -1262,23 +1270,30 @@ export class GeminiLiveController {
       ))})
     }
     this.toolBatch.started = true
+    const dispatch: Array<() => void> = []
     for (const {id, name, args} of parsed) {
       const pending: PendingToolCall = {
         name,
         generation: this.generation,
         sessionId: this.sessionId,
         batch: this.toolBatch,
+        dispatched: false,
       }
       this.pendingToolCalls.set(id, pending)
-      if (invalid) this.completeToolCall(id, pending, {
-        ok: false, status: "invalid", message: "Invalid tool arguments; no calls in this batch were run.",
-      }, false)
-      else if (name === "recall_memory") void this.runRecall(id, args.query as string, pending)
-      else if (name === "save_photo_caption") void this.runPhotoCaption(id, args, pending).catch(error => {
-        if (this.isCurrentToolCall(id, pending)) this.reportError(error instanceof Error ? error : new Error(String(error)))
+      dispatch.push(() => {
+        if (!this.isCurrentToolCall(id, pending)) return
+        pending.dispatched = !invalid
+        if (invalid) this.completeToolCall(id, pending, {
+          ok: false, status: "invalid", message: "Invalid tool arguments; no calls in this batch were run.",
+        }, false)
+        else if (name === "recall_memory") void this.runRecall(id, args.query as string, pending)
+        else if (name === "save_photo_caption") void this.runPhotoCaption(id, args, pending).catch(error => {
+          if (this.isCurrentToolCall(id, pending)) this.reportError(error instanceof Error ? error : new Error(String(error)))
+        })
+        else void this.runWorkingTool(id, args, pending)
       })
-      else void this.runWorkingTool(id, args, pending)
     }
+    return () => { for (const run of dispatch) run() }
   }
 
   private handleToolCancellation(value: unknown): void {
@@ -1289,7 +1304,7 @@ export class GeminiLiveController {
     }
     for (const id of ids) {
       const pending = this.pendingToolCalls.get(id)
-      if (pending?.name === "save_working_thought" || pending?.name === "annul_intention") {
+      if (pending && isUncertainWrite(pending)) {
         this.callbacks.onPersistenceError(WRITE_UNCERTAINTY_MESSAGE)
       }
       this.pendingToolCalls.delete(id)
@@ -2349,9 +2364,7 @@ export class GeminiLiveController {
   private reportError(error: Error): void {
     if (this.stopping || this.errorReported) return
     this.errorReported = true
-    if ([...this.pendingToolCalls.values()].some(call => (!call.response ||
-      (typeof call.response === "object" && call.response.status === "uncertain")) &&
-      (call.name === "save_working_thought" || call.name === "annul_intention"))) {
+    if ([...this.pendingToolCalls.values()].some(isUncertainWrite)) {
       error = new Error(`${error.message}. ${WRITE_UNCERTAINTY_MESSAGE}`)
     }
     this.pendingToolCalls.clear()

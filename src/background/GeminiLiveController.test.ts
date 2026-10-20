@@ -849,6 +849,48 @@ describe("GeminiLiveController", () => {
     }
   })
 
+  test("initial ASR co-packet speech precedes the internal caption and its answered ACK is SILENT", async () => {
+    const storage = new FakeStorage()
+    const h = harness({storage})
+    await start(h)
+    try {
+      await h.controller.sendImage({imageId: "asr-copacket-original", mimeType: "image/png", data: "AQID"})
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.mediaRef)
+        .toBe("mentra_media/test-phone/asr-copacket-original.png")
+      // No START or Manual Send: these are the sitting's first spoken words.
+      h.sockets[0].message({
+        toolCall: {functionCalls: [{id: "asr-copacket-caption", name: "save_photo_caption",
+          args: {image_id: "asr-copacket-original", caption: "A fictional amber circle."}}]},
+        serverContent: {
+          inputTranscription: {text: "Where is the fictional harbor?"},
+          outputTranscription: {text: "The harbor is north."},
+          modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
+          turnComplete: true,
+        },
+      })
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "asr-copacket-caption"))
+      expect(h.finalizations).toContainEqual({ok: true, durable: true, queued: true})
+      expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body).toMatchObject({
+        image_id: "asr-copacket-original", caption: "A fictional amber circle.",
+        caption_event_id: "sitting-1:photo:asr-copacket-original",
+      })
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "asr-copacket-caption"))
+        .toMatchObject({scheduling: "SILENT", response: {ok: true, durable: true}})
+      expect(h.audio).toEqual(["AAAAAA=="])
+      await h.controller.stop()
+      const rows = h.requests.flatMap(request => request.body.events ?? [])
+      expect(rows.filter(row => row.event_kind === "transcript" || row.event_kind === "photo_caption")
+        .map(row => [row.event_kind, row.role, row.content])).toEqual([
+        ["transcript", "user", "Where is the fictional harbor?"],
+        ["transcript", "assistant", "The harbor is north."],
+        ["photo_caption", "assistant", "A fictional amber circle."],
+      ])
+      expect(h.errors).toEqual([])
+    } finally {
+      await h.controller.stop()
+    }
+  })
+
   test.each([["continuous", false], ["manual", false], ["continuous", true]] as const)(
     "%s publishes normal speech without waiting for Stop (input before START=%s)", async (mode, inputBeforeStart) => {
     const h = harness({storage: new FakeStorage()})
@@ -3057,18 +3099,24 @@ describe("GeminiLiveController", () => {
   })
 
   test("cancelled and stopped writes discard late responses without undo or replay", async () => {
-    for (const action of ["cancel", "stop", "restart"] as const) {
+    for (const action of ["cancel", "cancel-acknowledged", "stop", "restart"] as const) {
       let release!: () => void
       const gate = new Promise<void>(resolve => { release = resolve })
       const h = harness({workingGate: gate})
       await start(h)
+      if (action === "cancel-acknowledged") admitRequest(h, "continuous")
       h.sockets[0].message({toolCall: {functionCalls: [
         {id: "late-write", name: "save_working_thought", args: {thought: "beacon"}},
       ]}})
       await waitFor(() => h.requests.some(request => request.url.endsWith("/working-thought")))
-      if (action === "cancel") h.sockets[0].message({toolCallCancellation: {ids: ["late-write"]}})
+      if (action === "cancel-acknowledged") {
+        release()
+        await new Promise(resolve => setTimeout(resolve, 0))
+      }
+      if (action === "cancel" || action === "cancel-acknowledged") h.sockets[0].message({toolCallCancellation: {ids: ["late-write"]}})
       else await h.controller.stop()
       if (action === "cancel") expect(h.persistenceErrors.some(message => message?.includes("may have saved"))).toBe(true)
+      if (action === "cancel-acknowledged") expect(h.persistenceErrors.some(message => message?.includes("may have saved"))).toBe(false)
       if (action === "restart") {
         const starting = h.controller.start()
         await waitFor(() => h.sockets.length === 2)
@@ -4696,12 +4744,46 @@ describe("GeminiLiveController", () => {
     expect(h.errors).toEqual([])
   })
 
-  test("malformed known messages fail loud after setup", async () => {
+  test.each([["audio", false], ["audio", true], ["content", true]] as const)(
+    "malformed known %s fails before executing a co-packet write (write=%s)", async (malformed, withWrite) => {
     const h = harness()
     await start(h)
-    h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "bad"}}]}}})
-    expect(h.errors).toEqual(["Gemini returned malformed audio"])
-    await h.controller.stop()
+    try {
+      h.sockets[0].message({
+        serverContent: malformed === "audio" ? {modelTurn: {parts: [{inlineData: {data: "bad"}}]}} : null,
+        ...(withWrite ? {toolCall: {functionCalls: [
+          {id: "malformed-packet-write", name: "save_working_thought", args: {thought: "A fictional beacon."}},
+        ]}} : {}),
+      })
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(h.requests.some(request => request.url.endsWith("/working-thought"))).toBe(false)
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      expect(h.errors).toEqual([malformed === "audio"
+        ? "Gemini returned malformed audio" : "Gemini returned malformed server content"])
+    } finally {
+      await h.controller.stop()
+    }
+  })
+
+  test("same-packet tool cancellation prevents executing the cancelled write", async () => {
+    const h = harness()
+    await start(h)
+    try {
+      h.sockets[0].message({
+        toolCall: {functionCalls: [
+          {id: "cancel-before-execution", name: "save_working_thought", args: {thought: "A fictional beacon."}},
+        ]},
+        toolCallCancellation: {ids: ["cancel-before-execution"]},
+        serverContent: {turnComplete: true},
+      })
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(h.requests.some(request => request.url.endsWith("/working-thought"))).toBe(false)
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      expect(h.errors).toEqual([])
+      expect(h.persistenceErrors.some(message => message?.includes("may have saved"))).toBe(false)
+    } finally {
+      await h.controller.stop()
+    }
   })
 
   test("setup timeout ends the lease", async () => {
