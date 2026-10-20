@@ -60,7 +60,7 @@ type PendingImage = {
   captionEventId?: string
   speakDescription?: boolean
   retryRequested?: boolean
-  deliveryAttempts?: number
+  retryUsed?: boolean
   imageBaseline?: number | null
 }
 
@@ -606,7 +606,7 @@ export class GeminiLiveController {
       throw new Error("No photo is waiting to retry")
     }
     this.pendingImage.providerSent = false
-    this.pendingImage.deliveryAttempts = 0
+    this.pendingImage.retryUsed = false
     this.pendingImage.imageBaseline = this.latestImageTokens
     this.clearPhotoAttempt()
     await this.retryPendingImage(true)
@@ -628,22 +628,14 @@ export class GeminiLiveController {
     if (this.stopping || this.reflecting || this.photoDeliveryFenced() || !this.ready || this.socket !== socket || socket.readyState !== WS_OPEN) return false
     if ((this.draining && !this.drainInputFlushed) || (this.stopPromise && !this.draining)) return false
     const pending = this.pendingImage!
-    if ((pending.deliveryAttempts ?? 0) >= 2) {
-      void this.requestPhotoRetry(pending)
-      return false
-    }
     this.clearPhotoAttempt()
     if (pending.imageBaseline === undefined) pending.imageBaseline = this.latestImageTokens
-    pending.deliveryAttempts = (pending.deliveryAttempts ?? 0) + 1
     const generation = this.generation
-    // Reserve the allowance durably before a frame can reach Gemini.
     await this.persistJournal()
     if (this.journalUnavailable) throw new Error("Local image journal unavailable")
     if (this.pendingImage !== pending || this.generation !== generation || this.socket !== socket ||
         socket.readyState !== WS_OPEN || !this.ready || this.stopping || (this.stopPromise && !this.draining)) return false
     if (this.photoDeliveryFenced() || (this.draining && !this.drainInputFlushed)) {
-      pending.deliveryAttempts -= 1
-      await this.persistJournal()
       return false
     }
     this.toolBatch = {request: null, completed: false, continuationSent: false, background: true, started: true}
@@ -664,11 +656,15 @@ export class GeminiLiveController {
         this.rejectPhotoAttempt(attempt, false)
         return
       }
+      if (this.voiceActive || this.turnActive || (this.spokenRequest && !this.spokenRequest.retired)) {
+        this.resetImageDelivery()
+        return
+      }
       try {
         socket.send(JSON.stringify({realtimeInput: {text: `image_id: ${pending.imageId}\n${PHOTO_CAPTION_INSTRUCTION}`}}))
         this.photoTimer = setTimeout(() => {
           console.error("[OpenAlma] Photo response/accounting incomplete; retaining original for Retry", {imageId: pending.imageId})
-          this.rejectPhotoAttempt(attempt, false)
+          this.rejectPhotoAttempt(attempt, attempt.batch.completed && !attempt.interrupted)
         }, TOOL_TIMEOUT_MS)
       } catch {
         this.rejectPhotoAttempt(attempt, false)
@@ -687,20 +683,30 @@ export class GeminiLiveController {
     if (this.photoAttempt !== attempt) return
     this.clearPhotoAttempt()
     const image = attempt.image
-    const retry = resend && (image.deliveryAttempts ?? 0) < 2
+    const retry = resend && image.retryUsed !== true
     console.error("[OpenAlma] Photo delivery not confirmed", {imageId: image.imageId,
       baseline: attempt.baseline, imageTokens: attempt.imageTokens ?? null, resend: retry})
-    for (const [id, call] of this.pendingToolCalls) {
-      if (call.batch === attempt.batch && call.name === "save_photo_caption" && call.response === undefined) {
-        this.completeToolCall(id, call, {ok: false, durable: false, status: "unconfirmed"}, false)
-      }
-    }
+    this.completePhotoCalls(attempt)
     if (this.pendingImage !== image) return
     if (retry) {
+      image.retryUsed = true
+      if (image.imageBaseline === null && attempt.imageTokens !== null && attempt.imageTokens !== undefined) {
+        image.imageBaseline = attempt.imageTokens
+      }
       image.providerSent = false
       image.retryRequested = false
       void this.persistJournal().then(() => this.retryPendingImage())
     } else void this.requestPhotoRetry(image)
+  }
+
+  private completePhotoCalls(attempt: PhotoAttempt): void {
+    for (const [id, call] of this.pendingToolCalls) {
+      if (call.batch === attempt.batch && call.name === "save_photo_caption" && call.response === undefined) {
+        const accepted = call.provisionalCaption !== undefined && this.acceptedCaptions.get(attempt.image.imageId) === call.provisionalCaption
+        this.completeToolCall(id, call, {ok: accepted, durable: accepted,
+          ...(accepted ? {} : {status: "unconfirmed"})}, false)
+      }
+    }
   }
 
   private async settlePhotoAttempt(): Promise<void> {
@@ -713,7 +719,10 @@ export class GeminiLiveController {
     }
     const captions = [...this.pendingToolCalls].filter(([, call]) =>
       call.batch === attempt.batch && call.provisionalCaption !== undefined && call.response === undefined)
-    if (!captions.length) return
+    if (!captions.length) {
+      this.rejectPhotoAttempt(attempt, true)
+      return
+    }
     attempt.settling = true
     if (this.photoTimer) clearTimeout(this.photoTimer)
     this.photoTimer = null
@@ -728,10 +737,7 @@ export class GeminiLiveController {
     if (this.photoAttempt !== attempt || this.pendingImage !== image || image.generation !== this.generation) return
     this.scheduleAppend()
     await this.scheduleImageFinalize()
-    for (const [id, call] of captions) {
-      const accepted = this.acceptedCaptions.get(image.imageId) === call.provisionalCaption
-      this.completeToolCall(id, call, {ok: accepted, durable: accepted}, false)
-    }
+    this.completePhotoCalls(attempt)
     if (this.photoAttempt === attempt) this.clearPhotoAttempt()
   }
 
@@ -1148,15 +1154,18 @@ export class GeminiLiveController {
     if (nativeResponse) this.toolBatch.nativeStarted = true
     const usage = message.usageMetadata
     if (usage !== undefined) {
-      const details = Array.isArray(usage?.promptTokensDetails) ? usage.promptTokensDetails : []
-      const images = details.filter((detail: any) => detail?.modality === "IMAGE")
-      const count = images.length === 1 && Number.isSafeInteger(images[0].tokenCount) && images[0].tokenCount >= 0
-        ? images[0].tokenCount as number : null
-      if (count !== null) this.latestImageTokens = count
+      const details = usage?.promptTokensDetails
+      const valid = Array.isArray(details) && details.every((detail: any) =>
+        typeof detail?.modality === "string" && Number.isSafeInteger(detail.tokenCount) && detail.tokenCount >= 0)
+      const images = valid ? details.filter((detail: any) => detail.modality === "IMAGE") : []
+      const count: number | null = valid && images.length <= 1 ? (images[0]?.tokenCount ?? 0) : null
+      if (count !== null && count !== this.latestImageTokens) {
+        this.latestImageTokens = count
+        void this.persistJournal()
+      }
       const owner = this.toolBatch.nativeStarted ? this.toolBatch :
         this.toolBatch.request && this.toolBatch.request !== this.completedBatch?.request ? null : this.completedBatch
       if (this.photoAttempt?.batch === owner) this.photoAttempt.imageTokens = count
-      void this.persistJournal()
     }
     if (message.serverContent?.interrupted && this.photoAttempt?.batch === this.toolBatch) {
       this.photoAttempt.interrupted = true
@@ -1197,7 +1206,7 @@ export class GeminiLiveController {
     }
     this.flushToolResponses()
     void this.settlePhotoAttempt().catch(error => this.reportError(error instanceof Error ? error : new Error(String(error))))
-    if (this.goAwayPending && !this.turnActive && !this.reflecting) void this.rotateForGoAway()
+    if (this.goAwayPending && !this.turnActive && !this.reflecting && !this.photoAttempt) void this.rotateForGoAway()
   }
 
   private handleGoAway(value: unknown): void {
@@ -2196,7 +2205,7 @@ export class GeminiLiveController {
       (image.captionEventId === undefined || (typeof image.captionEventId === "string" &&
         !!image.captionEventId.trim() && image.captionEventId.length <= 256)) &&
       (image.retryRequested === undefined || typeof image.retryRequested === "boolean") &&
-      (image.deliveryAttempts === undefined || (Number.isSafeInteger(image.deliveryAttempts) && image.deliveryAttempts >= 0 && image.deliveryAttempts <= 2)) &&
+      (image.retryUsed === undefined || typeof image.retryUsed === "boolean") &&
       (image.imageBaseline === undefined || image.imageBaseline === null || (Number.isSafeInteger(image.imageBaseline) && image.imageBaseline >= 0)) &&
       (image.speakDescription === undefined || typeof image.speakDescription === "boolean")
   }
@@ -2399,8 +2408,10 @@ export class GeminiLiveController {
   }
 
   private resetImageDelivery(): void {
-    if (this.photoAttempt && !this.pendingImage?.caption) this.rejectPhotoAttempt(this.photoAttempt, true)
-    else this.clearPhotoAttempt()
+    const attempt = this.photoAttempt
+    if (attempt?.settling) return
+    this.clearPhotoAttempt()
+    if (attempt) this.completePhotoCalls(attempt)
     if (this.pendingImage?.providerSent && !this.pendingImage.caption) {
       this.pendingImage.providerSent = false
       this.pendingImage.captureAfterCurrent = false

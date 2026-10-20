@@ -25,7 +25,9 @@ PNG. Photos send immediately unless you enable preview, which offers Send or
 Retake. Files over 1 MB show a dismissible cost and latency warning. Expand
 **Photo captions** to see the last five captions received while Iris is running,
 in arrival order. A green check means memU accepted the caption for filing, not
-that memory extraction has finished. Spoken photo descriptions remain separate.
+that memory extraction has finished. Unchecked captions are unconfirmed previews
+and may be wrong, including when the photo did not arrive. Spoken photo
+descriptions remain separate.
 
 Unconfirmed uploads stay in phone recovery after Stop; Start Iris again to check
 the saved original. Once the server accepts a caption for filing, it owns that

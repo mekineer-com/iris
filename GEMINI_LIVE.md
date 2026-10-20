@@ -89,15 +89,21 @@ carries the original's `media_ref` and has no spoken-transcript status.
 Use any IMAGE-count increase, not a fixed increment: the sequential test measured
 266 then329, retained329 after resumed setup and stayed329 when a third photo
 was missed. Fresh provider contexts start at zero; resumed contexts retain their
-known count and pending baseline with the existing journal. Unknown accounting
-does not become zero, and invalidating a resumption handle does not reset the
+known count and pending baseline with the existing journal. A valid detail list
+without IMAGE reports zero, as in the fresh-miss observations; missing or invalid
+details remain unknown. Invalidating a resumption handle does not reset the
 current context. Native response ownership, rather than merely sending a frame,
 determines which photo may consume a usage sample.
 
-Explicit flat accounting permits one automatic replay of the same stored
-original and ID; the consumed allowance survives reconnect. A second flat
-attempt exposes Retry/Discard. Unknown accounting or a missing caption remains
-bounded by the existing 30-second tool allowance and Stop's shorter drain.
+One normally completed failed response permits an actual retry of the same
+stored original and ID. Persist retryUsed when entering this retry phase; it is
+not a frame-send limit. Interruption, speech deferral, reconnect/go-away replay
+and aborted pre-send writes do not spend it. A second completed failure exposes
+Retry/Discard. A rising count without a caption fails promptly; a completed
+reply with unknown accounting can use its retry at the existing 30-second bound.
+Stop retains its shorter drain. If speech starts during the500ms delay, defer
+the task until the spoken answer finishes without spending the retry. Immediate
+idle go-away rotation waits for the photo, but the existing deadline still wins.
 No receipt or durable success is invented. Explicit Retry is separate from this
 automatic allowance. Copies need no new deduplication guard. Internal photo
 output is kept off playback/history without muting an adopted spoken request.
