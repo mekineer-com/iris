@@ -74,6 +74,7 @@ export class SessionController {
   private cameraEnabled = true
   private preferencesLoaded: Promise<void> = Promise.resolve()
   private photoRetryPending = false
+  private photoCaptions: SessionSnapshot["photoCaptions"] = []
   private failedPhotos: string[] = []
   private photoStatusError: string | null = null
   private manualAudio: string[] = []
@@ -164,6 +165,7 @@ export class SessionController {
           const identity = this.installationPending() ? undefined : await this.resolveProfileIdentity(submitted)
           const config = identity?.config ?? submitted
           await this.session.storage.set(OPENALMA_PROFILE_KEY, serializeOpenAlmaProfile(config))
+          if (this.config?.baseUrl !== config.baseUrl) this.photoCaptions = []
           this.config = config
           this.soulLoading = true
           this.memuAvailable = null
@@ -230,6 +232,7 @@ export class SessionController {
           }
           const selectedSoul = result.soul_id
           await this.session.storage.set(SOUL_ID_KEY, selectedSoul)
+          if (this.soulId !== selectedSoul) this.photoCaptions = []
           this.soulId = selectedSoul
           this.soulConfirmed = true
           this.failedPhotos = []
@@ -413,6 +416,7 @@ export class SessionController {
       microphoneEnabled: this.microphoneEnabled,
       cameraEnabled: this.cameraEnabled,
       photoRetryPending: this.photoRetryPending,
+      photoCaptions: this.photoCaptions.map(caption => ({...caption})),
       failedPhotos: [...this.failedPhotos],
       lastError: this.liveController?.activityPauseReason || this.lastError || this.photoStatusError,
       usageTotalTokens: this.usageTotalTokens,
@@ -495,6 +499,20 @@ export class SessionController {
           },
           onPhotoRetryChange: (pending) => {
             this.photoRetryPending = pending
+            this.pushSnapshot()
+          },
+          onPhotoCaption: (caption, acknowledgmentOnly) => {
+            // Stop advances the generation before its still-owned caption drain.
+            if (generation !== this.startGeneration && !(this.connection === "stopping" &&
+                this.teardownKind === "stop" && this.startGeneration === generation + 1)) return
+            const index = this.photoCaptions.findIndex(row => row.imageId === caption.imageId && row.caption === caption.caption)
+            if (index < 0) {
+              if (acknowledgmentOnly) return
+              this.photoCaptions = [...this.photoCaptions, {...caption, receivedAt: Date.now()}].slice(-5)
+            } else {
+              this.photoCaptions = this.photoCaptions.map((row, i) => i === index
+                ? {...row, durable: row.durable || caption.durable} : row)
+            }
             this.pushSnapshot()
           },
           onPersistenceError: (message) => {

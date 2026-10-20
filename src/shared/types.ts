@@ -15,6 +15,8 @@ export type OpenAlmaProfile = {
   installationConfirmed?: boolean
 }
 
+export type PhotoCaption = {imageId: string; caption: string; durable: boolean}
+
 export interface SessionSnapshot {
   configured: boolean
   connectionProfile: OpenAlmaProfile | null
@@ -31,6 +33,7 @@ export interface SessionSnapshot {
   microphoneEnabled: boolean
   cameraEnabled: boolean
   photoRetryPending: boolean
+  photoCaptions: Array<PhotoCaption & {receivedAt: number}>
   failedPhotos?: string[]
   lastError: string | null
   usageTotalTokens: number | null

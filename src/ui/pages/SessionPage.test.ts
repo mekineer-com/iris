@@ -48,6 +48,27 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
 }
 
 describe("SessionPage state projection", () => {
+  test("caption timeline is collapsed, keeps repeated text, and marks only accepted entries", () => {
+    const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+      connection: "listening", photoCaptions: [
+        {imageId: "photo-a", caption: "A fictional repeated scene.", durable: false, receivedAt: 1000},
+        {imageId: "photo-b", caption: "A fictional repeated scene.", durable: true, receivedAt: 2000},
+        {imageId: "photo-a", caption: "A different fictional caption.", durable: false, receivedAt: 2500},
+      ]}
+    const render = renderPage(snapshot, async () => ({ok: true}))
+    const panel = () => nodes(render()).find(node => node.type === "details" && node.props.className === "photo-captions")
+    expect(panel().props.open).toBeUndefined()
+    expect(nodes(panel()).filter(node => node.type === "p").map(node => node.props.children))
+      .toEqual(["A fictional repeated scene.", "A fictional repeated scene.", "A different fictional caption."])
+    expect(new Set(nodes(panel()).filter(node => node.type === "li").map(node => node.key)).size).toBe(3)
+    expect(nodes(panel()).filter(node => node.props?.["aria-label"] === "Accepted by memU")).toHaveLength(1)
+    expect(nodes(panel()).filter(node => node.type === "time").map(node => node.props.dateTime))
+      .toEqual([new Date(1000).toISOString(), new Date(2000).toISOString(), new Date(2500).toISOString()])
+    snapshot.photoCaptions = [{imageId: "photo-c", caption: "The next fictional scene.", durable: false, receivedAt: 3000}]
+    expect(nodes(panel()).filter(node => node.props?.["aria-label"] === "Accepted by memU")).toHaveLength(0)
+    expect(JSON.stringify(panel())).not.toContain("repeated scene")
+  })
+
   test("server-owned photo Retry and Discard are enabled while idle", () => {
     const render = renderPage({configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
       connection: "idle", photoRetryPending: false, failedPhotos: ["server-photo"]}, async () => ({ok: true}))

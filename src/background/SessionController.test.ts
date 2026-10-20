@@ -298,6 +298,52 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
 }
 
 describe("SessionController", () => {
+  test("caption timeline retains five, preserves repeats across photos, and ACKs update in place", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    for (let i = 1; i <= 6; i++) {
+      h.live.callbacks.onPhotoCaption!({imageId: `photo-${i}`, caption: "A repeated fictional scene.", durable: false}, false)
+    }
+    const before = lastSnapshot(h.session)!.photoCaptions
+    expect(before.map(row => row.imageId)).toEqual(["photo-2", "photo-3", "photo-4", "photo-5", "photo-6"])
+    h.live.callbacks.onPhotoCaption!({imageId: "photo-3", caption: "A repeated fictional scene.", durable: true}, true)
+    h.live.callbacks.onPhotoCaption!({imageId: "photo-3", caption: "A repeated fictional scene.", durable: false}, false)
+    h.live.callbacks.onPhotoCaption!({imageId: "photo-1", caption: "A repeated fictional scene.", durable: true}, true)
+    const after = lastSnapshot(h.session)!.photoCaptions
+    expect(after.map(row => row.imageId)).toEqual(before.map(row => row.imageId))
+    expect(after[1]).toEqual({...before[1], durable: true})
+    expect(before[1].durable).toBe(false)
+    const original = h.live
+    let release!: () => void
+    original.stopGate = new Promise<void>(resolve => {release = resolve})
+    const stopping = h.session.handlers["openalma:stop"]({})
+    await Promise.resolve()
+    original.callbacks.onPhotoCaption!({imageId: "photo-6", caption: "A repeated fictional scene.", durable: true}, true)
+    expect(lastSnapshot(h.session)!.photoCaptions.at(-1)?.durable).toBe(true)
+    release()
+    await stopping
+    expect(lastSnapshot(h.session)!.photoCaptions).toHaveLength(5)
+    original.callbacks.onPhotoCaption!({imageId: "late-after-stop", caption: "A late scene.", durable: false}, false)
+    expect(lastSnapshot(h.session)!.photoCaptions).toHaveLength(5)
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    original.callbacks.onPhotoCaption!({imageId: "stale-photo", caption: "A stale scene.", durable: false}, false)
+    expect(lastSnapshot(h.session)!.photoCaptions).toHaveLength(5)
+    await h.session.handlers["openalma:stop"]({})
+    await h.session.handlers["openalma:set-soul"]({soulId: "Another Test Soul", useExisting: false})
+    expect(lastSnapshot(h.session)!.photoCaptions).toEqual([])
+  })
+
+  test("caption history clears only after a changed connection is saved", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    h.live.callbacks.onPhotoCaption!({imageId: "photo-a", caption: "A fictional scene.", durable: true}, false)
+    await h.session.handlers["openalma:stop"]({})
+    await h.session.handlers["openalma:set-profile"]({...CONFIG})
+    expect(lastSnapshot(h.session)!.photoCaptions).toHaveLength(1)
+    await h.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://another-fictional-server.example"})
+    expect(lastSnapshot(h.session)!.photoCaptions).toEqual([])
+  })
+
   test.each(["retry", "discard"])("server-owned failed photo supports idle %s without starting voice", async action => {
     const session = new FakeSession()
     session.stored.set("openalma.soul-id", CONFIG.soulId)
@@ -1601,6 +1647,7 @@ describe("SessionController", () => {
       microphoneEnabled: true,
       cameraEnabled: true,
       photoRetryPending: false,
+      photoCaptions: [],
       failedPhotos: [],
       lastError: null,
       usageTotalTokens: null,

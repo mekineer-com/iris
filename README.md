@@ -22,8 +22,10 @@ After at least two completed user turns, Stop may play and save a short reflecti
 
 During a sitting, use **Take photo** or **Choose image** to show her a JPEG or
 PNG. Photos send immediately unless you enable preview, which offers Send or
-Retake. Files over 1 MB show a dismissible cost and latency warning. Her spoken
-description becomes the saved caption.
+Retake. Files over 1 MB show a dismissible cost and latency warning. Expand
+**Photo captions** to see the last five captions received while Iris is running,
+in arrival order. A green check means memU accepted the caption for filing, not
+that memory extraction has finished. Spoken photo descriptions remain separate.
 
 Unconfirmed uploads stay in phone recovery after Stop; Start Iris again to check
 the saved original. Once the server accepts a caption for filing, it owns that

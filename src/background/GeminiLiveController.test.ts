@@ -2,7 +2,7 @@ import {describe, expect, spyOn, test} from "bun:test"
 
 import {GeminiLiveController, journalSoulId, JOURNAL_KEY, PHOTO_CAPTION_INSTRUCTION, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
-import {PHOTO_RETRY_MESSAGE} from "../shared/types"
+import {PHOTO_RETRY_MESSAGE, type PhotoCaption} from "../shared/types"
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://127.0.0.1:9999",
@@ -152,6 +152,7 @@ function harness(
   const errors: string[] = []
   const persistenceErrors: Array<string | null> = []
   const photoRetryChanges: boolean[] = []
+  const photoCaptions: Array<PhotoCaption & {acknowledgmentOnly: boolean}> = []
   const finalizations: Array<{ok: boolean; durable: boolean; queued: boolean}> = []
   const reconnecting: boolean[] = []
   const usage: number[] = []
@@ -278,6 +279,7 @@ function harness(
         durationWarnings += 1
       },
       onPhotoRetryChange: (pending) => photoRetryChanges.push(pending),
+      onPhotoCaption: (caption, acknowledgmentOnly) => photoCaptions.push({...caption, acknowledgmentOnly}),
       onPersistenceError: (message) => persistenceErrors.push(message),
       onError: (error) => { errors.push(error.message); options.onError?.() },
     },
@@ -305,6 +307,7 @@ function harness(
     errors,
     persistenceErrors,
     photoRetryChanges,
+    photoCaptions,
     finalizations,
     finalizeStatuses,
     finalizeGates,
@@ -1529,6 +1532,29 @@ describe("GeminiLiveController", () => {
     expect(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)[0]).toContain("other-soul-handle")
     await h.controller.stop()
   })
+  test.each([200, 503])("caption preview waits for durable acceptance before green (%i)", async status => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => {release = resolve})
+    const h = harness({storage: new FakeStorage(), finalizeGates: [gate], finalizeStatuses: [status]})
+    await start(h)
+    try {
+      await h.controller.sendImage({imageId: "caption-preview", mimeType: "image/png", data: "AQID"})
+      saveCaption(h.sockets[0], "caption-preview", "A fictional green triangle.")
+      await waitFor(() => h.photoCaptions.length === 1)
+      expect(h.photoCaptions).toEqual([{imageId: "caption-preview", caption: "A fictional green triangle.",
+        durable: false, acknowledgmentOnly: false}])
+      expect(h.finalizations).toEqual([])
+      release()
+      await waitFor(() => h.finalizations.length === 1)
+      await waitFor(() => status === 200 ? h.photoCaptions.length === 2 : h.photoRetryChanges.at(-1) === true)
+      expect(h.photoCaptions.filter(caption => caption.durable)).toHaveLength(status === 200 ? 1 : 0)
+      if (status === 200) expect(h.photoCaptions[1]).toMatchObject({imageId: "caption-preview", acknowledgmentOnly: true})
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
   test("snapshots, sends, journals, acknowledges, then finalizes one image", async () => {
     const storage = new FakeStorage()
     const h = harness({storage})
@@ -1798,11 +1824,14 @@ describe("GeminiLiveController", () => {
       expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay"))).toHaveLength(1)
       expect(h.requests.some(request => /\/(finalize|retry|append)$/.test(request.url))).toBe(false)
       expect(h.sockets[0].sent.map(value => JSON.parse(value))).toEqual([{setup: {sessionResumption: {}}}])
+      expect(h.photoCaptions).toEqual([{imageId: "receipt-photo", caption: "A fictional amber star.",
+        durable: true, acknowledgmentOnly: false}])
       saveCaption(h.sockets[0], "receipt-photo", "A fictional amber star.", "recovered-duplicate")
       await waitFor(() => h.sockets[0].sent.some(value => JSON.parse(value).toolResponse))
       const result = h.sockets[0].sent.flatMap(value => JSON.parse(value).toolResponse?.functionResponses ?? [])
       expect(result[0]).toMatchObject({response: {ok: true, durable: true}, scheduling: "SILENT"})
       expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay"))).toHaveLength(1)
+      expect(h.photoCaptions).toHaveLength(1)
       expect(h.errors).toEqual([])
       await h.controller.stop()
     },

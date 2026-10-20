@@ -148,6 +148,15 @@ h1 {
   font-size: 1.5rem;
 }
 
+.photo-captions summary {
+  cursor: pointer;
+}
+
+.photo-captions p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .soul-new {
   width: 2rem;
   min-height: 2rem;

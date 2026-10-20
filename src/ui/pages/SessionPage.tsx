@@ -590,6 +590,22 @@ export default function SessionPage() {
         </div>
       ) : null}
       {imageStatus ? <p role="status">{imageStatus}</p> : null}
+      {snapshot?.photoCaptions?.length ? (
+        <details className="photo-captions">
+          <summary>Photo captions</summary>
+          <ol>
+            {snapshot.photoCaptions.map(({imageId, caption, durable, receivedAt}) => (
+              <li key={`${imageId}:${caption}`}>
+                <time dateTime={new Date(receivedAt).toISOString()} title="Received by Iris">
+                  {new Date(receivedAt).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}
+                </time>
+                {durable ? <span className="soul-ready" aria-label="Accepted by memU" title="Accepted by memU">✓</span> : null}
+                <p>{caption}</p>
+              </li>
+            ))}
+          </ol>
+        </details>
+      ) : null}
       {photoRetryPending ? (
         <div>
           <p role="status">{visible === "idle" || visible === "error"

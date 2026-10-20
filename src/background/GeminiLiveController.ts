@@ -2,7 +2,7 @@ import {approxBase64ByteLength} from "./audioHelpers"
 import {timeoutSignal} from "./timeoutSignal"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import type {ImageRequest} from "../shared/channels"
-import {MIC_SOURCES, PHOTO_RETRY_MESSAGE, type MicSource, type SessionMode} from "../shared/types"
+import {MIC_SOURCES, PHOTO_RETRY_MESSAGE, type MicSource, type PhotoCaption, type SessionMode} from "../shared/types"
 
 type StartResponse = {
   session_id: string
@@ -26,6 +26,7 @@ export type GeminiCallbacks = {
   onUsage: (totalTokens: number) => void
   onDurationWarning: () => void
   onPhotoRetryChange: (pending: boolean) => void
+  onPhotoCaption?: (caption: PhotoCaption, acknowledgmentOnly: boolean) => void
   onPersistenceError: (message: string | null) => void
   onError: (error: Error) => void
 }
@@ -645,6 +646,7 @@ export class GeminiLiveController {
       const filing = this.filingCaption(replay?.filing)
       if (filing !== null) {
         this.acceptedCaptions.set(pending.imageId, filing)
+        this.callbacks.onPhotoCaption?.({imageId: pending.imageId, caption: filing, durable: true}, false)
         this.pendingImage = null
         await this.persistJournal()
         this.callbacks.onPhotoRetryChange(false)
@@ -1832,6 +1834,7 @@ export class GeminiLiveController {
 
   private async finalizePendingImage(pending: PendingImage): Promise<void> {
     const generation = this.generation
+    this.callbacks.onPhotoCaption?.({imageId: pending.imageId, caption: pending.caption!, durable: false}, false)
     await this.persistJournal()
     if (generation !== this.generation || this.pendingImage !== pending) return
     let response: Response
@@ -1864,6 +1867,7 @@ export class GeminiLiveController {
       return
     }
     this.acceptedCaptions.set(pending.imageId, pending.caption!)
+    this.callbacks.onPhotoCaption?.({imageId: pending.imageId, caption: pending.caption!, durable: true}, true)
     if (pending.speakDescription) this.spokenPhotos.push(pending.imageId)
     this.pendingImage = null
     await this.persistJournal()
