@@ -77,10 +77,26 @@ type SessionJournal = {
   pendingImage?: PendingImage | null
 }
 
+type SpokenRequest = {
+  settled: boolean
+  audible: boolean
+  retired: boolean
+  continuing: boolean
+}
+
+type ToolBatch = {
+  request: SpokenRequest | null
+  completed: boolean
+  continuationSent: boolean
+  background: boolean
+  started: boolean
+}
+
 type PendingToolCall = {
   name: string
   generation: number
   sessionId: string
+  batch: ToolBatch
   response?: string | Record<string, unknown>
 }
 
@@ -216,6 +232,9 @@ export class GeminiLiveController {
   private interruptionFinalized = false
   private turnActive = false
   private turnHasToolCall = false
+  private spokenRequest: SpokenRequest | null = null
+  private toolBatch: ToolBatch = {request: null, completed: false, continuationSent: false, background: true, started: false}
+  private handlingMessage = false
   private turnAudioDelivered = false
   private voiceActive = false
   private hasCompletedProviderTurn = false
@@ -286,6 +305,8 @@ export class GeminiLiveController {
     this.interruptionFinalized = false
     this.turnActive = false
     this.turnHasToolCall = false
+    this.spokenRequest = null
+    this.toolBatch = {request: null, completed: false, continuationSent: false, background: true, started: false}
     this.voiceActive = false
     this.hasCompletedProviderTurn = false
     this.completeUserTurns = 0
@@ -399,6 +420,7 @@ export class GeminiLiveController {
       socket.send(JSON.stringify({realtimeInput: {activityStart: {}}}))
       started = true
       this.reserveSpeech(micSource)
+      this.admitSpokenRequest()
       this.turnActive = true
       for (const chunk of audioChunks) {
         if (socket.readyState !== WS_OPEN) throw new Error("socket closed during Manual activity")
@@ -567,6 +589,7 @@ export class GeminiLiveController {
       realtimeInput: {video: {data, mimeType}},
     }))
     socket.send(JSON.stringify({realtimeInput: {text: `image_id: ${pending.imageId}\n${PHOTO_CAPTION_INSTRUCTION}`}}))
+    this.toolBatch.started = true
     return true
   }
 
@@ -680,12 +703,14 @@ export class GeminiLiveController {
 
   muteForStop(): void {
     this.outputMuted = true
+    if (this.spokenRequest) this.spokenRequest.retired = true
   }
 
   private async performStop(graceful: boolean): Promise<void> {
     this.muteForStop()
     trace("provider.stop.begin", {graceful, turnActive: this.turnActive})
     try {
+      this.flushToolResponses()
       const stoppedMidTurn = this.turnActive
       const drainAttempted = graceful && Boolean(this.pendingImage && (this.imageUpload || !this.pendingImage.retryRequested))
       if (drainAttempted) await this.drainPhoto()
@@ -935,7 +960,11 @@ export class GeminiLiveController {
       if (type !== "ACTIVITY_START" && type !== "ACTIVITY_END") throw new Error("Gemini returned malformed voice activity")
       this.voiceActive = type === "ACTIVITY_START"
       if (this.voiceActive) {
-        if (this.mode === "continuous") this.reserveSpeech()
+        if (this.mode === "continuous") {
+          const adoptingEarlyTranscript = this.pendingSpeechDraft()?.speech?.admitted === false && this.spokenRequest
+          this.reserveSpeech()
+          if (!adoptingEarlyTranscript) this.admitSpokenRequest()
+        }
         this.turnActive = true
       } else {
         const speech = this.pendingSpeechDraft()
@@ -967,13 +996,16 @@ export class GeminiLiveController {
     const hasToolCall = message.toolCall !== undefined
     this.turnHasToolCall ||= hasToolCall
     if (hasToolCall) trace("provider.tool_call")
-    if (message.serverContent !== undefined) {
-      this.handleServerContent(message.serverContent, hasToolCall)
+    this.handlingMessage = true
+    try {
+      // Register the whole batch before a co-packet completion can settle it.
+      if (hasToolCall) this.handleToolCall(message.toolCall)
+      if (message.toolCallCancellation !== undefined) this.handleToolCancellation(message.toolCallCancellation)
+      if (message.serverContent !== undefined) this.handleServerContent(message.serverContent, hasToolCall)
+    } finally {
+      this.handlingMessage = false
     }
-    if (hasToolCall) this.handleToolCall(message.toolCall)
-    if (message.toolCallCancellation !== undefined) {
-      this.handleToolCancellation(message.toolCallCancellation)
-    }
+    this.flushToolResponses()
     if (this.goAwayPending && !this.turnActive && !this.reflecting) void this.rotateForGoAway()
   }
 
@@ -1006,6 +1038,7 @@ export class GeminiLiveController {
     this.voiceActive = false
     this.ready = false
     this.callbacks.onReconnecting(true)
+    this.disconnectToolBatch()
     if (this.reflecting) this.finishReflection(null)
     const generation = this.generation
     const sessionId = this.sessionId
@@ -1044,6 +1077,7 @@ export class GeminiLiveController {
     const output = this.transcriptText(content.outputTranscription, "output")
     if (input && !this.pendingSpeechDraft()) {
       this.reserveSpeech(this.turnMicSource, false)
+      if (!this.hasCompletedProviderTurn && !this.spokenRequest && !this.reflecting) this.admitSpokenRequest()
       const speech = this.pendingSpeechDraft()!
       if (this.hasCompletedProviderTurn || this.reflecting) {
         speech.speech!.late = true
@@ -1052,6 +1086,7 @@ export class GeminiLiveController {
     }
     if (content.modelTurn !== undefined || content.outputTranscription !== undefined ||
         (input && !this.pendingSpeechDraft()?.speech?.late)) this.turnActive = true
+    if (content.modelTurn !== undefined || content.outputTranscription !== undefined) this.toolBatch.started = true
     if (input) {
       const speech = this.pendingSpeechDraft()
       if (speech) {
@@ -1074,6 +1109,7 @@ export class GeminiLiveController {
       if (!this.outputMuted || this.reflecting) {
         this.callbacks.onAudio(inline.data)
         this.turnAudioDelivered = true
+        if (this.toolBatch.request) this.toolBatch.request.audible = true
       }
       this.providerAudioChunks += 1
     }
@@ -1093,6 +1129,7 @@ export class GeminiLiveController {
 
     if (!this.outputMuted) this.outputTranscript += output
     if (interrupted) {
+      if (!this.toolBatch.background && this.toolBatch.request) this.toolBatch.request.retired = true
       trace("provider.interrupted", {
         audioChunks: this.providerAudioChunks,
         inputChars: this.pendingSpeechDraft()?.content.length ?? 0,
@@ -1102,7 +1139,6 @@ export class GeminiLiveController {
       this.callbacks.onInterrupted()
     }
     if (content.turnComplete === true) {
-      const messageHasToolCall = hasToolCall
       hasToolCall ||= this.turnHasToolCall
       this.hasCompletedProviderTurn = true
       trace("provider.turn_complete", {
@@ -1123,9 +1159,20 @@ export class GeminiLiveController {
       }
       this.turnActive = this.voiceActive
       this.turnHasToolCall = false
+      const batch = this.toolBatch
+      batch.completed = true
+      const request = batch.request
+      if (!interruptedTurn && request && (this.mode === "manual" || !this.voiceActive)) {
+        request.settled = true
+        request.continuing = false
+        if (request.audible || !this.hasUnconsumedTools(request)) request.retired = true
+      }
+      if (this.spokenRequest?.retired) this.spokenRequest = null
+      this.toolBatch = {request: this.spokenRequest, completed: false, continuationSent: false,
+        background: !this.spokenRequest, started: false}
       this.reconnectAttempted = false
       if (this.latestUsageTotal !== null) this.callbacks.onUsage(this.latestUsageTotal)
-      this.callbacks.onTurnComplete(!messageHasToolCall)
+      this.callbacks.onTurnComplete(!this.spokenRequest)
       this.requestSpokenPhotoDescription()
       // Barge-in completes the old response before the interrupting voice turn is finished.
       if (!interruptedTurn) void this.retryPendingImage()
@@ -1214,11 +1261,13 @@ export class GeminiLiveController {
         [key, typeof value === "string" ? value.trim() : value],
       ))})
     }
+    this.toolBatch.started = true
     for (const {id, name, args} of parsed) {
       const pending: PendingToolCall = {
         name,
         generation: this.generation,
         sessionId: this.sessionId,
+        batch: this.toolBatch,
       }
       this.pendingToolCalls.set(id, pending)
       if (invalid) this.completeToolCall(id, pending, {
@@ -1244,6 +1293,12 @@ export class GeminiLiveController {
         this.callbacks.onPersistenceError(WRITE_UNCERTAINTY_MESSAGE)
       }
       this.pendingToolCalls.delete(id)
+    }
+    const request = this.spokenRequest
+    if (request?.settled && !request.continuing && !this.hasUnconsumedTools(request)) {
+      request.retired = true
+      this.spokenRequest = null
+      this.callbacks.onTurnComplete(true)
     }
   }
 
@@ -1444,6 +1499,7 @@ export class GeminiLiveController {
   }
 
   private flushToolResponses(): void {
+    if (this.handlingMessage) return
     for (const [id, pending] of this.pendingToolCalls) {
       if (!pending.response) continue
       if (!this.isCurrentToolCall(id, pending)) {
@@ -1451,21 +1507,62 @@ export class GeminiLiveController {
         continue
       }
       if (!this.ready || !this.socket || this.socket.readyState !== WS_OPEN) continue
+      const request = pending.batch.request
+      const needsAnswer = request && !request.retired && !request.audible && !this.outputMuted
+      if (needsAnswer && (!request.settled || !pending.batch.completed)) continue
+      const resume = needsAnswer && !pending.batch.continuationSent && !request.continuing
       this.socket.send(JSON.stringify({
         toolResponse: {
           functionResponses: [{
             id,
             name: pending.name,
             response: typeof pending.response === "string" ? {result: pending.response} : pending.response,
-            scheduling: "SILENT",
+            scheduling: resume ? "WHEN_IDLE" : "SILENT",
           }],
         },
       }))
+      if (resume) {
+        request.continuing = true
+        // Sibling results are context, not additional wakes for the same response.
+        for (const call of this.pendingToolCalls.values()) {
+          if (call.batch.request === request) call.batch.continuationSent = true
+        }
+      }
       this.deliveredToolResultIds.add(id)
       this.pendingToolCalls.delete(id)
     }
     this.finishPhotoDrainIfAcknowledged()
     this.requestSpokenPhotoDescription()
+  }
+
+  private hasUnconsumedTools(request: SpokenRequest): boolean {
+    return [...this.pendingToolCalls.values()].some(call =>
+      call.batch.request === request && !call.batch.continuationSent)
+  }
+
+  private admitSpokenRequest(): void {
+    if (this.spokenRequest) this.spokenRequest.retired = true
+    const request: SpokenRequest = {settled: false, audible: false, retired: false, continuing: false}
+    this.spokenRequest = request
+    // An unresolved background batch may overlap new speech. Completed old work
+    // cannot acquire ownership of a later request.
+    if (!this.toolBatch.started && (!this.toolBatch.request ||
+        (this.toolBatch.request.settled && !this.toolBatch.request.continuing))) {
+      this.toolBatch = {request, completed: false, continuationSent: false, background: false, started: false}
+    } else if (!this.toolBatch.request && !this.toolBatch.completed) {
+      this.toolBatch.request = request
+    }
+  }
+
+  private disconnectToolBatch(): void {
+    // A dropped socket is not proof of native completion. Preserve settled
+    // obligations, but do not manufacture a wake for unfinished provider work.
+    if (this.spokenRequest && (!this.spokenRequest.settled || this.spokenRequest.continuing)) {
+      this.spokenRequest.retired = true
+      this.spokenRequest = null
+    }
+    this.toolBatch = {request: this.spokenRequest, completed: false, continuationSent: false,
+      background: !this.spokenRequest, started: false}
   }
 
   private finalizeInterruptedTurn(userComplete = false): void {
@@ -1699,6 +1796,7 @@ export class GeminiLiveController {
 
   private requestSpokenPhotoDescription(): void {
     if (!this.spokenPhotos.length || this.turnActive || this.stopPromise || this.stopping || this.reflecting ||
+        (this.spokenRequest && !this.spokenRequest.retired) ||
         !this.ready || this.socket?.readyState !== WS_OPEN) return
     const imageId = this.spokenPhotos.shift()!
     this.socket.send(JSON.stringify({clientContent: {
@@ -2010,11 +2108,12 @@ export class GeminiLiveController {
       trace("provider.socket.closed", {resumable: Boolean(this.resumptionHandle)})
       this.socket = null
       this.ready = false
+      this.disconnectToolBatch()
       if (this.reflecting) {
         this.finishReflection(null)
         return
       }
-    const interrupted = this.turnActive || Boolean(this.outputTranscript.trim())
+      const interrupted = this.turnActive || Boolean(this.outputTranscript.trim())
       try {
         if (interrupted) {
           this.finalizeInterruptedTurn()

@@ -10,8 +10,8 @@ Source migration in progress, 2026-10-20: MCP now returns `v1beta` and Iris
 requires that constrained socket; token minting stays on `v1alpha/auth_tokens`.
 The unsupported proactivity setting and its constraint-mask entry are removed.
 These seams follow the Gemini 3.8 provider checks in `PLAN_iris_gemini38.md`.
-No model/configuration cutover has occurred. Photo/tool plumbing and late-speech
-reservations are implemented; requested-answer continuation is still incomplete.
+No model/configuration cutover has occurred. Photo/tool plumbing, late-speech
+reservations and requested-answer scheduling are implemented locally.
 The current source is not a release-ready migration.
 
 ## Source Contract
@@ -103,6 +103,27 @@ reflection follows handoff, outside that caption deadline; its text can settle a
 
 ### Completion and connection rotation
 
+- A spoken request is admitted at Continuous native activity start or Manual
+  Send, independently of when its transcription arrives. Tool calls retain
+  their native batch and request ownership across separate messages.
+- Results associated with an unanswered request wait for native completion and
+  the end of capture before one result uses `WHEN_IDLE`. Sibling results use
+  `SILENT`; fresh tools requested during that continuation can provide another
+  opportunity. Audible output makes further results silent. A completed response
+  without outstanding tools, including intentional silence, closes normally.
+- Unresolved background work may overlap a new admission; only that unresolved
+  batch can adopt it. Completed old batches and superseded requests cannot wake
+  later speech. Cancellation of the last outstanding tool closes its settled
+  request. Stop revokes continuation immediately but permits silent photo handoff.
+- This is a scheduling policy, not proof that tools caused silence or that any
+  PCM fully answered a question. Gemini supplies no request IDs for those claims.
+  It can still choose silence after `WHEN_IDLE`; no synthetic transcript or
+  semantic question classifier is introduced. Late ASR cannot reopen a request.
+- In-process replacement preserves already-settled pending requests and does not
+  repeat uncertain writes. A socket loss before native completion (including an
+  in-flight continuation) cannot certify completion: its unfinished results
+  resume silently, without an invented wake.
+  Provider acceptance of these integrated races remains a separate gate.
 - `serverContent.turnComplete: true` closes response generation, not input
   transcription ownership. Reserve spoken input at native activity start, or
   Manual Send; the Manual echo does not create another reservation.

@@ -332,7 +332,523 @@ function completeTurn(h: ReturnType<typeof harness>, input = "hello", output = "
   })
 }
 
+function functionResponses(socket: FakeSocket): Array<{id: string; name: string; scheduling: string; response: any}> {
+  return socket.sent.flatMap(value => JSON.parse(value).toolResponse?.functionResponses ?? [])
+}
+
+function admitRequest(h: ReturnType<typeof harness>, mode: "continuous" | "manual"): void {
+  if (mode === "manual") h.controller.sendActivity(["AAAA"], "phone")
+  else {
+    h.controller.sendAudio("AAAA", "phone")
+    h.sockets.at(-1)!.message({voiceActivity: {type: "ACTIVITY_START"}})
+    h.sockets.at(-1)!.message({voiceActivity: {type: "ACTIVITY_END"}})
+  }
+}
+
 describe("GeminiLiveController", () => {
+  test.each(["continuous", "manual"] as const)("%s holds a ready recall result until native request completion", async mode => {
+    const h = harness()
+    await start(h, mode)
+    try {
+      admitRequest(h, mode)
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "Where was the fictional beacon?"}}})
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "owed-recall", name: "recall_memory", args: {query: "fictional beacon"}},
+      ]}})
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/recall")))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      h.sockets[0].message({serverContent: {generationComplete: true}})
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "owed-recall"))
+      expect(functionResponses(h.sockets[0])).toContainEqual({
+        id: "owed-recall", name: "recall_memory", scheduling: "WHEN_IDLE",
+        response: {result: "A compact fictional memory."},
+      })
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "Beside the fictional harbor."},
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+      expect(h.events.at(-1)).toBe("turnComplete")
+      expect(h.errors).toEqual([])
+    } finally {
+      await h.controller.stop()
+    }
+  })
+
+  test.each(["co-packet", "split"] as const)("%s tools and completion retain the admitted answer obligation", async packet => {
+    const h = harness()
+    await start(h)
+    try {
+      admitRequest(h, "continuous")
+      const toolCall = {functionCalls: [{id: "native-batch", name: "recall_memory", args: {query: "fictional harbor"}}]}
+      h.sockets[0].message({toolCall, ...(packet === "co-packet" ? {serverContent: {turnComplete: true}} : {})})
+      if (packet === "split") h.sockets[0].message({serverContent: {turnComplete: true}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "native-batch"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "native-batch")?.scheduling).toBe("WHEN_IDLE")
+      expect(h.errors).toEqual([])
+    } finally {
+      await h.controller.stop()
+    }
+  })
+
+  test("background-only recall stays SILENT without inventing a spoken request", async () => {
+    const h = harness()
+    await start(h)
+    try {
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "background-recall", name: "recall_memory", args: {query: "fictional background"}},
+      ]}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "background-recall"))
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      expect(functionResponses(h.sockets[0]).every(response => response.scheduling === "SILENT")).toBe(true)
+      expect(h.audio).toEqual([])
+      expect(h.errors).toEqual([])
+    } finally {
+      await h.controller.stop()
+    }
+  })
+
+  test.each(["before-result", "after-result"] as const)("audible answer %s makes the tool result SILENT", async ordering => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const h = harness({recallGate: gate})
+    await start(h)
+    try {
+      admitRequest(h, "continuous")
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "Recall the fictional harbor."}},
+        toolCall: {functionCalls: [{id: "answered-recall", name: "recall_memory", args: {query: "harbor"}}]}})
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/recall")))
+      if (ordering === "after-result") {
+        release()
+        await new Promise(resolve => setTimeout(resolve, 0))
+        expect(functionResponses(h.sockets[0])).toEqual([])
+      }
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "I remember the harbor."},
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+      release()
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "answered-recall"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "answered-recall")?.scheduling).toBe("SILENT")
+      expect(h.audio).toEqual(["AAAAAA=="])
+      expect(h.errors).toEqual([])
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
+  test("a pending native batch wakes once even across another silent completion", async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const h = harness({workingGate: gate})
+    await start(h)
+    try {
+      admitRequest(h, "continuous")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "batch-recall", name: "recall_memory", args: {query: "fictional lighthouse"}},
+        {id: "batch-working", name: "read_working_state", args: {}},
+      ]}, serverContent: {turnComplete: true}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "batch-recall"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "batch-recall")?.scheduling).toBe("WHEN_IDLE")
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      release()
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "batch-working"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "batch-working")?.scheduling).toBe("SILENT")
+      expect(functionResponses(h.sockets[0]).filter(response => response.scheduling === "WHEN_IDLE")).toHaveLength(1)
+      expect(h.errors).toEqual([])
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
+  test("a fresh second tool round may continue the same unanswered request", async () => {
+    const h = harness()
+    await start(h)
+    try {
+      admitRequest(h, "continuous")
+      for (const id of ["first-round", "second-round"]) {
+        h.sockets[0].message({toolCall: {functionCalls: [
+          {id, name: "recall_memory", args: {query: `fictional ${id}`}},
+        ]}, serverContent: {turnComplete: true}})
+        await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === id))
+        expect(functionResponses(h.sockets[0]).find(response => response.id === id)?.scheduling).toBe("WHEN_IDLE")
+      }
+      expect(h.errors).toEqual([])
+    } finally {
+      await h.controller.stop()
+    }
+  })
+
+  test("one wake consumes all already-pending native batches for the request", async () => {
+    let releaseRecall!: () => void
+    let releaseWorking!: () => void
+    const h = harness({
+      recallGate: new Promise<void>(resolve => { releaseRecall = resolve }),
+      workingGate: new Promise<void>(resolve => { releaseWorking = resolve }),
+    })
+    await start(h)
+    try {
+      admitRequest(h, "continuous")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "extant-first", name: "recall_memory", args: {query: "fictional harbor"}},
+      ]}, serverContent: {turnComplete: true}})
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "extant-second", name: "read_working_state", args: {}},
+      ]}, serverContent: {turnComplete: true}})
+      releaseRecall()
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "extant-first"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "extant-first")?.scheduling).toBe("WHEN_IDLE")
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      releaseWorking()
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "extant-second"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "extant-second")?.scheduling).toBe("SILENT")
+      expect(h.errors).toEqual([])
+    } finally {
+      releaseRecall()
+      releaseWorking()
+      await h.controller.stop()
+    }
+  })
+
+  test("late ASR cannot revive a terminal silent request for a background recall", async () => {
+    const h = harness()
+    await start(h)
+    try {
+      admitRequest(h, "continuous")
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      expect(h.events.at(-1)).toBe("turnComplete")
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "Late fictional words."}}})
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "late-background", name: "recall_memory", args: {query: "fictional background"}},
+      ]}, serverContent: {turnComplete: true}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "late-background"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "late-background")?.scheduling).toBe("SILENT")
+      expect(h.errors).toEqual([])
+    } finally {
+      await h.controller.stop()
+    }
+  })
+
+  test("an old request's late result cannot wake a newer unanswered request", async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const h = harness({recallGate: gate})
+    await start(h)
+    try {
+      admitRequest(h, "continuous")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "old-request", name: "recall_memory", args: {query: "old fictional request"}},
+      ]}, serverContent: {turnComplete: true}})
+      admitRequest(h, "continuous")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "new-request", name: "read_working_state", args: {}},
+      ]}, serverContent: {turnComplete: true}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "new-request"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "new-request")?.scheduling).toBe("WHEN_IDLE")
+      release()
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "old-request"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "old-request")?.scheduling).toBe("SILENT")
+      expect(h.errors).toEqual([])
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
+  test("cancelling the last pending tool settles Manual without a late wake", async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const h = harness({recallGate: gate})
+    await start(h, "manual")
+    try {
+      admitRequest(h, "manual")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "manual-cancel", name: "recall_memory", args: {query: "fictional cancellation"}},
+      ]}, serverContent: {turnComplete: true}})
+      expect(h.events.at(-1)).toBe("toolBoundary")
+      h.sockets[0].message({toolCallCancellation: {ids: ["manual-cancel"]}})
+      expect(h.events.at(-1)).toBe("turnComplete")
+      release()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      expect(h.errors).toEqual([])
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
+  test("split old interruption and completion cannot retire the newer admitted request", async () => {
+    let release!: () => void
+    const h = harness({recallGate: new Promise<void>(resolve => { release = resolve })})
+    await start(h)
+    try {
+      admitRequest(h, "continuous")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "interrupted-old", name: "recall_memory", args: {query: "old fictional harbor"}},
+      ]}})
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+      h.sockets[0].message({serverContent: {interrupted: true}})
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      release()
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "interrupted-old"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "interrupted-old")?.scheduling).toBe("SILENT")
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "interrupting-new", name: "read_working_state", args: {}},
+      ]}, serverContent: {turnComplete: true}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "interrupting-new"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "interrupting-new")?.scheduling).toBe("WHEN_IDLE")
+      expect(h.errors).toEqual([])
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
+  test("an empty foreground A interrupted after B START cannot end B", async () => {
+    const h = harness()
+    await start(h)
+    try {
+      admitRequest(h, "continuous")
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+      h.sockets[0].message({serverContent: {interrupted: true, turnComplete: true}})
+      expect(h.events.at(-1)).toBe("toolBoundary")
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "empty-a-new-b", name: "recall_memory", args: {query: "fictional B question"}},
+      ]}})
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/recall")))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "empty-a-new-b"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "empty-a-new-b")?.scheduling).toBe("WHEN_IDLE")
+      expect(h.errors).toEqual([])
+    } finally {
+      await h.controller.stop()
+    }
+  })
+
+  test("an incomplete fresh continuation flushes SILENT after replacement without re-execution", async () => {
+    const h = harness()
+    await start(h)
+    try {
+      h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "fictional-continuation-handle"}})
+      admitRequest(h, "continuous")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "completed-initial", name: "recall_memory", args: {query: "fictional first round"}},
+      ]}, serverContent: {turnComplete: true}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "completed-initial"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "completed-initial")?.scheduling).toBe("WHEN_IDLE")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "incomplete-continuation", name: "read_working_state", args: {}},
+      ]}})
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/working-state")))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(functionResponses(h.sockets[0]).some(response => response.id === "incomplete-continuation")).toBe(false)
+      h.sockets[0].close()
+      await waitFor(() => h.sockets.length === 2)
+      h.sockets[1].open()
+      h.sockets[1].message({setupComplete: {}})
+      await waitFor(() => functionResponses(h.sockets[1]).some(response => response.id === "incomplete-continuation"))
+      expect(functionResponses(h.sockets[1]).find(response => response.id === "incomplete-continuation")?.scheduling).toBe("SILENT")
+      expect(functionResponses(h.sockets[1]).some(response => response.id === "completed-initial")).toBe(false)
+      expect(h.requests.filter(request => request.url.endsWith("/working-state"))).toHaveLength(1)
+      expect(h.requests.filter(request => request.url.endsWith("/recall"))).toHaveLength(1)
+      expect(h.errors).toEqual([])
+    } finally {
+      await h.controller.stop()
+    }
+  })
+
+  test("a completed background batch never adopts a later spoken request", async () => {
+    let release!: () => void
+    const h = harness({recallGate: new Promise<void>(resolve => { release = resolve })})
+    await start(h)
+    try {
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "completed-background", name: "recall_memory", args: {query: "fictional background"}},
+      ]}, serverContent: {turnComplete: true}})
+      admitRequest(h, "continuous")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "later-admission", name: "read_working_state", args: {}},
+      ]}, serverContent: {turnComplete: true}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "later-admission"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "later-admission")?.scheduling).toBe("WHEN_IDLE")
+      release()
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "completed-background"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "completed-background")?.scheduling).toBe("SILENT")
+      expect(h.errors).toEqual([])
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
+  test("background completion during active capture waits for the later spoken native boundary", async () => {
+    let release!: () => void
+    const h = harness({recallGate: new Promise<void>(resolve => { release = resolve })})
+    await start(h)
+    try {
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "overlapping-background", name: "recall_memory", args: {query: "fictional background"}},
+      ]}})
+      h.controller.sendAudio("AAAA", "phone")
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      release()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "A fictional overlapping question."}, turnComplete: true}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "overlapping-background"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "overlapping-background")?.scheduling).toBe("WHEN_IDLE")
+      expect(h.errors).toEqual([])
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
+  test("Stop flushes an already-ready held result SILENT without native completion", async () => {
+    const h = harness()
+    await start(h, "manual")
+    try {
+      admitRequest(h, "manual")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "held-at-stop", name: "recall_memory", args: {query: "fictional stopped question"}},
+      ]}})
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/recall")))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      await h.controller.stop()
+      expect(functionResponses(h.sockets[0])).toContainEqual({
+        id: "held-at-stop", name: "recall_memory", scheduling: "SILENT",
+        response: {result: "A compact fictional memory."},
+      })
+      expect(h.audio).toEqual([])
+      expect(h.errors).toEqual([])
+    } finally {
+      await h.controller.stop()
+    }
+  })
+
+  test("Stop never wakes a completed request whose recall is still pending", async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const h = harness({recallGate: gate})
+    await start(h)
+    try {
+      admitRequest(h, "continuous")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "stopped-request", name: "recall_memory", args: {query: "fictional stopped request"}},
+      ]}, serverContent: {turnComplete: true}})
+      await h.controller.stop()
+      release()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      expect(h.audio).toEqual([])
+      expect(h.errors).toEqual([])
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
+  test.each(["close", "goAway"] as const)("completed pending answer obligation survives %s resumption", async cause => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const h = harness({recallGate: gate})
+    await start(h)
+    try {
+      h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "fictional-answer-handle"}})
+      admitRequest(h, "continuous")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "resumed-answer", name: "recall_memory", args: {query: "fictional resumption"}},
+      ]}, serverContent: {turnComplete: true}})
+      if (cause === "close") h.sockets[0].close()
+      else h.sockets[0].message({goAway: {timeLeft: "0.1s"}})
+      await waitFor(() => h.sockets.length === 2)
+      h.sockets[1].open()
+      expect(JSON.parse(h.sockets[1].sent[0])).toEqual({setup: {sessionResumption: {handle: "fictional-answer-handle"}}})
+      h.sockets[1].message({setupComplete: {}})
+      release()
+      await waitFor(() => functionResponses(h.sockets[1]).some(response => response.id === "resumed-answer"))
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      expect(functionResponses(h.sockets[1]).find(response => response.id === "resumed-answer")?.scheduling).toBe("WHEN_IDLE")
+      expect(h.errors).toEqual([])
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
+  test("resumption cannot manufacture native completion for an unfinished request", async () => {
+    let release!: () => void
+    const h = harness({recallGate: new Promise<void>(resolve => { release = resolve })})
+    await start(h)
+    try {
+      h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "fictional-unfinished-handle"}})
+      admitRequest(h, "continuous")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "unfinished-reconnect", name: "recall_memory", args: {query: "unfinished fictional request"}},
+      ]}})
+      h.sockets[0].close()
+      await waitFor(() => h.sockets.length === 2)
+      h.sockets[1].open()
+      h.sockets[1].message({setupComplete: {}})
+      release()
+      await waitFor(() => functionResponses(h.sockets[1]).some(response => response.id === "unfinished-reconnect"))
+      expect(functionResponses(h.sockets[1]).find(response => response.id === "unfinished-reconnect")?.scheduling).toBe("SILENT")
+      expect(h.errors).toEqual([])
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
+  test.each(["continuous", "manual"] as const)("%s photo overlap hands off the stored original independently before continuing the answer", async mode => {
+    let releaseAppend!: () => void
+    const appendGate = new Promise<void>(resolve => { releaseAppend = resolve })
+    const storage = new FakeStorage()
+    const h = harness({storage, appendGates: [appendGate]})
+    await start(h, mode)
+    try {
+      await h.controller.sendImage({imageId: "overlap-original", mimeType: "image/png", data: "AQID"})
+      expect(h.requests.find(request => request.url.endsWith("/snapshot"))?.body.image_id).toBe("overlap-original")
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.mediaRef).toBe("mentra_media/test-phone/overlap-original.png")
+      admitRequest(h, mode)
+      saveCaption(h.sockets[0], "overlap-original", "A fictional green triangle.", "overlap-caption")
+      await waitFor(() => h.finalizations.some(result => result.durable))
+      const receipt = h.requests.find(request => request.url.endsWith("/snapshot/finalize"))!
+      expect(receipt.body).toMatchObject({image_id: "overlap-original", caption: "A fictional green triangle.",
+        caption_event_id: "sitting-1:photo:overlap-original"})
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      expect(h.audio).toEqual([])
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "overlap-caption"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "overlap-caption")).toMatchObject({
+        scheduling: "WHEN_IDLE", response: {ok: true, durable: true},
+      })
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "Where is the fictional harbor?"},
+        outputTranscription: {text: "The harbor is north."}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+      releaseAppend()
+      await h.controller.stop()
+      const rows = h.requests.flatMap(request => request.body.events ?? [])
+      expect(rows.find(row => row.event_kind === "photo_caption")).toMatchObject({
+        content: "A fictional green triangle.", media_ref: "mentra_media/test-phone/overlap-original.png",
+      })
+      expect(rows.some(row => row.event_kind === "transcript" && row.role === "assistant" && row.content === "The harbor is north.")).toBe(true)
+      expect(rows.some(row => row.event_kind === "transcript" && row.content === "A fictional green triangle.")).toBe(false)
+      expect(h.errors).toEqual([])
+    } finally {
+      releaseAppend()
+      await h.controller.stop()
+    }
+  })
+
   test.each([["continuous", false], ["manual", false], ["continuous", true]] as const)(
     "%s publishes normal speech without waiting for Stop (input before START=%s)", async (mode, inputBeforeStart) => {
     const h = harness({storage: new FakeStorage()})

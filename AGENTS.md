@@ -76,9 +76,10 @@ The MiniApp ZIP is generic and contains no endpoint, credential, user, soul, or
 phone identity. `.env.local` is used only by the private release wrapper for its
 explicit address bind and installation-completion poll; it is never compiled into Iris.
 
-Photos must be stored before sending to Gemini. Save captions only after the
-spoken transcript is acknowledged. Pending photo recovery survives Stop; stale
-button results cannot mutate a later sitting.
+Photos must be stored before sending to Gemini. Durable caption handoff is
+independent of transcript acknowledgment; receipt IDs are not timeline IDs.
+Pending photo recovery survives Stop; stale button results cannot mutate a later
+sitting. See GEMINI_LIVE.md for requested-answer and quiet-tool scheduling.
 
 A Soul's processing pause blocks new input, not transcript saving, token renewal
 or Stop. Keep unfinished manual takes in memory only; Retry belongs to the
