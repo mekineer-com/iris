@@ -96,9 +96,12 @@ An optional spoken description remains separate from this internal caption.
 Normal Stop mutes provider output before callbacks and retains the socket/lease
 for an eight-second caption handoff window. Continuous Stop flushes existing
 audio with 1.8 seconds of real-time-paced silence and `audioStreamEnd`; Manual
-Stop does not send an unsent take. An already-delivered task is not resent merely
+Stop does not send an unsent take. Replay cannot deliver a task mid-flush or
+after the drain closes. An already-delivered task is not resent merely
 because Stop was pressed. Timeout is logged and retains recovery state. Optional
-reflection follows handoff, outside that caption deadline; its text can settle at
+reflection follows both handoff and the caption's native completion, even if the
+handoff preceded Stop. An unrelated failed photo does not suppress reflection.
+Its text can settle at
 `generationComplete` rather than waiting for delayed playback completion.
 
 ### Completion and connection rotation
@@ -106,15 +109,28 @@ reflection follows handoff, outside that caption deadline; its text can settle a
 - A spoken request is admitted at Continuous native activity start or Manual
   Send, independently of when its transcription arrives. Tool calls retain
   their native batch and request ownership across separate messages.
-- Results associated with an unanswered request wait for native completion and
-  the end of capture before one result uses `WHEN_IDLE`. Sibling results use
-  `SILENT`; fresh tools requested during that continuation can provide another
+- Results associated with an unanswered request wait for native completion, the
+  end of capture, and every associated outstanding result. Earlier results use
+  `SILENT` and the last uses `WHEN_IDLE`; holding the cohort also preserves a
+  result that can wake the request if its slow sibling is canceled. Fresh tools
+  requested during that continuation can provide another
   opportunity. Audible output makes further results silent. A completed response
   without outstanding tools, including intentional silence, closes normally.
 - Unresolved background work may overlap a new admission; only that unresolved
   batch can adopt it. Completed old batches and superseded requests cannot wake
   later speech. Cancellation of the last outstanding tool closes its settled
   request. Stop revokes continuation immediately but permits silent photo handoff.
+- A new explicit photo task starts a background batch, not an older spoken
+  request's cohort. Its native phase fences the next photo's provider delivery,
+  not acceptance/storage of that next original. A missing caption at a provider
+  boundary exposes logged Retry/Discard; an eventual valid caption can still
+  complete its original task. Failed filing itself still requires explicit Retry.
+- A reply cut by Stop is saved as interrupted. Late transcription of that reply
+  is retained while its pre-Stop audio is still being settled; this does not
+  establish an exact heard-word cutoff. Missing text for heard audio records a
+  nonfatal gap during Stop, without canceling photo calls. Muted-only output
+  does not become shared dialogue. An orphan text fragment without an admitted
+  capture is not labeled interrupted merely because no activity-end arrived.
 - This is a scheduling policy, not proof that tools caused silence or that any
   PCM fully answered a question. Gemini supplies no request IDs for those claims.
   It can still choose silence after `WHEN_IDLE`; no synthetic transcript or

@@ -250,10 +250,12 @@ export class GeminiLiveController {
   private draftEvents: TranscriptDraft[] = []
   private missingSpeech = false
   private pendingImage: PendingImage | null = null
+  private photoBatch: ToolBatch | null = null
   private acceptedCaptions = new Map<string, string>()
   private spokenPhotos: string[] = []
   private imageUpload: Promise<void> | null = null
   private draining = false
+  private drainInputFlushed = false
   private outputMuted = false
   private drainDeadlineAt = 0
   private drainResolve: (() => void) | null = null
@@ -321,10 +323,12 @@ export class GeminiLiveController {
     this.draftEvents = []
     this.missingSpeech = false
     this.pendingImage = null
+    this.photoBatch = null
     this.acceptedCaptions.clear()
     this.spokenPhotos = []
     this.imageUpload = null
     this.draining = false
+    this.drainInputFlushed = false
     this.outputMuted = false
     this.drainResolve = null
     this.imageRetrying = false
@@ -541,7 +545,7 @@ export class GeminiLiveController {
       throw new Error("Photo send cancelled")
     }
     pending.retryRequested = false
-    if (this.turnActive && !this.draining) {
+    if (this.photoDeliveryFenced()) {
       pending.captureAfterCurrent = true
       await this.persistJournal()
       return
@@ -572,9 +576,10 @@ export class GeminiLiveController {
       await this.scheduleImageFinalize(true)
       return
     }
-    if (!this.pendingImage || this.pendingImage.providerSent) {
+    if (!this.pendingImage || (this.pendingImage.providerSent && !this.pendingImage.retryRequested)) {
       throw new Error("No photo is waiting to retry")
     }
+    this.pendingImage.providerSent = false
     await this.retryPendingImage(true)
   }
 
@@ -590,21 +595,29 @@ export class GeminiLiveController {
 
   private sendImageTurn(socket: SocketLike, mimeType: "image/jpeg" | "image/png", data: string): boolean {
     if (this.activityPauseReason) throw new Error(this.activityPauseReason)
-    if (this.stopping || this.reflecting || (this.turnActive && !this.draining) || !this.ready || this.socket !== socket || socket.readyState !== WS_OPEN) return false
+    if (this.stopping || this.reflecting || this.photoDeliveryFenced() || !this.ready || this.socket !== socket || socket.readyState !== WS_OPEN) return false
+    if ((this.draining && !this.drainInputFlushed) || (this.stopPromise && !this.draining)) return false
     const pending = this.pendingImage!
     socket.send(JSON.stringify({
       realtimeInput: {video: {data, mimeType}},
     }))
     socket.send(JSON.stringify({realtimeInput: {text: `image_id: ${pending.imageId}\n${PHOTO_CAPTION_INSTRUCTION}`}}))
-    this.toolBatch.started = true
+    this.toolBatch = {request: null, completed: false, continuationSent: false, background: true, started: true}
+    this.photoBatch = this.toolBatch
     return true
+  }
+
+  private photoDeliveryFenced(): boolean {
+    return (this.turnActive && !this.draining) ||
+      (this.photoBatch === this.toolBatch && !this.photoBatch.completed) ||
+      Boolean(this.toolBatch.started && this.toolBatch.request && !this.toolBatch.request.retired)
   }
 
   private async retryPendingImage(userRequested = false): Promise<void> {
     const pending = this.pendingImage
     const socket = this.socket
     if (
-      this.activityPauseReason || (this.turnActive && !this.draining) || !pending || (!pending.mediaRef && !userRequested) || (pending.retryRequested && !userRequested) || pending.caption || pending.providerSent || this.imageRetrying || this.stopping ||
+      this.activityPauseReason || this.photoDeliveryFenced() || !pending || (!pending.mediaRef && !userRequested) || (pending.retryRequested && !userRequested) || pending.caption || pending.providerSent || this.imageRetrying || this.stopping ||
       !this.ready || !socket || socket.readyState !== WS_OPEN
     ) return
     this.imageRetrying = true
@@ -719,13 +732,16 @@ export class GeminiLiveController {
     try {
       this.flushToolResponses()
       const stoppedMidTurn = this.turnActive
-      const drainAttempted = graceful && Boolean(this.pendingImage && (this.imageUpload || !this.pendingImage.retryRequested))
+      const drainAttempted = graceful && Boolean(
+        (this.pendingImage && (this.imageUpload || !this.pendingImage.retryRequested)) ||
+        (this.photoBatch && !this.photoBatch.completed))
       if (drainAttempted) await this.drainPhoto()
       if (stoppedMidTurn || this.outputTranscript.trim()) {
         this.finalizeInterruptedTurn()
         this.interruptionFinalized = false
       }
-      if (graceful && !this.pendingImage && !this.activityPauseReason && !stoppedMidTurn && this.ready && this.completeUserTurns >= 2) {
+      if (graceful && (!drainAttempted || !this.pendingImage) && (!this.photoBatch || this.photoBatch.completed) &&
+          !this.activityPauseReason && !stoppedMidTurn && this.ready && this.completeUserTurns >= 2) {
         trace("provider.reflection.begin")
         const reflection = await this.requestReflection()
         trace("provider.reflection.end", {persisted: Boolean(reflection && reflection !== "NO_SUMMARY")})
@@ -780,6 +796,7 @@ export class GeminiLiveController {
 
   private async drainPhoto(): Promise<void> {
     this.draining = true
+    this.drainInputFlushed = false
     this.drainDeadlineAt = Date.now() + this.photoDrainTimeoutMs
     let timeout!: ReturnType<typeof setTimeout>
     const completion = new Promise<void>(resolve => { this.drainResolve = resolve })
@@ -800,13 +817,13 @@ export class GeminiLiveController {
           this.socket.send(JSON.stringify({realtimeInput: {audioStreamEnd: true}}))
         }
         if (!this.draining) return
+        this.drainInputFlushed = true
         if (this.pendingImage === pending) {
           pending.captureAfterCurrent = false
           if (!pending.providerSent) await this.retryPendingImage()
         }
       }
       if (this.pendingImage?.caption) {
-        await this.appendTail
         await this.scheduleImageFinalize()
       }
       this.finishPhotoDrainIfAcknowledged()
@@ -829,7 +846,8 @@ export class GeminiLiveController {
   }
 
   private finishPhotoDrainIfAcknowledged(): void {
-    if (!this.pendingImage && ![...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption")) {
+    if (!this.pendingImage && (!this.photoBatch || this.photoBatch.completed) &&
+        ![...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption")) {
       this.drainResolve?.()
     }
   }
@@ -1094,7 +1112,7 @@ export class GeminiLiveController {
     }
     if (content.modelTurn !== undefined || content.outputTranscription !== undefined ||
         (input && !this.pendingSpeechDraft()?.speech?.late)) this.turnActive = true
-    if (content.modelTurn !== undefined || content.outputTranscription !== undefined) this.toolBatch.started = true
+    if (!interrupted && (content.modelTurn !== undefined || content.outputTranscription !== undefined)) this.beginToolBatch()
     if (input) {
       const speech = this.pendingSpeechDraft()
       if (speech) {
@@ -1135,7 +1153,7 @@ export class GeminiLiveController {
       return
     }
 
-    if (!this.outputMuted) this.outputTranscript += output
+    if (!this.outputMuted || this.turnAudioDelivered) this.outputTranscript += output
     if (interrupted) {
       if (!this.toolBatch.background && this.toolBatch.request) this.toolBatch.request.retired = true
       trace("provider.interrupted", {
@@ -1183,7 +1201,10 @@ export class GeminiLiveController {
       this.callbacks.onTurnComplete(!this.spokenRequest)
       this.requestSpokenPhotoDescription()
       // Barge-in completes the old response before the interrupting voice turn is finished.
-      if (!interruptedTurn) void this.retryPendingImage()
+      if (!interruptedTurn || (!this.voiceActive && (!this.spokenRequest || this.spokenRequest.retired) &&
+          this.pendingImage && !this.pendingImage.providerSent && !this.pendingImage.retryRequested)) {
+        void this.retryPendingImage()
+      }
     }
   }
 
@@ -1200,15 +1221,22 @@ export class GeminiLiveController {
     const audible = this.turnAudioDelivered
     this.clearTurn()
     this.settleSpeechDraft()
-    if (output) this.enqueueEvent("transcript", "assistant", output, "complete")
-    else if (audible) {
-      this.enqueueEvent("transcript_gap", "assistant", "Transcript unavailable.")
-      this.scheduleAppend()
-      throw new Error("Gemini completed audible speech without its transcription")
-    }
+    this.recordAssistantOutput(output, audible, this.outputMuted)
     this.releaseImageFence()
     this.deliveredToolResultIds.clear()
     this.scheduleAppend()
+  }
+
+  private recordAssistantOutput(output: string, audible: boolean, interrupted: boolean): void {
+    if (output) this.enqueueEvent("transcript", "assistant", output, interrupted ? "interrupted" : "complete")
+    else if (audible && (!interrupted || this.outputMuted)) {
+      this.enqueueEvent("transcript_gap", "assistant", "Transcript unavailable.")
+      this.scheduleAppend()
+      if (!this.outputMuted) throw new Error("Gemini completed audible speech without its transcription")
+      console.error("[OpenAlma] Reply heard before Stop ended without its transcription")
+      this.missingSpeech = true
+      this.callbacks.onPersistenceError("Some spoken words could not be transcribed")
+    }
   }
 
   private handleToolCall(value: unknown): () => void {
@@ -1269,7 +1297,7 @@ export class GeminiLiveController {
         [key, typeof value === "string" ? value.trim() : value],
       ))})
     }
-    this.toolBatch.started = true
+    this.beginToolBatch()
     const dispatch: Array<() => void> = []
     for (const {id, name, args} of parsed) {
       const pending: PendingToolCall = {
@@ -1419,11 +1447,15 @@ export class GeminiLiveController {
       this.completeToolCall(id, call, {ok: false, status: "invalid", message: "Photo does not match the pending original."}, false)
       return
     }
-    if (image.retryRequested) {
+    if (image.retryRequested && image.caption) {
       this.completeToolCall(id, call, {ok: false, status: "failed", message: PHOTO_RETRY_MESSAGE}, false)
       return
     }
     if (!image.caption) {
+      // A late result completes the original task; failed filing still needs Retry.
+      image.retryRequested = false
+      this.callbacks.onPhotoRetryChange(false)
+      this.photoBatch = call.batch
       image.caption = caption
       image.captionEventId = `${image.sessionId}:photo:${image.imageId}`
       this.enqueueEvent("photo_caption", "assistant", caption, undefined, image.mediaRef)
@@ -1524,8 +1556,12 @@ export class GeminiLiveController {
       if (!this.ready || !this.socket || this.socket.readyState !== WS_OPEN) continue
       const request = pending.batch.request
       const needsAnswer = request && !request.retired && !request.audible && !this.outputMuted
-      if (needsAnswer && (!request.settled || !pending.batch.completed)) continue
-      const resume = needsAnswer && !pending.batch.continuationSent && !request.continuing
+      if (needsAnswer && (!request.settled || [...this.pendingToolCalls.values()].some(call =>
+        call.batch.request === request && !call.batch.continuationSent &&
+        (call.response === undefined || !call.batch.completed)))) continue
+      const resume = needsAnswer && !pending.batch.continuationSent && !request.continuing &&
+        ![...this.pendingToolCalls.values()].some(call => call !== pending &&
+          call.batch.request === request && !call.batch.continuationSent)
       this.socket.send(JSON.stringify({
         toolResponse: {
           functionResponses: [{
@@ -1538,13 +1574,17 @@ export class GeminiLiveController {
       }))
       if (resume) {
         request.continuing = true
-        // Sibling results are context, not additional wakes for the same response.
-        for (const call of this.pendingToolCalls.values()) {
-          if (call.batch.request === request) call.batch.continuationSent = true
-        }
+        pending.batch.continuationSent = true
       }
       this.deliveredToolResultIds.add(id)
       this.pendingToolCalls.delete(id)
+    }
+    const image = this.pendingImage
+    if (image?.providerSent && !image.caption && !image.retryRequested && this.photoBatch?.completed &&
+        ![...this.pendingToolCalls.values()].some(call =>
+          call.name === "save_photo_caption" && call.batch === this.photoBatch)) {
+      console.error("[OpenAlma] Provider turn ended before a usable photo caption arrived; retaining original for Retry")
+      void this.requestPhotoRetry(image)
     }
     this.finishPhotoDrainIfAcknowledged()
     this.requestSpokenPhotoDescription()
@@ -1553,6 +1593,15 @@ export class GeminiLiveController {
   private hasUnconsumedTools(request: SpokenRequest): boolean {
     return [...this.pendingToolCalls.values()].some(call =>
       call.batch.request === request && !call.batch.continuationSent)
+  }
+
+  private beginToolBatch(): void {
+    if (!this.toolBatch.started && this.spokenRequest && !this.spokenRequest.retired &&
+        this.toolBatch !== this.photoBatch && this.toolBatch.request?.retired) {
+      this.toolBatch.request = this.spokenRequest
+      this.toolBatch.background = false
+    }
+    this.toolBatch.started = true
   }
 
   private admitSpokenRequest(): void {
@@ -1582,9 +1631,10 @@ export class GeminiLiveController {
 
   private finalizeInterruptedTurn(userComplete = false): void {
     const output = this.turnAudioDelivered ? this.outputTranscript.trim() : ""
+    const audible = this.turnAudioDelivered
     this.clearTurn()
     this.settleSpeechDraft(userComplete)
-    if (output) this.enqueueEvent("transcript", "assistant", output, "interrupted")
+    this.recordAssistantOutput(output, audible, true)
     this.interruptionFinalized = true
     if (!this.stopPromise && this.pendingImage?.providerSent && !this.pendingImage.caption) {
       this.pendingImage.providerSent = false
@@ -1640,7 +1690,7 @@ export class GeminiLiveController {
     if (speech) {
       speech.content = speech.content.trim()
       speech.speech!.waiting = false
-      if (!speech.speech!.ended) speech.status = "interrupted"
+      if (speech.speech!.admitted && !speech.speech!.ended) speech.status = "interrupted"
       if (!speech.content) {
         if (!speech.speech!.admitted) this.draftEvents.splice(this.draftEvents.indexOf(speech), 1)
         else {
