@@ -66,32 +66,43 @@ clears the handle. The handle is provider state, never transcript content.
 ### Internal photo task
 
 Iris snapshots the original in OpenAlma before provider delivery; upload and
-replay each allow 120 seconds. Between spoken turns it sends one ordered content
-turn with the original bytes and the caption task:
+replay each allow 120 seconds. Between spoken turns it sends the original as
+realtime video, then the unchanged caption task after 500 ms:
 
 ```json
-{
-  "clientContent": {
-    "turns": [{
-      "role": "user",
-      "parts": [
-        {"inlineData": {"data": "<base64>", "mimeType": "image/jpeg"}},
-        {"text": "image_id: <id>\n<PHOTO_CAPTION_INSTRUCTION>"}
-      ]
-    }],
-    "turnComplete": true
-  }
-}
+{"realtimeInput":{"video":{"data":"<base64>","mimeType":"image/jpeg"}}}
+{"realtimeInput":{"text":"image_id: <id>\n<PHOTO_CAPTION_INSTRUCTION>"}}
 ```
 
 The text contains `image_id: <id>` and `PHOTO_CAPTION_INSTRUCTION`, the exact
-Marcos-approved wording. This hunk reuses Iris's earlier ordered image wire;
-3.8 provider acceptance remains open. Separate realtime image/text delivery
-failed all three cold immediate checks; diagnostic spacing passed three but is
-not a production acknowledgment or delay policy. JPEG and PNG
-remain native inputs. Caption content comes only from `save_photo_caption`,
+Marcos-approved wording. Immediate separate delivery failed three cold checks;
+500 ms spacing passed those three but later missed a photo after resumption.
+The wait alone is not acknowledgment. The reviewed candidate therefore holds
+tool captions provisionally until normal native response completion and a
+response-owned IMAGE token count above the pre-photo baseline. Only then may the
+caption enter the journal's accepted-caption field, timeline or durable filing.
+Preview rows can appear earlier without a green check. JPEG and PNG remain
+native inputs. Caption content comes only from `save_photo_caption`,
 never from a nearby answer or output transcription. Its `photo_caption` event
 carries the original's `media_ref` and has no spoken-transcript status.
+
+Use any IMAGE-count increase, not a fixed increment: the sequential test measured
+266 then329, retained329 after resumed setup and stayed329 when a third photo
+was missed. Fresh provider contexts start at zero; resumed contexts retain their
+known count and pending baseline with the existing journal. Unknown accounting
+does not become zero, and invalidating a resumption handle does not reset the
+current context. Native response ownership, rather than merely sending a frame,
+determines which photo may consume a usage sample.
+
+Explicit flat accounting permits one automatic replay of the same stored
+original and ID; the consumed allowance survives reconnect. A second flat
+attempt exposes Retry/Discard. Unknown accounting or a missing caption remains
+bounded by the existing 30-second tool allowance and Stop's shorter drain.
+No receipt or durable success is invented. Explicit Retry is separate from this
+automatic allowance. Copies need no new deduplication guard. Internal photo
+output is kept off playback/history without muting an adopted spoken request.
+The implementation still needs provider acceptance; this is not a guarantee of
+visual grounding or successful resend.
 
 The existing snapshot-finalize route acknowledges durable server ownership from
 the scoped original and caption independently of transcript append. Its stable
@@ -107,7 +118,7 @@ An optional spoken description remains separate from this internal caption.
 Normal Stop mutes provider output before callbacks and retains the socket/lease
 for an eight-second caption handoff window. Continuous Stop flushes existing
 audio with 1.8 seconds of real-time-paced silence and `audioStreamEnd`, then
-waits for the preceding response's native completion before a new ordered image
+waits for the preceding response's native completion before a new image
 turn. `audioStreamEnd` alone cannot release that fence. The existing flush owner
 can wait for replacement readiness within the same drain cap. Manual
 Stop does not send an unsent take. Replay cannot deliver a task mid-flush or
