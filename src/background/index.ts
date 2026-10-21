@@ -1,6 +1,7 @@
 import {registerMiniapp} from "@mentra/miniapp/background"
 
 import {SessionController} from "./SessionController"
+import {installBackgroundBridge} from "../shared/hostBridge"
 
 registerMiniapp((session) => {
   const controller = new SessionController(session, {
@@ -9,3 +10,5 @@ registerMiniapp((session) => {
   })
   controller.start()
 })
+
+installBackgroundBridge()
