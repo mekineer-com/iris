@@ -161,6 +161,7 @@ export const SITTING_REFLECTION_PROMPT =
   "Reflect briefly in first person on the emotional tone, subtext, or meaningful shift in this sitting that the literal transcript may not preserve. Do not recap the conversation. Respond with one or two natural sentences, or exactly NO_SUMMARY if nothing worthwhile would be added."
 export const PHOTO_CAPTION_INSTRUCTION =
   "If a photo successfully arrives, use save_photo_caption(image_id, caption) to save your perception of the photo, so you will remember what this moment was about later on. Do not speak the caption out loud."
+const PHOTO_CAPTION_REPEAT_REQUEST = "Your memory store didn't receive the photo caption. Please repeat it!"
 const UNCERTAIN_SPEECH_PREFIX = "[Turn timing uncertain; combined speech, text retained in received order.]\n"
 
 function selectJournalKey(keys: string[], fresh = false): string {
@@ -623,7 +624,7 @@ export class GeminiLiveController {
     this.clearPersistenceErrorIfSynced()
   }
 
-  private async sendImageTurn(socket: SocketLike, mimeType: "image/jpeg" | "image/png", data: string): Promise<boolean> {
+  private async sendImageTurn(socket: SocketLike, mimeType: "image/jpeg" | "image/png", data: string, repeatCaption = false): Promise<boolean> {
     if (this.activityPauseReason) throw new Error(this.activityPauseReason)
     if (this.stopping || this.reflecting || this.photoDeliveryFenced() || !this.ready || this.socket !== socket || socket.readyState !== WS_OPEN) return false
     if ((this.draining && !this.drainInputFlushed) || (this.stopPromise && !this.draining)) return false
@@ -661,7 +662,8 @@ export class GeminiLiveController {
         return
       }
       try {
-        const text = `image_id: ${pending.imageId}\n${PHOTO_CAPTION_INSTRUCTION}`
+        const instruction = repeatCaption ? `${PHOTO_CAPTION_REPEAT_REQUEST}\n${PHOTO_CAPTION_INSTRUCTION}` : PHOTO_CAPTION_INSTRUCTION
+        const text = `image_id: ${pending.imageId}\n${instruction}`
         socket.send(JSON.stringify(this.mode === "manual"
           ? {clientContent: {turns: [{role: "user", parts: [{text}]}], turnComplete: true}}
           : {realtimeInput: {text}}))
@@ -811,7 +813,7 @@ export class GeminiLiveController {
       }
       try {
         pending.captureAfterCurrent = this.turnActive && !this.draining
-        if (!await this.sendImageTurn(socket, mimeType, data)) {
+        if (!await this.sendImageTurn(socket, mimeType, data, true)) {
           retryOnReplacement = this.pendingImage === pending
           return
         }

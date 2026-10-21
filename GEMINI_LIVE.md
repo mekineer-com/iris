@@ -84,6 +84,13 @@ without audio caused a real1007 "Precondition check failed" and destroyed the
 provider session; subsequent1008 resumption errors were its consequence.
 The original video stays500ms before the text in both modes. The explicit text
 turn passed a quiet, grounded Manual provider check before implementation.
+Receipt-checked replay adds Marcos's approved line before the unchanged caption
+instruction: "Your memory store didn't receive the photo caption. Please repeat it!"
+This covers reconnect recovery, automatic/explicit Retry and deferred delivery;
+it is not added to direct initial delivery. Existing accepted receipts return
+without resending either image or request. The line reports missing filing,
+not proof that Gemini saw the image or never attempted a tool call. Accounting,
+normal native completion and durable handoff remain required.
 Immediate separate delivery failed three cold checks;500ms spacing passed
 those three but later missed a photo after resumption.
 The wait alone is not acknowledgment. The reviewed candidate therefore holds
