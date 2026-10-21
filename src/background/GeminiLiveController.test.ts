@@ -66,7 +66,8 @@ function photoInput(message: any): {data: string; mimeType: string} | undefined 
 }
 
 function photoTask(message: any): string | undefined {
-  return message.realtimeInput?.text
+  const text = message.realtimeInput?.text ?? message.clientContent?.turns?.[0]?.parts?.[0]?.text
+  return typeof text === "string" && text.startsWith("image_id: ") && text.endsWith(`\n${PHOTO_CAPTION_INSTRUCTION}`) ? text : undefined
 }
 
 function textTurn(message: any): any {
@@ -408,18 +409,14 @@ describe("GeminiLiveController", () => {
       expect(h.sockets[0].sent.some(value => photoTask(JSON.parse(value)))).toBe(false)
       await waitPhotoTask(h.sockets[0], "serial-wire")
       expect(Date.now() - before).toBeGreaterThanOrEqual(500)
+      const text = `image_id: serial-wire\n${PHOTO_CAPTION_INSTRUCTION}`
       expect(h.sockets[0].sent.map(value => JSON.parse(value)).filter(message => photoTask(message)))
-        .toEqual([{realtimeInput: {text: `image_id: serial-wire\n${PHOTO_CAPTION_INSTRUCTION}`}}])
+        .toEqual([mode === "manual"
+          ? {clientContent: {turns: [{role: "user", parts: [{text}]}], turnComplete: true}}
+          : {realtimeInput: {text}}])
       const wire = h.sockets[0].sent.map(value => JSON.parse(value))
-      const taskIndex = wire.findIndex(message => photoTask(message))
-      if (mode === "manual") {
-        expect(wire.slice(taskIndex - 1, taskIndex + 2)).toEqual([
-          {realtimeInput: {activityStart: {}}}, wire[taskIndex], {realtimeInput: {activityEnd: {}}},
-        ])
-      } else {
-        expect(wire.some(message => message.realtimeInput?.activityStart || message.realtimeInput?.activityEnd)).toBe(false)
-      }
-      expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
+      expect(wire.some(message => message.realtimeInput?.activityStart || message.realtimeInput?.activityEnd)).toBe(false)
+      if (mode === "continuous") expect(wire.some(message => message.clientContent)).toBe(false)
       provisionalCaption(h.sockets[0], "serial-wire", "A fictional triangle.")
       h.sockets[0].message({...imageUsage(1), serverContent: {turnComplete: true}})
       await waitFor(() => h.finalizations.length === 1)
@@ -429,7 +426,7 @@ describe("GeminiLiveController", () => {
     }
   })
 
-  test("Manual photo closes its activity if sending the caption text throws", async () => {
+  test("Manual photo retains its original and real retry when the text send fails", async () => {
     const storage = new FakeStorage()
     const h = harness({storage})
     await start(h, "manual")
@@ -445,7 +442,8 @@ describe("GeminiLiveController", () => {
       await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryRequested)
       expect(failed).toBe(true)
       expect(socket.sent.map(value => JSON.parse(value)).filter(message => message.realtimeInput?.activityStart || message.realtimeInput?.activityEnd))
-        .toEqual([{realtimeInput: {activityStart: {}}}, {realtimeInput: {activityEnd: {}}}])
+        .toEqual([])
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe("manual-send-failure")
       expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
       expect(h.audio).toEqual([])
       expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed ?? false).toBe(false)

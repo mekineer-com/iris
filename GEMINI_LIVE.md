@@ -76,11 +76,14 @@ realtime video, then the unchanged caption task after 500 ms:
 
 The text contains `image_id: <id>` and `PHOTO_CAPTION_INSTRUCTION`, the exact
 Marcos-approved wording.
-Manual mode disables automatic activity detection, so its delayed text is
-synchronously bracketed by realtime `activityStart` and `activityEnd`, without
-admitting a spoken request. The video remains before that bracket; Gemini3.8's
-default turn coverage includes all video. No activity stays open across the
-500ms delay. Continuous mode does not send these manual markers.
+Manual mode disables automatic activity detection, so its delayed text uses
+`clientContent` with one user text part and `turnComplete: true`. Continuous
+mode retains the realtime text shown above. Neither photo path sends activity
+markers or admits a spoken request. An activityStart/text/activityEnd sequence
+without audio caused a real1007 "Precondition check failed" and destroyed the
+provider session; subsequent1008 resumption errors were its consequence.
+The original video stays500ms before the text in both modes. The explicit text
+turn passed a quiet, grounded Manual provider check before implementation.
 Immediate separate delivery failed three cold checks;500ms spacing passed
 those three but later missed a photo after resumption.
 The wait alone is not acknowledgment. The reviewed candidate therefore holds
