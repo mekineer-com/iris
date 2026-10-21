@@ -75,8 +75,14 @@ realtime video, then the unchanged caption task after 500 ms:
 ```
 
 The text contains `image_id: <id>` and `PHOTO_CAPTION_INSTRUCTION`, the exact
-Marcos-approved wording. Immediate separate delivery failed three cold checks;
-500 ms spacing passed those three but later missed a photo after resumption.
+Marcos-approved wording.
+Manual mode disables automatic activity detection, so its delayed text is
+synchronously bracketed by realtime `activityStart` and `activityEnd`, without
+admitting a spoken request. The video remains before that bracket; Gemini3.8's
+default turn coverage includes all video. No activity stays open across the
+500ms delay. Continuous mode does not send these manual markers.
+Immediate separate delivery failed three cold checks;500ms spacing passed
+those three but later missed a photo after resumption.
 The wait alone is not acknowledgment. The reviewed candidate therefore holds
 tool captions provisionally until normal native response completion and a
 response-owned IMAGE token count above the pre-photo baseline. Only then may the

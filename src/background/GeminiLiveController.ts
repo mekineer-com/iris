@@ -661,7 +661,12 @@ export class GeminiLiveController {
         return
       }
       try {
-        socket.send(JSON.stringify({realtimeInput: {text: `image_id: ${pending.imageId}\n${PHOTO_CAPTION_INSTRUCTION}`}}))
+        if (this.mode === "manual") socket.send(JSON.stringify({realtimeInput: {activityStart: {}}}))
+        try {
+          socket.send(JSON.stringify({realtimeInput: {text: `image_id: ${pending.imageId}\n${PHOTO_CAPTION_INSTRUCTION}`}}))
+        } finally {
+          if (this.mode === "manual" && socket.readyState === WS_OPEN) socket.send(JSON.stringify({realtimeInput: {activityEnd: {}}}))
+        }
         this.photoTimer = setTimeout(() => {
           console.error("[OpenAlma] Photo response/accounting incomplete; retaining original for Retry", {imageId: pending.imageId})
           this.rejectPhotoAttempt(attempt, attempt.batch.completed && !attempt.interrupted)

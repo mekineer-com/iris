@@ -392,9 +392,9 @@ function admitRequest(h: ReturnType<typeof harness>, mode: "continuous" | "manua
 }
 
 describe("GeminiLiveController", () => {
-  test("photo delivery sends original realtime video then unchanged text after 500ms", async () => {
+  test.each(["continuous", "manual"] as const)("%s photo sends original video then a complete unchanged text input after 500ms", async mode => {
     const h = harness({storage: new FakeStorage()})
-    await start(h)
+    await start(h, mode)
     try {
       completeTurn(h, "A fictional greeting.", "Hello.")
       h.sockets[0].message({usageMetadata: {totalTokenCount: 123,
@@ -410,11 +410,47 @@ describe("GeminiLiveController", () => {
       expect(Date.now() - before).toBeGreaterThanOrEqual(500)
       expect(h.sockets[0].sent.map(value => JSON.parse(value)).filter(message => photoTask(message)))
         .toEqual([{realtimeInput: {text: `image_id: serial-wire\n${PHOTO_CAPTION_INSTRUCTION}`}}])
+      const wire = h.sockets[0].sent.map(value => JSON.parse(value))
+      const taskIndex = wire.findIndex(message => photoTask(message))
+      if (mode === "manual") {
+        expect(wire.slice(taskIndex - 1, taskIndex + 2)).toEqual([
+          {realtimeInput: {activityStart: {}}}, wire[taskIndex], {realtimeInput: {activityEnd: {}}},
+        ])
+      } else {
+        expect(wire.some(message => message.realtimeInput?.activityStart || message.realtimeInput?.activityEnd)).toBe(false)
+      }
       expect(h.sockets[0].sent.some(value => JSON.parse(value).clientContent)).toBe(false)
       provisionalCaption(h.sockets[0], "serial-wire", "A fictional triangle.")
       h.sockets[0].message({...imageUsage(1), serverContent: {turnComplete: true}})
       await waitFor(() => h.finalizations.length === 1)
+      expect(h.audio).toEqual(["AAAAAA=="])
     } finally {
+      await h.controller.stop()
+    }
+  })
+
+  test("Manual photo closes its activity if sending the caption text throws", async () => {
+    const storage = new FakeStorage()
+    const h = harness({storage})
+    await start(h, "manual")
+    const socket = h.sockets[0]
+    const send = socket.send.bind(socket)
+    let failed = false
+    const sending = spyOn(socket, "send").mockImplementation(value => {
+      if (photoTask(JSON.parse(value)) && !failed) { failed = true; throw new Error("fictional text send failure") }
+      send(value)
+    })
+    try {
+      await h.controller.sendImage({imageId: "manual-send-failure", mimeType: "image/png", data: "AQID"})
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryRequested)
+      expect(failed).toBe(true)
+      expect(socket.sent.map(value => JSON.parse(value)).filter(message => message.realtimeInput?.activityStart || message.realtimeInput?.activityEnd))
+        .toEqual([{realtimeInput: {activityStart: {}}}, {realtimeInput: {activityEnd: {}}}])
+      expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+      expect(h.audio).toEqual([])
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed ?? false).toBe(false)
+    } finally {
+      sending.mockRestore()
       await h.controller.stop()
     }
   })
@@ -464,15 +500,19 @@ describe("GeminiLiveController", () => {
     }
   })
 
-  test.each(["discard", "stop"] as const)("%s cancels the delayed task before its 500ms send", async action => {
+  test.each([
+    {mode: "continuous", action: "discard"}, {mode: "continuous", action: "stop"},
+    {mode: "manual", action: "discard"}, {mode: "manual", action: "stop"},
+  ] as const)("$mode $action cancels the delayed task before its 500ms send", async ({mode, action}) => {
     const h = harness({storage: new FakeStorage()})
-    await start(h)
+    await start(h, mode)
     try {
       await h.controller.sendImage({imageId: "cancel-delayed", mimeType: "image/png", data: "AQID"})
       if (action === "discard") await h.controller.discardImage()
       else await h.controller.stop(true)
       await new Promise(resolve => setTimeout(resolve, 550))
       expect(h.sockets[0].sent.filter(value => photoTask(JSON.parse(value)))).toEqual([])
+      expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.activityStart || JSON.parse(value).realtimeInput?.activityEnd)).toBe(false)
       expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
     } finally {
       await h.controller.stop()
@@ -489,6 +529,8 @@ describe("GeminiLiveController", () => {
       else h.controller.sendActivity(["AAAA"], "phone")
       await new Promise(resolve => setTimeout(resolve, 550))
       expect(h.sockets[0].sent.some(value => photoTask(JSON.parse(value)))).toBe(false)
+      expect(h.sockets[0].sent.map(value => JSON.parse(value)).filter(message => message.realtimeInput?.activityStart).length)
+        .toBe(mode === "manual" ? 1 : 0)
       expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed ?? false).toBe(false)
       if (mode === "continuous") h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
       h.sockets[0].message({serverContent: {inputTranscription: {text: "Where is the fictional beacon?"}}})
