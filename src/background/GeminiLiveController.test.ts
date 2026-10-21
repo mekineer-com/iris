@@ -341,7 +341,7 @@ function noImageUsage() {
 }
 
 function photoTaskText(imageId: string, repeatCaption = false): string {
-  return `image_id: ${imageId}\n${repeatCaption ? "Your memory store didn't receive the photo caption. Please repeat it!\n" : ""}${PHOTO_CAPTION_INSTRUCTION}`
+  return `image_id: ${imageId}\n${repeatCaption ? "Your memory store didn't receive the photo caption. Please send it!\n" : ""}${PHOTO_CAPTION_INSTRUCTION}`
 }
 
 async function waitPhotoTask(socket: FakeSocket, imageId: string, repeatCaption?: boolean): Promise<void> {

@@ -161,7 +161,7 @@ export const SITTING_REFLECTION_PROMPT =
   "Reflect briefly in first person on the emotional tone, subtext, or meaningful shift in this sitting that the literal transcript may not preserve. Do not recap the conversation. Respond with one or two natural sentences, or exactly NO_SUMMARY if nothing worthwhile would be added."
 export const PHOTO_CAPTION_INSTRUCTION =
   "If a photo successfully arrives, use save_photo_caption(image_id, caption) to save your perception of the photo, so you will remember what this moment was about later on. Do not speak the caption out loud."
-const PHOTO_CAPTION_REPEAT_REQUEST = "Your memory store didn't receive the photo caption. Please repeat it!"
+const PHOTO_CAPTION_REPEAT_REQUEST = "Your memory store didn't receive the photo caption. Please send it!"
 const UNCERTAIN_SPEECH_PREFIX = "[Turn timing uncertain; combined speech, text retained in received order.]\n"
 
 function selectJournalKey(keys: string[], fresh = false): string {
