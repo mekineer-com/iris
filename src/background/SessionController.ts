@@ -1053,7 +1053,7 @@ export class SessionController {
     const config = this.config
     const soulId = this.soulId
     const generation = this.startGeneration
-    const query = new URLSearchParams({user_id: config.userId, soul_id: soulId})
+    const query = `user_id=${encodeURIComponent(config.userId)}&soul_id=${encodeURIComponent(soulId)}`
     const current = () => this.soulId === soulId && this.config === config && generation === this.startGeneration
     try {
       const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/status?${query}`, {

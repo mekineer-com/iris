@@ -29,7 +29,7 @@ for (const host of ["mentra", "glassly"]) {
   const init = host === "mentra" ? "__mentraInitCallback" : "__initCallback"
   const inbound = host === "mentra" ? "__mentraDeliverBridgeRaw" : "__deliverBridgeRaw"
   const globals: Record<string, any> = {
-    console, URL, URLSearchParams, Headers, Request, Response, AbortController, AbortSignal,
+    console, Headers, Request, Response, AbortController, AbortSignal,
     TextEncoder, TextDecoder, crypto, btoa, atob, queueMicrotask,
     setTimeout(fn: (...args: any[]) => void, ms: number, ...args: any[]) {
       const timer = setTimeout(fn, ms, ...args); timers.add(timer); return timer

@@ -298,6 +298,19 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
 }
 
 describe("SessionController", () => {
+  test("Stop completes photo recovery status without the host's URLSearchParams global", async () => {
+    const h = setup({failedPhotos: ["fictional-pending-photo"]})
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const original = globalThis.URLSearchParams
+    try {
+      Object.defineProperty(globalThis, "URLSearchParams", {value: undefined, configurable: true, writable: true})
+      await h.session.handlers["openalma:stop"]({})
+      expect(lastSnapshot(h.session)).toMatchObject({connection: "idle", failedPhotos: ["fictional-pending-photo"]})
+    } finally {
+      Object.defineProperty(globalThis, "URLSearchParams", {value: original, configurable: true, writable: true})
+    }
+  })
+
   test("caption timeline retains five, preserves repeats across photos, and ACKs update in place", async () => {
     const h = setup()
     await h.session.handlers["openalma:start"]({mode: "continuous"})
