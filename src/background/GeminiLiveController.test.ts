@@ -525,23 +525,29 @@ describe("GeminiLiveController", () => {
     } finally { await h.controller.stop() }
   })
 
-  test("caption and co-packet readiness cannot consume the next original or its retry", async () => {
+  test.each(["co-packet", "caption-first", "ready-first"] as const)("caption and %s readiness cannot consume the next original or its retry", async layout => {
     const h = harness({storage: new FakeStorage()})
     await start(h)
     try {
       await h.controller.sendImage({imageId: "packet-first", mimeType: "image/png", data: "AQID"})
       await h.controller.sendImage({imageId: "packet-next", mimeType: "image/png", data: "BAUG"})
       await waitPhotoTask(h.sockets[0], "packet-first")
-      h.sockets[0].message({toolCall: {functionCalls: [
-        {id: "packet-save", name: "save_photo_caption", args: {image_id: "packet-first", caption: "A fictional red square."}},
-        {id: "packet-ready", name: "nothing_to_add", args: {}},
-      ]}, serverContent: {turnComplete: true}})
+      const caption = {id: "packet-save", name: "save_photo_caption", args: {image_id: "packet-first", caption: "A fictional red square."}}
+      const ready = {id: "packet-ready", name: "nothing_to_add", args: {}}
+      if (layout === "co-packet") {
+        h.sockets[0].message({toolCall: {functionCalls: [caption, ready]}, serverContent: {turnComplete: true}})
+      } else {
+        h.sockets[0].message({toolCall: {functionCalls: [layout === "caption-first" ? caption : ready]}})
+        h.sockets[0].message({toolCall: {functionCalls: [layout === "caption-first" ? ready : caption]}, serverContent: {turnComplete: true}})
+      }
       await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "packet-save"))
       expect(functionResponses(h.sockets[0]).find(response => response.id === "packet-ready"))
         .toMatchObject({response: {ok: true}, scheduling: "SILENT"})
       expect(h.sockets[0].sent.filter(value => photoTask(JSON.parse(value)))).toHaveLength(1)
       const next = await providerReady(h.sockets[0])
       expect(next).toMatchObject({response: {task: "please-caption-packet-next"}, scheduling: "WHEN_IDLE"})
+      const retry = await providerReady(h.sockets[0])
+      expect(retry).toMatchObject({response: {task: `${PHOTO_REPEAT}\nplease-caption-packet-next`}, scheduling: "WHEN_IDLE"})
     } finally { await h.controller.stop() }
   })
 

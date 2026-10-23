@@ -102,10 +102,10 @@ type ToolBatch = {
   started: boolean
   photoSettling?: boolean
   photoContinuation?: boolean
+  photoCaption?: boolean
 }
 
 type PendingToolCall = {
-  photoCaption?: boolean
   invites?: boolean
   name: string
   generation: number
@@ -753,7 +753,7 @@ export class GeminiLiveController {
         call.dispatched && call.response === undefined)
       if (!ready) return
       const [id, call] = ready
-      if (this.photoJob?.batch === call.batch || call.photoCaption) { call.response = {ok: true}; continue }
+      if (this.photoJob?.batch === call.batch || call.batch.photoCaption) { call.response = {ok: true}; continue }
       if (this.photoJob?.phase === "loading" || this.photoJob?.phase === "filing" || this.imageFinalization ||
           [...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption" && call.response === undefined)) return
       const image = this.photoJob?.image ?? this.pendingImages.find(image => !image.caption && !image.retryRequested && image.mediaRef)
@@ -1506,7 +1506,6 @@ export class GeminiLiveController {
     const dispatch: Array<() => void> = []
     for (const {id, name, args} of parsed) {
       const pending: PendingToolCall = {
-        photoCaption: name === "nothing_to_add" && parsed.some(call => call.name === "save_photo_caption"),
         name,
         generation: this.generation,
         sessionId: this.sessionId,
@@ -1663,6 +1662,7 @@ export class GeminiLiveController {
       this.completeToolCall(id, call, {ok: false, status: "failed", message: PHOTO_RETRY_MESSAGE}, false)
       return
     }
+    call.batch.photoCaption = true
     if (!image.caption) {
       image.caption = caption
       image.captionEventId ??= `${image.sessionId}:photo:${image.imageId}`
