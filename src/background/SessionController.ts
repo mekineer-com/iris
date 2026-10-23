@@ -964,7 +964,7 @@ export class SessionController {
 
   private onGeminiAudio(base64Pcm: string): void {
     const reflection = this.connection === "stopping" && this.teardownKind === "stop"
-    if (reflection && (!this.closingThoughtsAtStop || this.stopExpiredAt !== null || this.stopDeadline()! <= Date.now())) return
+    if (reflection && (!this.closingThoughtsAtStop || this.stopDeadline()! <= Date.now())) return
     if (this.connection === "starting") {
       this.startupAudio.push(base64Pcm)
       return

@@ -506,7 +506,6 @@ export class GeminiLiveController {
           if (!this.stopping && this.sessionId === sittingId) this.callbacks.onDurationWarning()
         }, response.session_warning_seconds * 1000)
       }
-      if (this.pendingEvents.length) this.scheduleAppend()
     } catch (error) {
       await this.stop()
       throw error
