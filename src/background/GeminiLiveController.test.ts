@@ -160,6 +160,7 @@ function harness(
   const errors: string[] = []
   const persistenceErrors: Array<string | null> = []
   const photoRetryChanges: boolean[] = []
+  const frameDeliveryChanges: boolean[] = []
   const photoCaptions: Array<PhotoCaption & {acknowledgmentOnly: boolean}> = []
   const finalizations: Array<{ok: boolean; durable: boolean; queued: boolean}> = []
   const reconnecting: boolean[] = []
@@ -284,6 +285,7 @@ function harness(
   const controller = new GeminiLiveController(
     options.config ?? CONFIG,
     {
+      onFrameDeliveryChange: open => frameDeliveryChanges.push(open),
       getStopDeadline: options.getStopDeadline,
       canInvite: options.canInvite,
       onAudio: (data) => audio.push(data),
@@ -323,6 +325,7 @@ function harness(
     errors,
     persistenceErrors,
     photoRetryChanges,
+    frameDeliveryChanges,
     photoCaptions,
     finalizations,
     finalizeStatuses,
@@ -423,6 +426,84 @@ function admitRequest(h: ReturnType<typeof harness>, mode: "continuous" | "manua
 }
 
 describe("GeminiLiveController", () => {
+  test.each([false, true])("frame delivery waits for filing and native receipt completion (caption turn already complete=%s)", async completed => {
+    let release!: () => void
+    const h = harness({storage: new FakeStorage(), finalizeGates: [new Promise<void>(resolve => {release = resolve})]})
+    expect(h.controller.frameDeliveryOpen).toBe(false)
+    await start(h)
+    try {
+      expect(h.controller.frameDeliveryOpen).toBe(true)
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "A fictional view."}}})
+      expect(h.controller.frameDeliveryOpen).toBe(true)
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+      completeTurn(h, "", "A fictional answer.")
+      const upload = h.controller.sendImage({imageId: "frame-gate-photo", mimeType: "image/png", data: "AQID"})
+      expect(h.controller.frameDeliveryOpen).toBe(false)
+      await upload
+      await waitPhotoTask(h.sockets[0], "frame-gate-photo")
+      provisionalCaption(h.sockets[0], "frame-gate-photo", "A fictional mountain path.")
+      if (completed) h.sockets[0].message({serverContent: {turnComplete: true}})
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+      expect(h.controller.frameDeliveryOpen).toBe(false)
+      release()
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "caption-frame-gate-photo"))
+      expect(h.controller.pendingImageIds).toEqual([])
+      expect(h.controller.frameDeliveryOpen).toBe(false)
+      // If the receipt preceded its owning native completion, that completion
+      // starts the continuation rather than completing it.
+      if (!completed) {
+        h.sockets[0].message({serverContent: {turnComplete: true}})
+        expect(h.controller.frameDeliveryOpen).toBe(false)
+      }
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      expect(h.controller.frameDeliveryOpen).toBe(true)
+      const sent = h.sockets[0].sent.length
+      for (let i = 0; i < 3; i++) h.controller.resumeBackgroundWork()
+      expect(h.sockets[0].sent).toHaveLength(sent)
+      expect(h.frameDeliveryChanges).toEqual([true, false, true])
+    } finally { release(); await h.controller.stop() }
+    expect(h.frameDeliveryChanges).toEqual([true, false, true, false])
+  })
+
+  test("parked Retry originals do not block frames, but their explicit filing retry does", async () => {
+    let release!: () => void
+    const h = harness({storage: new FakeStorage(), finalizeStatuses: [500],
+      finalizeGates: [Promise.resolve(), new Promise<void>(resolve => {release = resolve})]})
+    await start(h)
+    try {
+      await h.controller.sendImage({imageId: "parked-frame-gate", mimeType: "image/png", data: "AQID"})
+      await completePhotoCaption(h.sockets[0], "parked-frame-gate", "A fictional cloudy sky.")
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "caption-parked-frame-gate"))
+      expect(h.controller.pendingPhotoIds).toEqual(["parked-frame-gate"])
+      expect(h.controller.frameDeliveryOpen).toBe(true)
+      const retry = h.controller.retryImage("parked-frame-gate")
+      expect(h.controller.frameDeliveryOpen).toBe(false)
+      await waitFor(() => h.requests.filter(request => request.url.endsWith("/snapshot/finalize")).length === 2)
+      release()
+      await retry
+      expect(h.controller.frameDeliveryOpen).toBe(true)
+      expect(h.frameDeliveryChanges).toEqual([true, false, true, false, true])
+    } finally { release(); await h.controller.stop() }
+  })
+
+  test("frame opportunity closes on reconnect and reopens only after replacement readiness", async () => {
+    const h = harness()
+    await start(h)
+    try {
+      h.sockets[0].close()
+      expect(h.controller.frameDeliveryOpen).toBe(false)
+      expect(h.frameDeliveryChanges).toEqual([true, false])
+      await waitFor(() => h.sockets.length === 2)
+      h.sockets[1].open()
+      h.sockets[1].message({setupComplete: {}})
+      await waitFor(() => h.reconnecting.at(-1) === false)
+      expect(h.controller.frameDeliveryOpen).toBe(true)
+      expect(h.frameDeliveryChanges).toEqual([true, false, true])
+    } finally { await h.controller.stop() }
+    expect(h.controller.frameDeliveryOpen).toBe(false)
+  })
+
   test("Stop waits for nokoru's native reply before requesting reflection", async () => {
     const h = harness({photoDrainTimeoutMs: 500})
     await start(h)

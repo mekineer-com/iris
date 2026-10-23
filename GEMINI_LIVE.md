@@ -174,6 +174,18 @@ skipping the summary because an internal cue was outstanding. An unrelated faile
 Its text can settle at
 `generationComplete` rather than waiting for delayed playback completion.
 
+### Passive-frame preparation
+
+`SessionSnapshot.frameDeliveryOpen`, paired with `startGeneration`, projects
+the current sitting's delivery opportunity. It closes during original upload,
+runnable photo work, filing, caption receipts and their native continuation,
+reconnect, pause or teardown. Parked Retry items alone do not close it, and
+ordinary user/Soul speech does not impose the quiet-invitation gate. Hidden
+or camera-disabled UI also projects closed. Native opportunity changes publish
+through the existing SessionController snapshot path without a polling timer.
+This is not vision activation or permission to bypass cadence/catch-up. No
+passive intake, retention settings, camera wiring or frame sender is enabled.
+
 ### Completion and connection rotation
 
 - A spoken request is admitted at Continuous native activity start or Manual

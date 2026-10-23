@@ -22,6 +22,7 @@ type StartResponse = {
 export class PhotoUploadConflict extends Error {}
 
 export type GeminiCallbacks = {
+  onFrameDeliveryChange?: (open: boolean) => void
   getStopDeadline?: () => number | null
   canInvite?: () => boolean
   onAudio: (base64Pcm: string) => void
@@ -94,6 +95,7 @@ type SpokenRequest = {
 }
 
 type ToolBatch = {
+  photo?: boolean
   invitation?: boolean
   request: SpokenRequest | null
   completed: boolean
@@ -301,6 +303,25 @@ export class GeminiLiveController {
 
   get pendingImageIds(): string[] {
     return this.pendingImages.map(image => image.imageId)
+  }
+
+  // Opportunity only: vision activation, cadence and catch-up ownership remain separate.
+  get frameDeliveryOpen(): boolean {
+    return this.ready && !this.stopping && !this.stopPromise && !this.outputMuted && !this.errorReported &&
+      !this.reconnecting && !this.goAwayPending && !this.reflecting && !this.activityPauseReason &&
+      !this.photoJob && !this.imageUpload && !this.imageFinalization && !this.imageRetrying &&
+      !this.pendingImages.some(image => !image.retryRequested) &&
+      ![...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption") &&
+      !(this.toolBatch.started && this.toolBatch.photo === true)
+  }
+
+  private lastPublishedFrameDelivery = false
+
+  private publishFrameDelivery(): void {
+    const open = this.frameDeliveryOpen
+    if (open === this.lastPublishedFrameDelivery) return
+    this.lastPublishedFrameDelivery = open
+    this.callbacks.onFrameDeliveryChange?.(open)
   }
 
   private removePendingImage(image: PendingImage): void {
@@ -576,6 +597,7 @@ export class GeminiLiveController {
       }
     })
     this.imageUpload = upload
+    this.publishFrameDelivery()
     return upload
   }
 
@@ -855,6 +877,7 @@ export class GeminiLiveController {
     }
     if (!userRequested) return
     this.imageRetrying = true
+    this.publishFrameDelivery()
     try {
       const response = await this.request(`/integration/mentra/session/${this.sessionId}/snapshot/replay`, {
         user_id: this.config.userId, soul_id: this.config.soulId, image_id: pending.imageId,
@@ -909,6 +932,7 @@ export class GeminiLiveController {
 
   muteForStop(): void {
     this.outputMuted = true
+    this.publishFrameDelivery()
     if (this.spokenRequest) this.spokenRequest.retired = true
   }
 
@@ -1261,6 +1285,7 @@ export class GeminiLiveController {
     this.reconnecting = true
     this.voiceActive = false
     this.ready = false
+    this.publishFrameDelivery()
     this.callbacks.onReconnecting(true)
     this.disconnectToolBatch()
     if (this.reflecting) this.finishReflection(null)
@@ -1397,7 +1422,8 @@ export class GeminiLiveController {
       }
       if (this.spokenRequest?.retired) this.spokenRequest = null
       this.toolBatch = {request: this.spokenRequest, completed: false, continuationSent: false,
-        background: !this.spokenRequest, started: !interruptedTurn && batch.photoContinuation === true}
+        background: !this.spokenRequest, started: !interruptedTurn && batch.photoContinuation === true,
+        photo: !interruptedTurn && batch.photoContinuation === true && batch.photo === true}
       this.reconnectAttempted = false
       if (this.latestUsageTotal !== null) this.callbacks.onUsage(this.latestUsageTotal)
       this.materializeDrafts()
@@ -1844,7 +1870,12 @@ export class GeminiLiveController {
         this.photoTimer = setTimeout(expire, TOOL_TIMEOUT_MS)
       }
       if (pending.scheduling === "WHEN_IDLE") {
-        if (pending.batch.completed) this.toolBatch.started = true
+        const photo = pending.name === "save_photo_caption" || this.photoJob?.callId === id
+        if (photo) pending.batch.photo = true
+        if (pending.batch.completed) {
+          this.toolBatch.started = true
+          if (photo) this.toolBatch.photo = true
+        }
         else pending.batch.photoContinuation = true
       }
       if (resume) {
@@ -1857,6 +1888,7 @@ export class GeminiLiveController {
     }
     this.finishPhotoDrainIfAcknowledged()
     this.sendInvitation()
+    this.publishFrameDelivery()
   }
 
   private hasUnconsumedTools(request: SpokenRequest): boolean {
@@ -2103,6 +2135,7 @@ export class GeminiLiveController {
       }
     })
     this.imageFinalization = {image: pending, promise: finalization}
+    this.publishFrameDelivery()
     return finalization
   }
 
@@ -2485,6 +2518,7 @@ export class GeminiLiveController {
     this.clearGoAway()
     this.reconnecting = true
     this.voiceActive = false
+    this.publishFrameDelivery()
     try {
       trace("provider.socket.closed", {resumable: Boolean(this.resumptionHandle)})
       this.socket = null
@@ -2743,6 +2777,7 @@ export class GeminiLiveController {
   private reportError(error: Error): void {
     if (this.stopping || this.errorReported) return
     this.errorReported = true
+    this.publishFrameDelivery()
     if ([...this.pendingToolCalls.values()].some(isUncertainWrite)) {
       error = new Error(`${error.message}. ${WRITE_UNCERTAINTY_MESSAGE}`)
     }

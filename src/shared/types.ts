@@ -28,6 +28,7 @@ export interface ImageTime {
 }
 
 export interface SessionSnapshot {
+  frameDeliveryOpen: boolean
   stopDeadlineAt: number | null
   startGeneration: number
   configured: boolean

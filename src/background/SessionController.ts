@@ -424,6 +424,9 @@ export class SessionController {
 
   private snapshot(): SessionSnapshot {
     return {
+      frameDeliveryOpen: this.foreground && this.cameraEnabled &&
+        (this.connection === "listening" || this.connection === "speaking") &&
+        this.liveController?.frameDeliveryOpen === true,
       stopDeadlineAt: this.stopDeadline(),
       startGeneration: this.startGeneration,
       configured: Boolean(this.config),
@@ -526,6 +529,7 @@ export class SessionController {
       this.recoverySoulId = this.soulId
       if (!this.liveController) {
         this.liveController = this.createLiveController({...this.currentConfig(), soulId: this.soulId}, {
+          onFrameDeliveryChange: () => this.pushSnapshot(),
           getStopDeadline: () => this.stopDeadline(),
           canInvite: () => this.connection === "listening" &&
             (this.mode === "continuous" || this.manualPhase === "idle"),

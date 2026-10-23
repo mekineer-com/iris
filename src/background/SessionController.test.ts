@@ -35,6 +35,7 @@ function testPcm(value: number): string {
 }
 
 class FakeLive {
+  frameDeliveryOpen = false
   stopDeadlineRefreshes = 0
   resumptions = 0
   starts = 0
@@ -321,6 +322,84 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
 }
 
 describe("SessionController", () => {
+  test("frame delivery snapshots project the current sitting's native opportunity", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const original = h.live
+    const opportunity = (live: FakeLive, open: boolean) => {
+      live.frameDeliveryOpen = open
+      const count = h.session.snapshots.length
+      live.callbacks.onFrameDeliveryChange!(open)
+      expect(h.session.snapshots).toHaveLength(count + 1)
+    }
+    const projected = (connection: Snapshot["connection"], open: boolean, startGeneration = 1) => {
+      expect(lastSnapshot(h.session)).toMatchObject({connection, frameDeliveryOpen: open, startGeneration})
+    }
+    let release!: () => void
+    try {
+      projected("listening", false)
+      opportunity(original, true)
+      projected("listening", true)
+      h.live.audio()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      projected("speaking", true)
+      opportunity(original, false)
+      projected("speaking", false)
+      opportunity(original, true)
+      projected("speaking", true)
+
+      h.session.onCloseCb!()
+      projected("speaking", false)
+      opportunity(original, false)
+      opportunity(original, true)
+      projected("speaking", false)
+      h.session.onOpenCb!()
+      projected("speaking", true)
+      await h.session.handlers["openalma:set-capabilities"]({cameraEnabled: false})
+      projected("speaking", false)
+      opportunity(original, false)
+      opportunity(original, true)
+      projected("speaking", false)
+      await h.session.handlers["openalma:set-capabilities"]({cameraEnabled: true})
+      projected("speaking", true)
+
+      original.reconnecting(true)
+      projected("reconnecting", false)
+      opportunity(original, false)
+      opportunity(original, true)
+      projected("reconnecting", false)
+      original.reconnecting(false)
+      await new Promise(resolve => setTimeout(resolve, 0))
+      projected("listening", true)
+
+      original.stopGate = new Promise<void>(resolve => {release = resolve})
+      const stopping = h.session.handlers["openalma:stop"]({})
+      projected("stopping", false, 2)
+      original.callbacks.onFrameDeliveryChange!(true)
+      projected("stopping", false, 2)
+      release()
+      await stopping
+      projected("idle", false, 2)
+      original.callbacks.onFrameDeliveryChange!(true)
+      projected("idle", false, 2)
+
+      await h.session.handlers["openalma:start"]({mode: "continuous"})
+      projected("listening", false, 3)
+      original.callbacks.onFrameDeliveryChange!(true)
+      projected("listening", false, 3)
+      opportunity(h.live, true)
+      projected("listening", true, 3)
+      original.frameDeliveryOpen = false
+      original.callbacks.onFrameDeliveryChange!(false)
+      projected("listening", true, 3)
+      expect(original.images).toEqual([])
+      expect(h.live.images).toEqual([])
+    } finally {
+      release?.()
+      await h.session.handlers["openalma:stop"]({})
+    }
+  })
+
   for (const initiallyVisible of [true, false]) {
     test(`Stop deadlines stay anchored across focus changes (initially ${initiallyVisible ? "visible" : "hidden"})`, async () => {
       const h = setup()
@@ -2025,6 +2104,7 @@ describe("SessionController", () => {
     const harness = setup()
     harness.session.onOpenCb?.()
     expect(harness.session.snapshots[0]).toEqual({
+      frameDeliveryOpen: false,
       stopDeadlineAt: null,
       startGeneration: 0,
       configured: true,
