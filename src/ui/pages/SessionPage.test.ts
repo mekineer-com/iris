@@ -29,7 +29,7 @@ function labelledCheckbox(tree: any, text: string) {
 }
 
 function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Promise<unknown>, now?: number) {
-  for (const [field, value] of Object.entries({modelChoice: null, model: null, configuredModel: null, modelSaving: false,
+  for (const [field, value] of Object.entries({modelChoice: LIVE_MODELS[0], model: null, configuredModel: null, modelSaving: false,
     callMode: "audio", maxMemorizedPhotos: 1, catchUpRender: null})) {
     if (!(field in snapshot)) Object.assign(snapshot, {[field]: value})
   }
@@ -71,25 +71,53 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
 }
 
 describe("SessionPage state projection", () => {
-  const modelButtons = (tree: any) => nodes(nodes(tree).find(node => node.props?.["aria-label"] === "Model"))
-    .filter(node => node.type === "button")
+  test("idle reserves an empty status row; connection activity fills it", () => {
+    const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"], connection: "idle"}
+    const render = renderPage(snapshot, async () => ({ok: true}))
+    const status = nodes(render()).find(node => node.props?.className === "status")
+    expect(status).toBeDefined()
+    expect(status.props.children.filter(Boolean)).toEqual([])
+    for (const connection of ["starting", "reconnecting", "listening", "speaking", "stopping", "error"]) {
+      snapshot.connection = connection
+      expect(nodes(render()).some(node => node.props?.className === "status")).toBe(true)
+    }
+  })
 
-  test("no saved override implies neither model, including custom or offered server settings", () => {
+  test("top gear toggles Settings without a visible text button", () => {
+    const render = renderPage({configured: true, soulId: "Quill", souls: ["Quill"]}, async () => ({ok: true}))
+    const gear = () => nodes(render()).find(node => node.props?.["aria-label"] === "Settings")
+    const panel = () => nodes(render()).find(node => node.props?.id === "iris-settings")
+    expect(gear().props["aria-expanded"]).toBe(false)
+    const tree = nodes(render())
+    expect(tree.indexOf(tree.find(node => node.props?.id === "iris-settings")))
+      .toBeGreaterThan(tree.indexOf(tree.find(node => node.props?.className === "photo-controls")))
+    expect(gear().props.children.props["aria-hidden"]).toBe("true")
+    expect(panel().props.hidden).toBe(true)
+    gear().props.onClick()
+    expect(gear().props["aria-expanded"]).toBe(true)
+    expect(panel().props.hidden).toBe(false)
+    gear().props.onClick()
+    expect(panel().props.hidden).toBe(true)
+  })
+
+  const modelSwitches = (tree: any) => nodes(nodes(tree).find(node => node.props?.["aria-label"] === "Model"))
+    .filter(node => node.props?.role === "switch")
+
+  test("no saved override displays Live, independent of the old server model", () => {
     const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"],
-      configuredModel: null as string | null}
+      modelChoice: null, configuredModel: null as string | null}
     const render = renderPage(snapshot, async () => ({ok: true}))
     for (const model of [null, "custom-server-model", ...LIVE_MODELS]) {
       snapshot.configuredModel = model
       const tree = render()
-      expect(modelButtons(tree).map(button => button.props["aria-pressed"])).toEqual([false, false])
-      expect(modelButtons(tree).map(button => button.props.children)).toEqual(["Live", "Thinking"])
+      expect(modelSwitches(tree).map(button => button.props.checked)).toEqual([false])
       const selector = nodes(tree).find(node => node.props?.["aria-label"] === "Model")
-      expect(nodes(selector).find(node => node.type === "p").props.children)
-        .toBe(model ? `Using server setting: ${model}` : "Using server setting")
+      expect(nodes(selector).some(node => node.type === "p")).toBe(false)
+      expect(JSON.stringify(selector)).toContain(LIVE_MODELS[0])
       const controls = nodes(tree).find(node => node.props?.["aria-label"] === "Voice controls")
-      expect(modelButtons(controls)).toHaveLength(2)
+      expect(modelSwitches(controls)).toHaveLength(1)
       const settings = nodes(tree).find(node => node.props?.id === "iris-settings")
-      expect(modelButtons(settings)).toHaveLength(0)
+      expect(modelSwitches(settings)).toHaveLength(0)
     }
   })
 
@@ -115,11 +143,10 @@ describe("SessionPage state projection", () => {
         await new Promise(resolve => setTimeout(resolve, 0))
         expect(start().props.disabled).toBe(false)
         calls.length = 0
-        modelButtons(render())[index].props.onClick()
+        modelSwitches(render())[0].props.onChange({target: {checked: index === 1}})
         expect(calls).toEqual([{channel: "openalma:set-model", payload: {model: choice}}])
-        expect(modelButtons(render()).map(button => button.props.disabled)).toEqual([true, true])
-        expect(modelButtons(render()).map(button => button.props["aria-pressed"]))
-          .toEqual(LIVE_MODELS.map(model => model === previous))
+        expect(modelSwitches(render()).map(button => button.props.disabled)).toEqual([true])
+        expect(modelSwitches(render())[0].props.checked).toBe(previous === LIVE_MODELS[1])
         expect(start().props.disabled).toBe(true)
         if (fails) reject(new Error("Fictional model preference storage failure"))
         else {
@@ -127,14 +154,42 @@ describe("SessionPage state projection", () => {
           resolve()
         }
         await new Promise(resolve => setTimeout(resolve, 0))
-        expect(modelButtons(render()).map(button => button.props["aria-pressed"]))
-          .toEqual(LIVE_MODELS.map(model => model === (fails ? previous : choice)))
-        expect(modelButtons(render()).map(button => button.props.disabled)).toEqual([false, false])
+        expect(modelSwitches(render())[0].props.checked).toBe((fails ? previous : choice) === LIVE_MODELS[1])
+        expect(modelSwitches(render()).map(button => button.props.disabled)).toEqual([false])
         expect(start().props.disabled).toBe(false)
         if (fails) expect(JSON.stringify(render())).toContain("Fictional model preference storage failure")
       })
     }
   }
+
+  test.each([false, true])("first Start saves displayed Live before starting (save fails=%s)", async fails => {
+    const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
+      soulConfirmed: true, soulLocked: false, connection: "idle", modelChoice: null, configuredModel: "old-server-model"}
+    const calls: Array<{channel: string; payload: unknown}> = []
+    let resolve!: () => void, reject!: (error: Error) => void
+    const saving = new Promise<void>((res, rej) => {resolve = res; reject = rej})
+    const render = renderPage(snapshot, async (channel, payload) => {
+      calls.push({channel, payload})
+      if (channel === "openalma:set-soul") return {soulId: "Quill", created: false}
+      if (channel === "openalma:set-model") return saving
+      return {ok: true}
+    })
+    nodes(render()).find(node => node.props?.onFocus).props.onChange({target: {value: "Quill"}})
+    nodes(render()).find(node => node.props?.["aria-label"] === "Use soul").props.onClick()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    calls.length = 0
+    const start = () => nodes(render()).find(node => node.props?.className === "sitting-button")
+    start().props.onClick()
+    expect(calls).toEqual([{channel: "openalma:set-model", payload: {model: LIVE_MODELS[0]}}])
+    expect(modelSwitches(render())[0].props.disabled).toBe(true)
+    if (fails) reject(new Error("Fictional model save failed"))
+    else resolve()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(calls.filter(call => call.channel === "openalma:start")).toEqual(fails ? [] : [
+      {channel: "openalma:start", payload: {mode: "continuous", callMode: "audio"}},
+    ])
+    if (fails) expect(JSON.stringify(render())).toContain("Fictional model save failed")
+  })
 
   test("model selection locks for the whole sitting and background save; active label uses actual model", () => {
     const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"], connection: "idle",
@@ -143,8 +198,8 @@ describe("SessionPage state projection", () => {
     for (const connection of ["idle", "error", "starting", "reconnecting", "listening", "speaking", "stopping"]) {
       snapshot.connection = connection
       const locked = connection !== "idle" && connection !== "error"
-      expect(modelButtons(render()).map(button => button.props.disabled)).toEqual([locked, locked])
-      if (locked) expect(JSON.stringify(render())).toContain("Using model: actual-lease-model")
+      expect(modelSwitches(render()).map(button => button.props.disabled)).toEqual([locked])
+      if (locked) expect(JSON.stringify(render())).toContain("actual-lease-model")
     }
     snapshot.connection = "idle"
     nodes(render()).find(node => node.props?.onFocus).props.onChange({target: {value: "Fable"}})
@@ -152,7 +207,7 @@ describe("SessionPage state projection", () => {
     const start = () => nodes(render()).find(node => node.props?.className === "sitting-button")
     expect(start().props.disabled).toBe(false)
     snapshot.modelSaving = true
-    expect(modelButtons(render()).map(button => button.props.disabled)).toEqual([true, true])
+    expect(modelSwitches(render()).map(button => button.props.disabled)).toEqual([true])
     expect(start().props.disabled).toBe(true)
     snapshot.connection = "listening"
     expect(start().props.disabled).toBe(false)
@@ -162,7 +217,7 @@ describe("SessionPage state projection", () => {
     const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
       soulConfirmed: true, connection: "idle", closingThoughts: undefined as boolean | undefined}
     const render = renderPage(snapshot, async () => ({ok: true}))
-    const row = nodes(render()).find(node => node.props?.className === "sitting-controls")
+    const row = nodes(render()).find(node => node.props?.className === "sitting-controls sitting-start")
     expect(nodes(row).some(node => node.props?.className === "sitting-button")).toBe(true)
     expect(labelledCheckbox(row, "Closing thoughts")).toBeUndefined()
     expect(nodes(row).filter(node => node.props?.className === "sitting-button").map(node => node.props.children))
@@ -235,7 +290,7 @@ describe("SessionPage state projection", () => {
       try {
         expect(calls).toEqual([active ? "openalma:stop" : "openalma:start"])
         expect(labelledCheckbox(render(), "Closing thoughts").props.disabled).toBe(true)
-        expect(modelButtons(render()).map(button => button.props.disabled)).toEqual([true, true])
+        expect(modelSwitches(render()).map(button => button.props.disabled)).toEqual([true])
       } finally {
         release()
         await new Promise(resolve => setTimeout(resolve, 0))
@@ -604,7 +659,7 @@ describe("SessionPage state projection", () => {
 })
 
 describe("Video UI and allowance projection", () => {
-  test("Video starts explicitly and Photos stays available but collapsed", async () => {
+  test("Video starts explicitly and Photos stays expanded in every call mode", async () => {
     const calls: any[] = []
     const snapshot = {configured: true, soulLoading: false, startGeneration: 1, soulId: "Quill", souls: ["Quill"],
       soulConfirmed: true, soulLocked: false, connection: "idle", callMode: "audio"}
@@ -621,17 +676,17 @@ describe("Video UI and allowance projection", () => {
     expect(calls).toEqual([{channel: "openalma:start", payload: {mode: "continuous", callMode: "video"}}])
     snapshot.callMode = "video"; snapshot.connection = "listening"
     const photos = nodes(render()).find(node => node.props.className === "photo-controls")
-    expect(photos.props.open).toBe(false)
+    expect(photos.type).toBe("section")
     expect(nodes(photos).some(node => node.props?.children === "Photos")).toBe(true)
     expect(nodes(photos).filter(node => node.props?.type === "file")).toHaveLength(1)
     expect(nodes(photos).find(node => node.type === "button" && node.props.children === "Take photo")).toBeDefined()
     snapshot.callMode = "audio"
-    expect(nodes(render()).find(node => node.props.className === "photo-controls").props.open).toBe(true)
+    expect(nodes(render()).find(node => node.props.className === "photo-controls").type).toBe("section")
     expect(nodes(render()).filter(node => node.props?.type === "file")).toHaveLength(2)
     snapshot.callMode = "video"
     for (const connection of ["idle", "error"]) {
       snapshot.connection = connection
-      expect(nodes(render()).find(node => node.props.className === "photo-controls").props.open).toBe(true)
+      expect(nodes(render()).find(node => node.props.className === "photo-controls").type).toBe("section")
       expect(nodes(render()).filter(node => node.props?.type === "file")).toHaveLength(2)
     }
   })

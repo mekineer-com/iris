@@ -215,6 +215,8 @@ export default function SessionPage() {
   const modeDisabled = active || stopping || startPending || stopPending || modePending
   const modelSaving = modelPending || snapshot?.modelSaving === true
   const modelDisabled = active || stopping || startPending || stopPending || modelSaving
+  const displayedModel = (active || stopping) && snapshot?.model
+    ? snapshot.model : snapshot?.modelChoice ?? LIVE_MODELS[0]
   const soulLocked = snapshot?.soulLocked ?? true
   const connectionLocked = (snapshot?.connectionLocked ?? true) || active || stopping || soulPending
   const soulReady = !soulDirty && snapshot?.soulConfirmed && soulName.trim() === snapshot.soulId
@@ -275,6 +277,10 @@ export default function SessionPage() {
         if (pendingNewSoul !== soulName.trim() || !await selectSoul(soulName.trim(), false)) return
       }
       if (owner !== startOwner.current) return
+      if (!snapshot?.modelChoice) {
+        await modelRpc({model: LIVE_MODELS[0]})
+        if (owner !== startOwner.current) return
+      }
       await startRpc({mode, callMode})
     } catch (error) {
       if (owner === startOwner.current) {
@@ -561,13 +567,19 @@ export default function SessionPage() {
 
   return (
     <main>
-      <header>
+      <header className="iris-header">
         <p className="eyebrow">OpenAlma voice</p>
-        <h1>Iris</h1>
+        <div className="iris-title-row">
+          <h1>Iris</h1>
+          <button type="button" className="settings-toggle" aria-label="Settings" title="Settings" aria-controls="iris-settings"
+            aria-expanded={settingsOpen} onClick={() => setSettingsOpen((open) => !open)}>
+            <span aria-hidden="true">&#9881;</span>
+          </button>
+        </div>
       </header>
       <p className="status" role="status" aria-live="polite">
         {showSpinner ? <span className="spinner" aria-hidden="true" /> : null}
-        {statusText(visible, mode, manualPhase, snapshot.soulId, microphoneEnabled)}
+        {visible === "idle" ? null : statusText(visible, mode, manualPhase, snapshot.soulId, microphoneEnabled)}
         {stopping && stopDeadline !== null ? <span aria-live="off"> {stopSecondsRemaining(stopDeadline, stopNow)}s remaining</span> : null}
       </p>
       {snapshot?.memuAvailable === false ? (
@@ -584,7 +596,7 @@ export default function SessionPage() {
       ) : null}
       <section className="soul-control" aria-label="Soul selection">
         <label>
-          <span>Soul</span>
+          <span className="section-label">Soul</span>
           <span className="soul-entry">
             <span className="soul-combobox" onBlur={(event) => {
               if (!event.currentTarget.contains(event.relatedTarget)) setSoulMenuOpen(false)
@@ -645,25 +657,16 @@ export default function SessionPage() {
       </section>
       <section className="controls" aria-label="Voice controls">
         <section className="mode-control" aria-label="Model">
-          <span>Model</span>
-          <div className="mode-options">
-            {LIVE_MODELS.map((model, index) => (
-              <button key={model} type="button" aria-pressed={snapshot.modelChoice === model}
-                disabled={modelDisabled} onClick={() => void onModel(model)}>
-                {index === 0 ? "Live" : "Thinking"}
-              </button>
-            ))}
-          </div>
-          <p>{(active || stopping) && snapshot.model
-            ? `Using model: ${snapshot.model}`
-            : snapshot.modelChoice
-              ? `Selected model: ${snapshot.modelChoice}`
-              : snapshot.configuredModel
-                ? `Using server setting: ${snapshot.configuredModel}`
-                : "Using server setting"}</p>
+          <span className="section-label">Model</span>
+          <label className="model-toggle">
+            <input type="checkbox" role="switch" aria-label="Thinking"
+              checked={displayedModel === LIVE_MODELS[1]} disabled={modelDisabled}
+              onChange={event => void onModel(LIVE_MODELS[event.target.checked ? 1 : 0])} />
+            <span>{displayedModel}</span>
+          </label>
         </section>
-        <span>Call</span>
-        <div className="sitting-controls">
+        <span className="section-label">Call</span>
+        <div className={`sitting-controls${active || stopping ? "" : " sitting-start"}`}>
           {active || stopping ? <button
             type="button"
             className="sitting-button"
@@ -715,8 +718,8 @@ export default function SessionPage() {
       <video ref={vision.videoRef} className="video-preview" muted playsInline
         hidden={!videoCall || !active} aria-label="Phone camera preview" />
       {vision.error ? <p role="alert">{vision.error}</p> : null}
-      <details className="photo-controls" key={String(videoCall)} open={!videoCall}>
-      <summary>Photos</summary>
+      <section className="photo-controls" aria-label="Photos">
+      <div className="section-label">Photos</div>
       <div className="image-actions">
         {videoCall ? <button type="button" disabled={!vision.ready || !cameraEnabled || !voiceReady || imagePending || stopping}
           onClick={() => void onVideoPhoto()}>Take photo</button> : <label className="image-picker">
@@ -741,7 +744,7 @@ export default function SessionPage() {
           />
         </label>
       </div>
-      </details>
+      </section>
       {pendingPhoto?.previewUrl ? <img className="image-preview" src={pendingPhoto.previewUrl} alt="Selected photo preview" /> : null}
       {pendingPhoto && shouldWarnLargeImage(pendingPhoto.file.size, largeImageWarningDismissed) ? (
         <div role="alert">
@@ -824,14 +827,16 @@ export default function SessionPage() {
             onClick={() => void onMode("manual")}>Manual</button>
         </div>
       </section>
-      <label className="photo-allowance">
-        Maximum memorized photos:
+      <section className="mode-control" aria-label="Photo allowance">
+        <label className="section-label" htmlFor="photo-allowance">Maximum memorized photos</label>
+        <div className="photo-allowance">
         <output>{maxPhotosDraft ?? snapshot.maxMemorizedPhotos} in 5 min, {(maxPhotosDraft ?? snapshot.maxMemorizedPhotos) * 2} in 15 min, {(maxPhotosDraft ?? snapshot.maxMemorizedPhotos) * 3} in 45 min</output>
-        <span className="allowance-slider">Fewer <input type="range" min="1" max="5" step="1"
+        <span className="allowance-slider">Fewer <input id="photo-allowance" type="range" min="1" max="5" step="1"
           aria-label="Maximum memorized photos" value={maxPhotosDraft ?? snapshot.maxMemorizedPhotos}
           disabled={starting || stopping} onChange={event => void onMaxPhotos(Number(event.target.value))} /> More</span>
         {active ? <small>Changes apply to the next call.</small> : null}
-      </label>
+        </div>
+      </section>
       <label className="preview-control">
         <input
           type="checkbox"
@@ -865,8 +870,6 @@ export default function SessionPage() {
         <button type="button" onClick={editConnection}>Edit Connection</button>
         <small className="iris-version">Iris {manifest.version}</small>
       </section>
-      <button type="button" className="settings-toggle" aria-label="Settings" aria-controls="iris-settings"
-        aria-expanded={settingsOpen} onClick={() => setSettingsOpen((open) => !open)}>&#9881; Settings</button>
     </main>
   )
 }
