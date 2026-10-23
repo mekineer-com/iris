@@ -24,6 +24,18 @@ test("preserves an original date with no supplied timezone", async () => {
     source: "DateTimeOriginal", receivedAt: receipt, originalTime: "2000:02:29 01:02:03"})
 })
 
+test("invalid offset metadata does not discard a usable original date", async () => {
+  const bytes = new Uint8Array(await fixture("capture.jpg").arrayBuffer())
+  const offset = new TextEncoder().encode("-05:00")
+  const start = bytes.findIndex((_, index) => offset.every((value, part) => bytes[index + part] === value))
+  expect(start).toBeGreaterThan(-1)
+  bytes.set(new TextEncoder().encode("broken"), start)
+  expect(await readImageTime(new File([bytes], "invalid-offset.jpg"), receipt)).toEqual({
+    timestamp: "2026-01-08T10-17-23", source: "DateTimeOriginal", receivedAt: receipt,
+    originalTime: "2026:01:08 10:17:23",
+  })
+})
+
 test("the existing parser normalizes padded and NUL-terminated metadata at its boundary", async () => {
   expect(await readImageTime(fixture("padded.jpg"), receipt)).toEqual({timestamp: "2026-01-08T10-17-23",
     source: "DateTimeOriginal", receivedAt: receipt, originalTime: "2026:01:08 10:17:23", offset: "-05:00"})

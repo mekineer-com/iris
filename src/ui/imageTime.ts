@@ -1,7 +1,6 @@
 import {Exifr} from "exifr/src/bundles/nano.mjs"
 import "exifr/src/dicts/tiff-exif-keys.mjs"
 import "exifr/src/file-parsers/png.mjs"
-import "exifr/src/segment-parsers/ihdr.mjs"
 
 import {formatImageTimestamp} from "../shared/imageReference"
 
@@ -17,7 +16,7 @@ export async function readImageTime(file: Pick<File, "arrayBuffer">, receivedAt:
   const receipt: ImageTime = {timestamp: formatImageTimestamp(receivedAt), source: "receipt", receivedAt}
   const bytes = await file.arrayBuffer()
   // EXIF-local filters work with nano; construct outside the optional-data catch to expose config errors.
-  const parser = new Exifr({reviveValues: false, gps: false,
+  const parser = new Exifr({reviveValues: false, gps: false, ihdr: false,
     ifd0: {pick: [0x8769]}, exif: {pick: [0x9003, 0x9004, 0x9011, 0x9012]}})
   let metadata: unknown
   try {
@@ -38,7 +37,7 @@ export async function readImageTime(file: Pick<File, "arrayBuffer">, receivedAt:
     try {timestamp = formatImageTimestamp(originalTime)} catch {continue}
     const offset = fields[offsetField]
     return {timestamp, source, receivedAt, originalTime,
-      ...(typeof offset === "string" && offset ? {offset} : {})}
+      ...(typeof offset === "string" && /^[+-]\d{2}:\d{2}$/.test(offset) ? {offset} : {})}
   }
   return receipt
 }

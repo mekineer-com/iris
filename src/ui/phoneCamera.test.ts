@@ -233,16 +233,10 @@ test("capture/encoding failure releases the camera instead of returning empty da
 const running: PhoneCameraState = {enabled: true, cameraEnabled: true, visible: true,
   pickerOpen: false, connection: "listening", generation: 4, startGeneration: 4}
 
-test("camera-run condition keeps the camera through reconnect without requiring the mic", async () => {
+test("camera-run condition includes reconnect without requiring the mic", () => {
   expect(cameraShouldRun(running)).toBe(true)
   expect(cameraShouldRun({...running, connection: "speaking"})).toBe(true)
-  const h = harness()
-  await h.camera.start()
-  if (!cameraShouldRun({...running, connection: "reconnecting"})) h.camera.stop()
-  expect(h.active.track.stop).not.toHaveBeenCalled()
-  expect(h.getUserMedia).toHaveBeenCalledTimes(1)
-  expect(h.onStopped).not.toHaveBeenCalled()
-  h.camera.dispose()
+  expect(cameraShouldRun({...running, connection: "reconnecting"})).toBe(true)
 })
 
 test.each([
