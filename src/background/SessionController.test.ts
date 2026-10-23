@@ -343,7 +343,204 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
   return session.snapshots.at(-1)
 }
 
+const flush = () => new Promise(resolve => setTimeout(resolve, 0))
+
+function sdkSpeaker(session: FakeSession, onClose: (streamId: string) => Promise<void>) {
+  const messages: Array<{type: string; streamId: string; base64?: string}> = []
+  let streamId = 0
+  session.speaker.createStream = async () => new SpeakerStreamWriter({
+    sendRequest: async (message: typeof messages[number]) => {
+      messages.push(message)
+      if (message.type === "miniapp_speaker_stream_close") await onClose(message.streamId)
+      return {}
+    },
+  } as never, `test-${++streamId}`) as never
+  return messages
+}
+
 describe("SessionController", () => {
+  test("Closing thoughts defaults checked, persists across controllers, and does not apply failed writes", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const set = h.session.handlers["openalma:set-closing-thoughts"]
+    const save = h.session.storage.set
+    try {
+      expect(lastSnapshot(h.session)?.closingThoughts).toBe(true)
+      for (const payload of [null, {}, {enabled: "false"}]) {
+        await expect(set(payload)).rejects.toThrow("Invalid Closing thoughts")
+      }
+      h.session.storage.set = async () => {throw new Error("Fictional storage failure")}
+      await expect(set({enabled: false})).rejects.toThrow("Fictional storage failure")
+      expect(lastSnapshot(h.session)?.closingThoughts).toBe(true)
+      expect(h.session.stored.has("openalma.closing-thoughts")).toBe(false)
+      h.session.storage.set = save
+      await set({enabled: false})
+      expect(h.session.stored.get("openalma.closing-thoughts")).toBe("0")
+      const restored = setup({stored: Object.fromEntries(h.session.stored)})
+      await restored.session.handlers["openalma:start"]({mode: "continuous"})
+      try {
+        expect(lastSnapshot(restored.session)?.closingThoughts).toBe(false)
+        await restored.session.handlers["openalma:set-closing-thoughts"]({enabled: true})
+        expect(restored.session.stored.get("openalma.closing-thoughts")).toBe("1")
+        expect(lastSnapshot(restored.session)?.closingThoughts).toBe(true)
+      } finally {
+        await restored.session.handlers["openalma:stop"]({})
+      }
+    } finally {
+      h.session.storage.set = save
+      await h.session.handlers["openalma:stop"]({})
+    }
+  })
+
+  for (const enabled of [true, false]) {
+    test(`Stop freezes ${enabled ? "checked" : "unchecked"} Closing thoughts while a preference write is pending`, async () => {
+      const h = setup({stored: {"openalma.closing-thoughts": enabled ? "1" : "0"}})
+      await h.session.handlers["openalma:start"]({mode: "continuous"})
+      const save = h.session.storage.set
+      let releaseSave!: () => void
+      const gate = new Promise<void>(resolve => {releaseSave = resolve})
+      h.session.storage.set = async (key, value) => {
+        if (key === "openalma.closing-thoughts") await gate
+        await save(key, value)
+      }
+      const pending = h.session.handlers["openalma:set-closing-thoughts"]({enabled: !enabled})
+      await flush()
+      expect(lastSnapshot(h.session)?.closingThoughts).toBe(enabled)
+      let releaseStop!: () => void
+      h.live.stopGate = new Promise<void>(resolve => {releaseStop = resolve})
+      h.live.audioOnStop = true
+      h.live.persistenceOnStop = "Fictional transcript sync warning"
+      const stop = h.session.handlers["openalma:stop"]({})
+      try {
+        expect(h.session.micHandler).toBeNull()
+        expect(h.live.outputMuted).toBe(true)
+        await flush()
+        expect(h.live.stopArgs).toEqual([true])
+        await expect(h.session.handlers["openalma:set-closing-thoughts"]({enabled: !enabled}))
+          .rejects.toThrow("Wait for this sitting")
+        releaseSave()
+        await pending
+        expect(h.session.stored.get("openalma.closing-thoughts")).toBe(enabled ? "0" : "1")
+        expect(lastSnapshot(h.session)).toMatchObject({connection: "stopping", closingThoughts: enabled})
+        expect(h.session.streams.flatMap(stream => stream.writes)).toEqual(enabled ? [silentPcm()] : [])
+        releaseStop()
+        await stop
+        expect(lastSnapshot(h.session)).toMatchObject({connection: "idle", closingThoughts: !enabled,
+          lastError: "Fictional transcript sync warning"})
+        expect(h.session.plays.at(-1)?.audioUrl).toContain("listen-stop")
+        await h.session.handlers["openalma:start"]({mode: "continuous"})
+        h.live.audioOnStop = true
+        const count = h.session.streams.length
+        await h.session.handlers["openalma:stop"]({})
+        expect(h.session.streams.length - count).toBe(enabled ? 0 : 1)
+      } finally {
+        releaseSave()
+        releaseStop()
+        await pending
+        await stop
+        await h.session.handlers["openalma:stop"]({})
+      }
+    })
+  }
+
+  for (const stalled of ["creation", "abort", "reflection creation"] as const) {
+    test(`Stop budget covers stalled writer ${stalled} without abandoning provider cleanup`, async () => {
+      const h = setup()
+      await h.session.handlers["openalma:start"]({mode: "continuous"})
+      let release!: () => void
+      const gate = new Promise<void>(resolve => {release = resolve})
+      if (stalled !== "abort") h.session.createGate = gate
+      else h.session.abortGate = gate
+      if (stalled !== "reflection creation") h.live.audio()
+      await flush()
+      const startedAt = 1_000_000
+      let now = startedAt
+      const clock = spyOn(Date, "now").mockImplementation(() => now)
+      h.live.audioOnStop = true
+      const stop = h.session.handlers["openalma:stop"]({})
+      try {
+        await flush()
+        expect(h.live.stops).toBe(stalled === "reflection creation" ? 1 : 0)
+        now += 30_001
+        h.session.onOpenCb!()
+        await stop
+        expect(h.live.stopArgs).toEqual([true])
+        expect(h.session.speakerStops).toBeGreaterThan(0)
+        expect(lastSnapshot(h.session)?.connection).toBe("idle")
+        await h.session.handlers["openalma:start"]({mode: "continuous"})
+        h.live.audio(testPcm(2))
+        await flush()
+        const stops = h.session.speakerStops
+        release()
+        await flush()
+        expect(h.session.speakerStops).toBe(stops)
+        expect(lastSnapshot(h.session)?.connection).toBe("speaking")
+        expect(h.session.streams.find(stream => stream.aborted)).toBeDefined()
+        expect(h.session.streams.filter(stream => !stream.aborted).flatMap(stream => stream.writes)).toEqual([testPcm(2)])
+      } finally {
+        release()
+        await stop
+        clock.mockRestore()
+        await h.session.handlers["openalma:stop"]({})
+      }
+    })
+  }
+
+  for (const returnToForeground of [true, false]) {
+    test(`reflection SDK close expires at the original ${returnToForeground ? "30s foreground" : "5min background"} deadline and cannot touch a new sitting`, async () => {
+      const h = setup()
+      let release!: () => void
+      const drain = new Promise<void>(resolve => {release = resolve})
+      const messages = sdkSpeaker(h.session, async streamId => {if (streamId === "test-1") await drain})
+      await h.session.handlers["openalma:start"]({mode: "continuous"})
+      h.live.audioOnStop = true
+      const startedAt = 1_000_000
+      let now = startedAt
+      const clock = spyOn(Date, "now").mockImplementation(() => now)
+      const stop = h.session.handlers["openalma:stop"]({})
+      try {
+        await flush()
+        expect(messages.at(-1)?.type).toBe("miniapp_speaker_stream_close")
+        expect(lastSnapshot(h.session)?.connection).toBe("stopping")
+        now += 10_000
+        h.session.onCloseCb!()
+        expect(lastSnapshot(h.session)?.stopDeadlineAt).toBe(startedAt + 300_000)
+        now = startedAt + 45_000
+        h.session.handlers["openalma:visibility"]({visible: false})
+        expect(lastSnapshot(h.session)?.connection).toBe("stopping")
+        if (returnToForeground) h.session.onOpenCb!()
+        else {
+          now = startedAt + 300_001
+          h.session.handlers["openalma:visibility"]({visible: false})
+        }
+        await stop
+        expect(h.session.speakerStops).toBeGreaterThan(0)
+        // Real SDK abort is a no-op once close has settled the writer.
+        expect(messages.some(message => message.type === "miniapp_speaker_stream_abort")).toBe(false)
+        expect(lastSnapshot(h.session)?.connection).toBe("idle")
+        await h.session.handlers["openalma:start"]({mode: "continuous"})
+        h.live.audio(testPcm(2))
+        await flush()
+        const before = [...messages]
+        const stops = h.session.speakerStops
+        release()
+        await flush()
+        expect(messages).toEqual(before)
+        expect(h.session.speakerStops).toBe(stops)
+        expect(lastSnapshot(h.session)?.connection).toBe("speaking")
+        h.live.audio(testPcm(3))
+        await flush()
+        expect(messages.filter(message => message.base64).map(message => [message.streamId, message.base64]))
+          .toEqual([["test-1", silentPcm()], ["test-2", testPcm(2)], ["test-2", testPcm(3)]])
+      } finally {
+        release()
+        await stop
+        clock.mockRestore()
+        await h.session.handlers["openalma:stop"]({})
+      }
+    })
+  }
+
   test("frame RPC routes originals and model copies without sending a deliberate photo", async () => {
     const h = setup()
     const frame = passiveFrame()
@@ -593,7 +790,7 @@ describe("SessionController", () => {
   })
 
   for (const initiallyVisible of [true, false]) {
-    test(`Stop deadlines stay anchored across focus changes (initially ${initiallyVisible ? "visible" : "hidden"})`, async () => {
+    test(`Stop deadlines stay anchored and expiry cannot reopen reflection on hide (initially ${initiallyVisible ? "visible" : "hidden"})`, async () => {
       const h = setup()
       await h.session.handlers["openalma:start"]({mode: "continuous"})
       if (!initiallyVisible) h.session.onCloseCb!()
@@ -623,15 +820,36 @@ describe("SessionController", () => {
         expect(deadline()!).toBeLessThan(now)
         now = startedAt + 290_000
         h.session.onCloseCb!()
-        expect(deadline()).toBe(startedAt + 300_000)
+        expect(deadline()).toBe(startedAt + 30_000)
+        live.audio()
+        await flush()
+        expect(h.session.streams).toEqual([])
+        expect(lastSnapshot(h.session)?.connection).toBe("stopping")
         now = startedAt + 301_000
         h.session.handlers["openalma:visibility"]({visible: false})
-        expect(deadline()).toBeLessThan(now)
+        expect(deadline()).toBe(startedAt + 30_000)
         expect(live.stopDeadlineRefreshes - refreshes).toBe(4)
+
+        release()
+        await stop
+        await h.session.handlers["openalma:start"]({mode: "continuous"})
+        h.live.stopGate = new Promise<void>(resolve => {release = resolve})
+        h.live.audioOnStop = true
+        const nextStop = h.session.handlers["openalma:stop"]({})
+        try {
+          expect(lastSnapshot(h.session)?.stopDeadlineAt).toBe(now + 300_000)
+          expect(h.live.callbacks.getStopDeadline!()).toBe(now + 300_000)
+          await flush()
+          expect(h.session.streams.flatMap(stream => stream.writes)).toEqual([silentPcm()])
+        } finally {
+          release()
+          await nextStop
+        }
       } finally {
         release()
         await stop
         clock.mockRestore()
+        await h.session.handlers["openalma:stop"]({})
       }
     })
   }
@@ -1881,15 +2099,7 @@ describe("SessionController", () => {
     let releaseB!: () => void
     const drainA = new Promise<void>(resolve => {releaseA = resolve})
     const drainB = new Promise<void>(resolve => {releaseB = resolve})
-    const messages: Array<{type: string; streamId: string; base64?: string}> = []
-    let streamId = 0
-    h.session.speaker.createStream = async () => new SpeakerStreamWriter({
-      sendRequest: async (message: typeof messages[number]) => {
-        messages.push(message)
-        if (message.type === "miniapp_speaker_stream_close") await (message.streamId === "test-1" ? drainA : drainB)
-        return {}
-      },
-    } as never, `test-${++streamId}`) as never
+    const messages = sdkSpeaker(h.session, streamId => streamId === "test-1" ? drainA : drainB)
     await h.session.handlers["openalma:start"]({mode: "continuous"})
     try {
       h.live.audio("AAAAAA==")
@@ -2314,6 +2524,7 @@ describe("SessionController", () => {
       manualPhase: "idle",
       microphoneEnabled: true,
       cameraEnabled: true,
+      closingThoughts: true,
       photoRetryPending: false,
       pendingPhotoIds: [],
       photoCaptions: [],

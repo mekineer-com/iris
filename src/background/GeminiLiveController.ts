@@ -578,7 +578,7 @@ export class GeminiLiveController {
     const finish = () => {
       this.candidateFrames = []
       if (this.draining) this.drainResolve?.()
-      if (this.reflecting) this.finishReflection(null)
+      if (this.reflecting) this.finishReflection(this.outputTranscript.trim() || null)
     }
     const remaining = this.drainDeadlineAt - Date.now()
     if (remaining <= 0) finish()

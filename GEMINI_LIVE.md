@@ -150,6 +150,14 @@ inspect the server filing receipt before requesting another caption, even after
 provider resumption. A different photo cannot implicitly discard pending work.
 An optional spoken description remains separate from this internal caption.
 
+The main Start/Stop row has **Closing thoughts**, checked by default and
+remembered in phone-local SDK storage. It controls reflection playback only;
+existing generation/saving rules are unchanged when unchecked. Stop freezes
+the last confirmed choice; a preference save still pending at that moment
+applies to later sittings without delaying Stop or changing speech midstream.
+Ordinary conversation is cut immediately either way. Lifecycle earcons remain
+nonverbal; the preference does not remove the existing Stop beep.
+
 Normal Stop mutes provider output before callbacks and retains the socket/lease
 for a shared 30-second foreground allowance, shown as an inline countdown. While
 Iris lacks focus, the allowance extends to five minutes from the original Stop,
@@ -158,6 +166,13 @@ immediately. Work may finish early; no compulsory delay or popup is added.
 The same deadline caps reflection. Native UI close/open and WebView visibility
 update the actual provider deadline, not only its display. Hidden execution is
 not guaranteed by the host; the absolute deadline is checked on return.
+The speaker wait is capped too, including pending creation, retirement and
+final playback. Expiry explicitly stops host playback and invalidates the old
+writer epoch without awaiting a stalled SDK close (abort is a no-op once that
+writer is settled). Neither late completion nor a later visibility change may
+reopen an expired budget or affect the next sitting. Actual reflection text
+available at expiry is retained through `sitting_summary`, without the
+transcript-only `status` field.
 Continuous Stop flushes existing
 audio with 1.8 seconds of real-time-paced silence and `audioStreamEnd`, then
 waits for the preceding response's native completion before a new image

@@ -22,6 +22,7 @@ export interface Channels {
   "openalma:set-profile": Rpc<OpenAlmaProfile, {ok: true}>
   "openalma:start": Rpc<{mode: SessionMode}, {ok: true}>
   "openalma:stop": Rpc<Record<string, never>, {ok: true}>
+  "openalma:set-closing-thoughts": Rpc<{enabled: boolean}, {ok: true}>
   "openalma:set-soul": Rpc<{soulId: string; useExisting: boolean}, SelectSoulResult>
   "openalma:set-mode": Rpc<{mode: SessionMode}, {ok: true}>
   "openalma:set-capabilities": Rpc<{

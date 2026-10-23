@@ -19,6 +19,13 @@ type Node = {props: Record<string, any>}
 const nodes = (tree: any): any[] => !tree || typeof tree !== "object" ? []
   : Array.isArray(tree) ? tree.flatMap(nodes) : [tree, ...nodes(tree.props?.children)]
 
+function labelledCheckbox(tree: any, text: string) {
+  const label = nodes(tree).find(node => node.type === "label" &&
+    (Array.isArray(node.props.children) ? node.props.children : [node.props.children])
+      .some((child: unknown) => typeof child === "string" && child.trim() === text))
+  return nodes(label).find(node => node.type === "input" && node.props.type === "checkbox")
+}
+
 function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Promise<unknown>, now?: number) {
   if (!("startGeneration" in snapshot)) Object.assign(snapshot, {startGeneration: 1})
   if (!("pendingPhotoIds" in snapshot)) Object.assign(snapshot, {pendingPhotoIds: ["local-photo"]})
@@ -53,6 +60,87 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
 }
 
 describe("SessionPage state projection", () => {
+  test("Closing thoughts lives beside Start/Stop, defaults checked, and follows the remembered snapshot", () => {
+    const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
+      soulConfirmed: true, connection: "idle", closingThoughts: undefined as boolean | undefined}
+    const render = renderPage(snapshot, async () => ({ok: true}))
+    const row = nodes(render()).find(node => node.props?.className === "sitting-controls")
+    expect(nodes(row).some(node => node.props?.className === "sitting-button")).toBe(true)
+    expect(labelledCheckbox(row, "Closing thoughts").props.checked).toBe(true)
+    const settings = nodes(render()).find(node => node.props?.id === "iris-settings")
+    expect(labelledCheckbox(settings, "Closing thoughts")).toBeUndefined()
+    for (const connection of ["idle", "listening", "speaking", "starting", "stopping"]) {
+      snapshot.connection = connection
+      snapshot.closingThoughts = false
+      const checkbox = labelledCheckbox(render(), "Closing thoughts")
+      expect(checkbox.props.checked).toBe(false)
+      expect(checkbox.props.disabled).toBe(["starting", "stopping"].includes(connection))
+    }
+  })
+
+  for (const fails of [true, false]) {
+    test(`pending Closing thoughts ${fails ? "failure" : "success"} locks only its checkbox, not Stop`, async () => {
+      const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
+        soulConfirmed: true, connection: "listening", closingThoughts: true}
+      let resolve!: () => void
+      let reject!: (error: Error) => void
+      const pending = new Promise<void>((res, rej) => {resolve = res; reject = rej})
+      const calls: Array<{channel: string; payload: unknown}> = []
+      const render = renderPage(snapshot, async (channel, payload) => {
+        calls.push({channel, payload})
+        if (channel === "openalma:set-closing-thoughts") return pending
+        return {ok: true}
+      })
+      labelledCheckbox(render(), "Closing thoughts").props.onChange({target: {checked: false}})
+      expect(calls).toEqual([{channel: "openalma:set-closing-thoughts", payload: {enabled: false}}])
+      expect(labelledCheckbox(render(), "Closing thoughts").props).toMatchObject({disabled: true, checked: true})
+      expect(labelledCheckbox(render(), "Microphone enabled").props.disabled).toBe(false)
+      const stop = nodes(render()).find(node => node.props?.className === "sitting-button")
+      expect(stop.props.disabled).toBe(false)
+      stop.props.onClick()
+      expect(calls.at(-1)?.channel).toBe("openalma:stop")
+      if (fails) reject(new Error("Fictional preference storage failure"))
+      else resolve()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(labelledCheckbox(render(), "Closing thoughts").props).toMatchObject({disabled: false, checked: true})
+      if (fails) expect(JSON.stringify(render())).toContain("Fictional preference storage failure")
+      else {
+        snapshot.closingThoughts = false
+        expect(labelledCheckbox(render(), "Closing thoughts").props.checked).toBe(false)
+      }
+    })
+  }
+
+  for (const active of [true, false]) {
+    test(`Closing thoughts is locked while the ${active ? "Stop" : "Start"} RPC is pending`, async () => {
+      const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
+        soulConfirmed: true, soulLocked: false, connection: active ? "listening" : "idle"}
+      let release!: () => void
+      const pending = new Promise<void>(resolve => {release = resolve})
+      const calls: string[] = []
+      const render = renderPage(snapshot, async channel => {
+        if (channel === "openalma:set-soul") return {soulId: "Quill", created: false}
+        calls.push(channel)
+        await pending
+        return {ok: true}
+      })
+      if (!active) {
+        nodes(render()).find(node => node.props?.onFocus).props.onChange({target: {value: "Quill"}})
+        nodes(render()).find(node => node.props?.["aria-label"] === "Use soul").props.onClick()
+        await new Promise(resolve => setTimeout(resolve, 0))
+      }
+      nodes(render()).find(node => node.props?.className === "sitting-button").props.onClick()
+      try {
+        expect(calls).toEqual([active ? "openalma:stop" : "openalma:start"])
+        expect(labelledCheckbox(render(), "Closing thoughts").props.disabled).toBe(true)
+      } finally {
+        release()
+        await new Promise(resolve => setTimeout(resolve, 0))
+      }
+      expect(labelledCheckbox(render(), "Closing thoughts").props.disabled).toBe(false)
+    })
+  }
+
   test("a picker opened before restart cannot attach its photo to the replacement sitting", async () => {
     const calls: string[] = []
     const snapshot = {configured: true, startGeneration: 1, soulId: "Quill", souls: ["Quill"],
@@ -320,7 +408,7 @@ describe("SessionPage state projection", () => {
           return nodes(render()).find(node => node.props?.type === "file").props.onChange({currentTarget: {
           files: [new File([new Uint8Array([1, 2, 3])], "fictional.png", {type: "image/png"})], value: "",
         }})}
-        const settingError = () => nodes(render()).find(node => node.props?.type === "checkbox").props.onChange({target: {checked: false}})
+        const settingError = () => labelledCheckbox(render(), "Microphone enabled").props.onChange({target: {checked: false}})
         const finishOld = () => fails ? pending[0].reject(new Error("Old photo failed")) : pending[0].resolve()
 
         nodes(render()).find(node => node.props?.onFocus).props.onChange({target: {value: "Quill"}})

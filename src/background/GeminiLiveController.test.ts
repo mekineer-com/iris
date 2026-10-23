@@ -922,6 +922,28 @@ describe("GeminiLiveController", () => {
     expect(h.sockets[0].readyState).toBe(3)
   })
 
+  test("deadline-cut closing thoughts preserve actual text through the existing summary contract", async () => {
+    let deadline = Date.now() + 1_000
+    const h = harness({getStopDeadline: () => deadline, storage: new FakeStorage()})
+    await start(h)
+    completeTurn(h, "A fictional morning.", "A bright one.")
+    completeTurn(h, "A fictional evening.", "A calm one.")
+    const stopping = h.controller.stop(true)
+    try {
+      await waitFor(() => h.sockets[0].sent.some(value => value.includes("Reflect briefly")))
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "I enjoyed our fictional walk"},
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
+      deadline = Date.now() - 1
+      h.controller.refreshStopDeadline()
+      await stopping
+      const summaries = h.requests.flatMap(request => request.body.events ?? []).filter(event => event.event_kind === "sitting_summary")
+      expect(summaries).toHaveLength(1)
+      expect(summaries[0]).toMatchObject({role: "assistant", content: "I enjoyed our fictional walk"})
+      expect(summaries[0]).not.toHaveProperty("status")
+      expect(h.errors).toEqual([])
+    } finally { deadline = Date.now() - 1; h.controller.refreshStopDeadline(); await stopping }
+  })
+
   test.each(["Snapshot image id conflicts", "Soul is paused"])("only a confirmed original conflict permits a new reference (%s)", async detail => {
     const h = harness({storage: new FakeStorage(), snapshotResponse: Response.json({detail}, {status: 409})})
     await start(h)

@@ -42,6 +42,7 @@ export type FrameIntakeResult =
   | {retained: false; delivery: "not-sent"; reason: "unavailable" | "full"}
 
 export interface SessionSnapshot {
+  closingThoughts: boolean
   frameDeliveryOpen: boolean
   stopDeadlineAt: number | null
   startGeneration: number

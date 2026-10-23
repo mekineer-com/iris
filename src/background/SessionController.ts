@@ -51,6 +51,7 @@ const MAX_MANUAL_AUDIO_BYTES = 16000 * 2 * 120
 const MANUAL_LIMIT_MESSAGE = "Manual recording reached 120-second limit"
 const MICROPHONE_ENABLED_KEY = "openalma.microphone-enabled"
 const CAMERA_ENABLED_KEY = "openalma.camera-enabled"
+const CLOSING_THOUGHTS_KEY = "openalma.closing-thoughts"
 const SOUL_ID_KEY = "openalma.soul-id"
 
 function trace(event: string, detail: Record<string, unknown> = {}): void {
@@ -61,6 +62,8 @@ function trace(event: string, detail: Record<string, unknown> = {}): void {
 export class SessionController {
   private foreground = true
   private stopStartedAt: number | null = null
+  private stopExpiredAt: number | null = null
+  private stopPlayback: {timer: ReturnType<typeof setTimeout> | null; expire: () => void} | null = null
   private started = false
   private readonly unsubs: Array<() => void> = []
   private send: Send | null = null
@@ -77,6 +80,8 @@ export class SessionController {
   private manualPhase: ManualPhase = "idle"
   private microphoneEnabled = true
   private cameraEnabled = true
+  private closingThoughts = true
+  private closingThoughtsAtStop = true
   private preferencesLoaded: Promise<void> = Promise.resolve()
   private photoRetryPending = false
   private photoCaptions: SessionSnapshot["photoCaptions"] = []
@@ -304,6 +309,16 @@ export class SessionController {
         return {ok: true as const}
       }),
     )
+    this.unsubs.push(ui.handle("openalma:set-closing-thoughts", async payload => {
+      await this.preferencesLoaded
+      const enabled = (payload as {enabled?: unknown} | null)?.enabled
+      if (typeof enabled !== "boolean") throw new Error("Invalid Closing thoughts setting")
+      if (this.teardownPromise || this.connection === "stopping") throw new Error("Wait for this sitting to finish")
+      await this.session.storage.set(CLOSING_THOUGHTS_KEY, enabled ? "1" : "0")
+      this.closingThoughts = enabled
+      this.pushSnapshot()
+      return {ok: true as const}
+    }))
     this.unsubs.push(
       ui.handle("openalma:set-capabilities", async (payload) => {
         await this.preferencesLoaded
@@ -440,6 +455,7 @@ export class SessionController {
 
   private snapshot(): SessionSnapshot {
     return {
+      closingThoughts: this.connection === "stopping" ? this.closingThoughtsAtStop : this.closingThoughts,
       frameDeliveryOpen: this.foreground && this.cameraEnabled &&
         (this.connection === "listening" || this.connection === "speaking") &&
         this.liveController?.frameDeliveryOpen === true,
@@ -666,6 +682,8 @@ export class SessionController {
     this.liveController?.muteForStop()
     this.connection = "stopping"
     this.stopStartedAt = kind === "stop" ? Date.now() : null
+    this.stopExpiredAt = null
+    this.closingThoughtsAtStop = this.closingThoughts
     this.teardownKind = kind
     this.startGeneration += 1
     this.startInFlight = false
@@ -716,6 +734,7 @@ export class SessionController {
     }
     this.teardownKind = "stop"
     this.teardownPromise = this.runTeardown().finally(() => {
+      this.clearStopPlaybackDeadline()
       this.teardownPromise = null
     })
     await this.teardownPromise
@@ -726,6 +745,7 @@ export class SessionController {
     this.lastError = error instanceof Error ? error.message : String(error)
     this.teardownKind = "fail"
     this.teardownPromise = this.runTeardown().finally(() => {
+      this.clearStopPlaybackDeadline()
       this.teardownPromise = null
     })
     await this.teardownPromise
@@ -736,13 +756,18 @@ export class SessionController {
     const generation = this.beginTeardown(this.teardownKind ?? "fail")
     trace("session.stop.begin", {kind: this.teardownKind, graceful})
     this.pushSnapshot()
-    await this.abortCurrentWriter()
+    const playbackDeadline = graceful ? this.armStopPlaybackDeadline() : null
+    const retirement = this.abortCurrentWriter()
+    await (playbackDeadline ? Promise.race([retirement, playbackDeadline]) : retirement)
     trace("session.speaker.aborted")
     await this.stopLiveController(graceful)
     trace("session.provider.stopped")
-    if (graceful) {
-      await this.speechFinishTail
-      await this.finishSpeech()
+    if (graceful && this.closingThoughtsAtStop) {
+      const epoch = this.speakerEpoch
+      const playback = this.speechFinishTail.then(() => {
+        if (epoch === this.speakerEpoch) return this.finishSpeech()
+      })
+      await Promise.race([playback, playbackDeadline!])
     } else {
       this.speechFinishTail = Promise.resolve()
     }
@@ -776,13 +801,46 @@ export class SessionController {
 
   private stopDeadline(): number | null {
     return this.connection === "stopping" && this.stopStartedAt !== null
-      ? this.stopStartedAt + (this.foreground ? STOP_FOREGROUND_MS : STOP_BACKGROUND_MS) : null
+      ? this.stopExpiredAt ?? this.stopStartedAt + (this.foreground ? STOP_FOREGROUND_MS : STOP_BACKGROUND_MS) : null
   }
 
   private setForeground(visible: boolean): void {
+    if (this.stopPlayback && this.stopDeadline()! <= Date.now()) this.stopPlayback.expire()
     this.foreground = visible
     this.liveController?.refreshStopDeadline()
+    this.refreshStopPlaybackDeadline()
     this.pushSnapshot()
+  }
+
+  private armStopPlaybackDeadline(): Promise<void> {
+    return new Promise(resolve => {
+      const pending = {timer: null as ReturnType<typeof setTimeout> | null, expire: () => {
+        if (this.stopPlayback !== pending) return
+        this.stopExpiredAt = this.stopDeadline()
+        this.clearStopPlaybackDeadline()
+        this.speakerEpoch += 1
+        // SDK abort cannot stop a writer after close() has marked it settled.
+        try { this.session.speaker.stop() } catch { /* host may already be stopped */ }
+        void this.abortCurrentWriter()
+        resolve()
+      }}
+      this.stopPlayback = pending
+      this.refreshStopPlaybackDeadline()
+    })
+  }
+
+  private refreshStopPlaybackDeadline(): void {
+    const pending = this.stopPlayback
+    if (!pending) return
+    if (pending.timer !== null) clearTimeout(pending.timer)
+    const remaining = this.stopDeadline()! - Date.now()
+    if (remaining <= 0) pending.expire()
+    else pending.timer = setTimeout(pending.expire, remaining)
+  }
+
+  private clearStopPlaybackDeadline(): void {
+    if (this.stopPlayback?.timer) clearTimeout(this.stopPlayback.timer)
+    this.stopPlayback = null
   }
 
   reportInstallationError(): void {
@@ -877,6 +935,7 @@ export class SessionController {
 
   private onGeminiAudio(base64Pcm: string): void {
     const reflection = this.connection === "stopping" && this.teardownKind === "stop"
+    if (reflection && (!this.closingThoughtsAtStop || this.stopExpiredAt !== null || this.stopDeadline()! <= Date.now())) return
     if (this.connection === "starting") {
       this.startupAudio.push(base64Pcm)
       return
@@ -1035,10 +1094,11 @@ export class SessionController {
   ): Promise<void> {
     let storedSoul: string | null = null
     try {
-      let [storedProfile, microphone, camera, savedSoul, journal] = await Promise.all([
+      let [storedProfile, microphone, camera, closingThoughts, savedSoul, journal] = await Promise.all([
         this.session.storage.get(OPENALMA_PROFILE_KEY),
         this.session.storage.get(MICROPHONE_ENABLED_KEY),
         this.session.storage.get(CAMERA_ENABLED_KEY),
+        this.session.storage.get(CLOSING_THOUGHTS_KEY),
         this.session.storage.get(SOUL_ID_KEY),
         readSessionJournal(this.session.storage),
       ])
@@ -1071,6 +1131,7 @@ export class SessionController {
       storedSoul = savedSoul
       this.microphoneEnabled = microphone !== "0"
       this.cameraEnabled = camera !== "0"
+      this.closingThoughts = closingThoughts !== "0"
       this.soulId = storedSoul?.trim() || config.soulId
       if (!journal.unreadable) this.recoverySoulId = journalSoulId(journal.raw, config)
       if (this.recoverySoulId) this.soulId = this.recoverySoulId

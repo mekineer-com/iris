@@ -293,6 +293,25 @@ button:disabled {
   background: var(--ink);
 }
 
+.sitting-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.closing-thoughts {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 2.75rem;
+}
+
+.closing-thoughts input {
+  width: auto;
+  margin: 0;
+}
+
 .recording-button {
   border-color: #a4412b;
   background: #a4412b;

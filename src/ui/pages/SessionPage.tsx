@@ -87,6 +87,7 @@ export default function SessionPage() {
   const profileRpc = useRpc<Channels, "openalma:set-profile">("openalma:set-profile")
   const startRpc = useRpc<Channels, "openalma:start">("openalma:start")
   const stopRpc = useRpc<Channels, "openalma:stop">("openalma:stop")
+  const closingThoughtsRpc = useRpc<Channels, "openalma:set-closing-thoughts">("openalma:set-closing-thoughts")
   const soulRpc = useRpc<Channels, "openalma:set-soul">("openalma:set-soul")
   const modeRpc = useRpc<Channels, "openalma:set-mode">("openalma:set-mode")
   const capabilitiesRpc = useRpc<Channels, "openalma:set-capabilities">("openalma:set-capabilities")
@@ -96,6 +97,7 @@ export default function SessionPage() {
   const pendingImageRpc = useRpc<Channels, "openalma:pending-image">("openalma:pending-image")
   const [startPending, setStartPending] = useState(false)
   const [stopPending, setStopPending] = useState(false)
+  const [closingThoughtsPending, setClosingThoughtsPending] = useState(false)
   const [stopNow, setStopNow] = useState(Date.now)
   const [soulName, setSoulName] = useState("")
   const [soulDirty, setSoulDirty] = useState(true)
@@ -163,6 +165,7 @@ export default function SessionPage() {
   const photoRetryPending = snapshot?.photoRetryPending ?? false
   const microphoneEnabled = snapshot?.microphoneEnabled ?? true
   const cameraEnabled = snapshot?.cameraEnabled ?? true
+  const closingThoughts = snapshot?.closingThoughts ?? true
   const visible = visibleConnection(connection, startPending, stopPending)
   const starting = visible === "starting"
   const stopping = visible === "stopping"
@@ -316,6 +319,18 @@ export default function SessionPage() {
       setRpcError(error instanceof Error ? error.message : String(error))
     } finally {
       setCapabilitiesPending(false)
+    }
+  }
+
+  const onClosingThoughts = async (enabled: boolean) => {
+    setRpcError(null)
+    setClosingThoughtsPending(true)
+    try {
+      await closingThoughtsRpc({enabled})
+    } catch (error) {
+      setRpcError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setClosingThoughtsPending(false)
     }
   }
 
@@ -555,14 +570,22 @@ export default function SessionPage() {
         {soulLocked ? <p>Finish this sitting before changing souls.</p> : null}
       </section>
       <section className="controls" aria-label="Voice controls">
-        <button
-          type="button"
-          className="sitting-button"
-          disabled={sittingDisabled}
-          onClick={() => void (active ? onStop() : onStart())}
-        >
-          {sittingLabel}
-        </button>
+        <div className="sitting-controls">
+          <button
+            type="button"
+            className="sitting-button"
+            disabled={sittingDisabled}
+            onClick={() => void (active ? onStop() : onStart())}
+          >
+            {sittingLabel}
+          </button>
+          <label className="closing-thoughts">
+            <input type="checkbox" aria-label="Closing thoughts" checked={closingThoughts}
+              disabled={closingThoughtsPending || starting || stopping}
+              onChange={event => void onClosingThoughts(event.target.checked)} />
+            Closing thoughts
+          </label>
+        </div>
         {mode === "manual" && voiceReady ? (
           <div className="manual-controls">
             {manualPhase === "idle" ? (
