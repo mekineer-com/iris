@@ -17,7 +17,7 @@ export function stampImage(
   context.imageSmoothingQuality = "high"
   context.drawImage(original, 0, 0, copy.width, copy.height)
   // Preserve the tested 28px/768px layout at the chosen model-copy resolution.
-  let fontSize = Math.min(Math.round(28 * Math.max(copy.width, copy.height) / 768), copy.height - 12)
+  let fontSize = Math.min(Math.round(28 * maxLongEdge / 768), copy.height - 12)
   if (fontSize < 10) throw new Error("Image is too small for its reference")
   context.font = `bold ${fontSize}px sans-serif`
   const available = copy.width - 24

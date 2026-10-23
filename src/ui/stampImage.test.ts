@@ -35,6 +35,15 @@ test("fits the full suffix-bearing reference inside a portrait model copy", () =
   expect(h.context.fillText.mock.calls[0][0]).toBe(reference)
 })
 
+test("fits a readable reference on a 256px original without upscaling it", () => {
+  const h = harness(256, 256)
+  stampImage(h.original as unknown as HTMLCanvasElement, reference, 768, h.page)
+  expect(h.copy).toMatchObject({width: 256, height: 256})
+  expect(parseInt(h.context.font.slice(5))).toBeGreaterThanOrEqual(10)
+  expect(h.context.measureText(reference).width + 24).toBeLessThanOrEqual(256)
+  expect(h.context.fillText).toHaveBeenCalledWith(reference, 12, 8)
+})
+
 test("uses decoded image dimensions rather than a styled preview size", () => {
   const h = harness()
   const image = {...h.original, width: 100, height: 50, naturalWidth: 640, naturalHeight: 480}
