@@ -3,14 +3,8 @@ import "exifr/src/dicts/tiff-exif-keys.mjs"
 import "exifr/src/file-parsers/png.mjs"
 
 import {formatImageTimestamp} from "../shared/imageReference"
-
-export interface ImageTime {
-  timestamp: string
-  source: "DateTimeOriginal" | "CreateDate" | "receipt"
-  receivedAt: number
-  originalTime?: string
-  offset?: string
-}
+import type {ImageTime} from "../shared/types"
+export type {ImageTime} from "../shared/types"
 
 export async function readImageTime(file: Pick<File, "arrayBuffer">, receivedAt: number): Promise<ImageTime> {
   const receipt: ImageTime = {timestamp: formatImageTimestamp(receivedAt), source: "receipt", receivedAt}

@@ -345,25 +345,17 @@ export default function SessionPage() {
     setLargeImageWarningDismissed(true)
   }
 
-  const handleStoredPhoto = async (action: "retry" | "discard", imageId?: string) => {
-    const local = imageId === undefined || snapshot?.pendingPhotoIds.includes(imageId)
-    const ownerRef = local ? imageOwner : filingOwner
-    const owner = ++ownerRef.current
-    if (local) setImagePending(true)
-    else setFilingPending(imageId)
+  const handleStoredPhoto = async (action: "retry" | "discard", imageId: string) => {
+    const owner = ++filingOwner.current
+    setFilingPending(imageId)
     setRpcError(null)
     try {
-      await pendingImageRpc({action, ...(imageId === undefined ? {} : {imageId})})
-      if (owner !== ownerRef.current) return
-      if (action === "discard" && local) setImageStatus(null)
+      await pendingImageRpc({action, imageId})
     } catch (error) {
-      if (owner !== ownerRef.current) return
+      if (owner !== filingOwner.current) return
       setRpcError(error instanceof Error ? error.message : String(error))
     } finally {
-      if (owner === ownerRef.current) {
-        if (local) setImagePending(false)
-        else setFilingPending(null)
-      }
+      if (owner === filingOwner.current) setFilingPending(null)
     }
   }
 
@@ -615,8 +607,8 @@ export default function SessionPage() {
           {snapshot?.pendingPhotoIds.map(imageId => (
             <div className="image-review" key={imageId}>
               <span>{imageId}</span>
-              <button type="button" disabled={imagePending || stopping || !voiceReady} onClick={() => void handleStoredPhoto("retry", imageId)}>Retry</button>
-              <button type="button" disabled={imagePending || stopping || !voiceReady} onClick={() => void handleStoredPhoto("discard", imageId)}>Discard</button>
+              <button type="button" disabled={filingPending !== null || imagePending || stopping || !voiceReady} onClick={() => void handleStoredPhoto("retry", imageId)}>Retry</button>
+              <button type="button" disabled={filingPending !== null || imagePending || stopping || !voiceReady} onClick={() => void handleStoredPhoto("discard", imageId)}>Discard</button>
             </div>
           ))}
         </div>

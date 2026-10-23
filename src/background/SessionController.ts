@@ -2,7 +2,8 @@ import type {AudioChunkData, MiniappSession, UnsubscribeFn} from "@mentra/miniap
 import {makeRequestId} from "@mentra/miniapp"
 
 import type {Channels} from "../shared/channels"
-import type {ImageRequest} from "../shared/channels"
+import type {ImageReferenceRequest, ImageRequest} from "../shared/channels"
+import {formatImageTimestamp, nextImageReference} from "../shared/imageReference"
 import {MIC_SOURCES, type MicSource} from "../shared/types"
 import type {
   ConnectionState,
@@ -13,7 +14,7 @@ import type {
   SessionSnapshot,
 } from "../shared/types"
 import {approxBase64ByteLength, normalizePcm16Audio} from "./audioHelpers"
-import {GeminiLiveController, journalSoulId, readSessionJournal} from "./GeminiLiveController"
+import {GeminiLiveController, journalImageIds, journalSoulId, readSessionJournal, readStoredValue, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
 import type {GeminiCallbacks} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {
@@ -87,6 +88,7 @@ export class SessionController {
   private durationWarning = false
   private startInFlight = false
   private startGeneration = 0
+  private imageReferenceTail: Promise<void> = Promise.resolve()
   private speakerEpoch = 0
   private speakerWriter: SpeakerWriter | null = null
   private speakerOpenPromise: Promise<SpeakerWriter | null> | null = null
@@ -258,28 +260,21 @@ export class SessionController {
         const imageId = (payload as {imageId?: unknown} | null)?.imageId
         await this.preferencesLoaded
         if (action !== "retry" && action !== "discard") throw new Error("Unknown pending photo action")
-        if (imageId !== undefined) {
-          if (typeof imageId !== "string") throw new Error("Unknown failed photo")
-          if (this.liveController?.pendingPhotoIds.includes(imageId)) {
-            if (action === "retry") await this.liveController.retryImage(imageId)
-            else await this.liveController.discardImage(imageId)
-            return {ok: true as const}
-          }
-          if (!this.failedPhotos.includes(imageId)) throw new Error("Unknown failed photo")
-          const config = this.currentConfig()
-          const soulId = this.soulId
-          const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/photos/${encodeURIComponent(imageId)}/${action}`, {
-            method: "POST", signal: timeoutSignal(10_000), headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({user_id: config.userId, soul_id: soulId}),
-          })
-          if (!response.ok) throw new Error(`Photo ${action} failed (${response.status})`)
-          if (this.soulId === soulId && this.config?.baseUrl === config.baseUrl) await this.refreshFailedPhotos()
+        if (typeof imageId !== "string" || !imageId) throw new Error("Choose a photo to retry or discard")
+        if (this.liveController?.pendingPhotoIds.includes(imageId)) {
+          if (action === "retry") await this.liveController.retryImage(imageId)
+          else await this.liveController.discardImage(imageId)
           return {ok: true as const}
         }
-        if (!this.liveController) throw new Error("Start Iris to retry or discard the pending photo")
-        if (action === "retry") await this.liveController.retryImage()
-        else if (action === "discard") await this.liveController.discardImage()
-        else throw new Error("Unknown pending photo action")
+        if (!this.failedPhotos.includes(imageId)) throw new Error("Unknown failed photo")
+        const config = this.currentConfig()
+        const soulId = this.soulId
+        const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/photos/${encodeURIComponent(imageId)}/${action}`, {
+          method: "POST", signal: timeoutSignal(10_000), headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({user_id: config.userId, soul_id: soulId}),
+        })
+        if (!response.ok) throw new Error(`Photo ${action} failed (${response.status})`)
+        if (this.soulId === soulId && this.config?.baseUrl === config.baseUrl) await this.refreshFailedPhotos()
         return {ok: true as const}
       }),
     )
@@ -342,6 +337,12 @@ export class SessionController {
         }
         this.handleManualAction(action)
         return {ok: true as const}
+      }),
+    )
+    this.unsubs.push(
+      ui.handle("openalma:reserve-image", async payload => {
+        await this.preferencesLoaded
+        return this.reserveImageReference(payload as ImageReferenceRequest)
       }),
     )
     this.unsubs.push(
@@ -430,6 +431,41 @@ export class SessionController {
       usageTotalTokens: this.usageTotalTokens,
       durationWarning: this.durationWarning,
     }
+  }
+
+  private reserveImageReference(payload: ImageReferenceRequest): Promise<{startGeneration: number; imageId: string}> {
+    const config = this.currentConfig()
+    const soulId = this.soulId
+    const generation = payload?.startGeneration
+    const current = () => this.config === config && this.soulId === soulId && generation === this.startGeneration &&
+      this.cameraEnabled && (this.connection === "listening" || this.connection === "speaking")
+    const reservation = this.imageReferenceTail.then(async () => {
+      if (!current()) throw new Error("Photo reservation belongs to an inactive sitting")
+      const timestamp = payload?.time?.timestamp
+      if (typeof timestamp !== "string" || timestamp !== formatImageTimestamp(timestamp)) throw new Error("Invalid image timestamp")
+      const key = `openalma:image-references:${JSON.stringify([config.userId, soulId, timestamp.slice(0, 10)])}`
+      const [raw, recovered] = await Promise.all([
+        readStoredValue(this.session.storage, key), readStoredValue(this.session.storage, RECOVERED_CHATS_KEY),
+      ])
+      if (!current()) throw new Error("Photo reservation belongs to an inactive sitting")
+      const counters = raw === null ? {} : JSON.parse(raw)
+      if (!counters || typeof counters !== "object" || Array.isArray(counters)) throw new Error("Invalid image naming state")
+      const knownIds = [...(this.liveController?.pendingImageIds ?? [])]
+      let archives: unknown
+      try {archives = JSON.parse(recovered ?? "[]")} catch {archives = null}
+      const entries = Array.isArray(archives) ? archives : recovered === null ? [] : [recovered]
+      for (const entry of entries) {
+        if (typeof entry === "string") knownIds.push(...journalImageIds(entry, {userId: config.userId, soulId}))
+      }
+      const second = timestamp.slice(11)
+      const next = nextImageReference(timestamp, counters[second] === undefined ? 0 : counters[second], knownIds)
+      counters[second] = next.suffix
+      await this.session.storage.set(key, JSON.stringify(counters))
+      if (!current()) throw new Error("Photo reservation belongs to an inactive sitting")
+      return {startGeneration: generation, imageId: next.imageId}
+    })
+    this.imageReferenceTail = reservation.then(() => {}, () => {})
+    return reservation
   }
 
   private pushSnapshot(): void {

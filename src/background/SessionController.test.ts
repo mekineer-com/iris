@@ -1,7 +1,7 @@
 import {describe, expect, test} from "bun:test"
 
 import type {GeminiCallbacks} from "./GeminiLiveController"
-import {GeminiLiveController, JOURNAL_KEY} from "./GeminiLiveController"
+import {GeminiLiveController, JOURNAL_KEY, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {SessionController} from "./SessionController"
 import type {MicSource, SessionSnapshot as Snapshot} from "../shared/types"
@@ -48,6 +48,7 @@ class FakeLive {
   imageRetryIds: Array<string | undefined> = []
   imageDiscardIds: Array<string | undefined> = []
   pendingPhotoIds: string[] = []
+  pendingImageIds: string[] = []
   activityError: Error | null = null
   startGate: Promise<void> | null = null
   stopGate: Promise<void> | null = null
@@ -303,6 +304,119 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
 }
 
 describe("SessionController", () => {
+  test("phone reservations serialize collisions and remember older dates across sittings and Souls", async () => {
+    const h = setup()
+    const time = {timestamp: "2026-01-08T10-17-23", source: "DateTimeOriginal",
+      originalTime: "2026:01:08 10:17:23", receivedAt: Date.UTC(2026, 9, 22)}
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const reserve = (timestamp = time.timestamp) => h.session.handlers["openalma:reserve-image"]({
+      startGeneration: lastSnapshot(h.session)!.startGeneration, time: {...time, timestamp},
+    })
+    const first = await Promise.all([reserve(), reserve(), reserve()])
+    expect(first.map(result => result.imageId)).toEqual([time.timestamp, `${time.timestamp}-2`, `${time.timestamp}-3`])
+    expect((await reserve("2026-10-22T12-00-00")).imageId).toBe("2026-10-22T12-00-00")
+    expect((await reserve()).imageId).toBe(`${time.timestamp}-4`)
+    await h.session.handlers["openalma:stop"]({})
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    expect((await reserve()).imageId).toBe(`${time.timestamp}-5`)
+    await h.session.handlers["openalma:stop"]({})
+    await h.session.handlers["openalma:set-soul"]({soulId: "Another Soul", useExisting: false})
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    expect((await reserve()).imageId).toBe(time.timestamp)
+    expect([...h.session.stored.keys()].filter(key => key.startsWith("openalma:image-references:"))).toHaveLength(3)
+    expect(h.live.images).toEqual([])
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test.each(["pending", "v1", "v2", "v3"])("phone naming includes the highest reservation from %s", async highest => {
+    const timestamp = "2026-01-08T10-17-23"
+    const record = (version: number, suffix: number, soulId = CONFIG.soulId) => JSON.stringify({version,
+      scope: {userId: CONFIG.userId, soulId},
+      ...(version === 3 ? {pendingImages: [{imageId: `${timestamp}-${suffix}`}]} : {pendingImage: {imageId: `${timestamp}-${suffix}`}}),
+    })
+    const h = setup({stored: {[RECOVERED_CHATS_KEY]: JSON.stringify([
+      record(1, highest === "v1" ? 8 : 3), record(2, highest === "v2" ? 8 : 4), record(3, highest === "v3" ? 8 : 6),
+      record(3, 99, "Other Soul"), "unreadable historical backup",
+    ])}})
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const pendingId = `${timestamp}-${highest === "pending" ? 8 : 2}`
+    h.live.pendingImageIds = [pendingId]
+    expect(h.live.pendingPhotoIds).toEqual([])
+    const result = await h.session.handlers["openalma:reserve-image"]({startGeneration: 1,
+      time: {timestamp, source: "receipt", receivedAt: 1}})
+    expect(result).toEqual({startGeneration: 1, imageId: `${timestamp}-9`})
+    expect(h.live.pendingImageIds).toEqual([pendingId])
+    expect(h.session.stored.get(RECOVERED_CHATS_KEY)).toContain("unreadable historical backup")
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test.each(["naming", "recovered"])("an unreadable existing %s key cannot reset a reservation", async unreadable => {
+    const timestamp = "2026-01-08T10-17-23"
+    const key = `openalma:image-references:${JSON.stringify([CONFIG.userId, CONFIG.soulId, "2026-01-08"])}`
+    const h = setup({stored: {[key]: JSON.stringify({"10-17-23": 4}), [RECOVERED_CHATS_KEY]: "[]"}})
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const get = h.session.storage.get
+    h.session.storage.get = async name => name === (unreadable === "naming" ? key : RECOVERED_CHATS_KEY) ? null : get(name)
+    try {
+      await expect(h.session.handlers["openalma:reserve-image"]({startGeneration: 1,
+        time: {timestamp, source: "receipt", receivedAt: 1}})).rejects.toThrow("could not be read")
+      expect(h.session.stored.get(key)).toBe(JSON.stringify({"10-17-23": 4}))
+      expect(h.session.stored.get(RECOVERED_CHATS_KEY)).toBe("[]")
+    } finally {
+      h.session.storage.get = get
+      await h.session.handlers["openalma:stop"]({})
+    }
+  })
+
+  test("reservation persists before reply and rejects a Stop during its write without reclaiming the suffix", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    let release!: () => void
+    let entered!: () => void
+    const gate = new Promise<void>(resolve => {release = resolve})
+    const writing = new Promise<void>(resolve => {entered = resolve})
+    const set = h.session.storage.set
+    h.session.storage.set = async (key, value) => {
+      if (key.startsWith("openalma:image-references:")) {entered(); await gate}
+      await set(key, value)
+    }
+    const time = {timestamp: "2026-01-08T10-17-23", source: "receipt", receivedAt: 1}
+    let replied = false
+    const reservation = h.session.handlers["openalma:reserve-image"]({startGeneration: 1, time})
+    const outcome = reservation.then(() => {replied = true; return null}, error => error)
+    await writing
+    expect(replied).toBe(false)
+    await h.session.handlers["openalma:stop"]({})
+    release()
+    expect((await outcome).message).toContain("inactive sitting")
+    expect(replied).toBe(false)
+    h.session.storage.set = set
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(await h.session.handlers["openalma:reserve-image"]({startGeneration: 3, time}))
+      .toEqual({startGeneration: 3, imageId: `${time.timestamp}-2`})
+    expect(h.live.images).toEqual([])
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test("invalid naming state and disabled/stale intake never guess a fresh reference", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const time = {timestamp: "2026-01-08T10-17-23", source: "receipt", receivedAt: 1}
+    const key = `openalma:image-references:${JSON.stringify([CONFIG.userId, CONFIG.soulId, "2026-01-08"])}`
+    h.session.stored.set(key, JSON.stringify({"10-17-23": null}))
+    await expect(h.session.handlers["openalma:reserve-image"]({startGeneration: 1, time})).rejects.toThrow("suffix state")
+    expect(h.session.stored.get(key)).toBe(JSON.stringify({"10-17-23": null}))
+    h.session.stored.set(key, "unreadable naming state")
+    await expect(h.session.handlers["openalma:reserve-image"]({startGeneration: 1, time})).rejects.toThrow()
+    h.session.stored.delete(key)
+    await h.session.handlers["openalma:set-capabilities"]({cameraEnabled: false})
+    await expect(h.session.handlers["openalma:reserve-image"]({startGeneration: 1, time})).rejects.toThrow("inactive sitting")
+    await h.session.handlers["openalma:set-capabilities"]({cameraEnabled: true})
+    await expect(h.session.handlers["openalma:reserve-image"]({startGeneration: 0, time})).rejects.toThrow("inactive sitting")
+    expect(await h.session.handlers["openalma:reserve-image"]({startGeneration: 1, time}))
+      .toEqual({startGeneration: 1, imageId: time.timestamp})
+    await h.session.handlers["openalma:stop"]({})
+  })
   test("Stop completes photo recovery status without the host's URLSearchParams global", async () => {
     const h = setup({failedPhotos: ["fictional-pending-photo"]})
     await h.session.handlers["openalma:start"]({mode: "continuous"})
@@ -1386,18 +1500,20 @@ describe("SessionController", () => {
     const harness = setup()
     await expect(harness.session.handlers["openalma:image"]({})).rejects.toThrow("Start Iris")
     for (const action of ["retry", "discard"]) {
-      await expect(harness.session.handlers["openalma:pending-image"]({action})).rejects.toThrow("Start Iris")
+      await expect(harness.session.handlers["openalma:pending-image"]({action})).rejects.toThrow("Choose a photo")
+      await expect(harness.session.handlers["openalma:pending-image"]({action, imageId: "unknown-photo"})).rejects.toThrow("Unknown failed photo")
     }
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     const image = {imageId: "image-1", mimeType: "image/png", data: "AQID"}
     await harness.session.handlers["openalma:image"](image)
     expect(harness.live.images).toEqual([image])
-    await harness.session.handlers["openalma:pending-image"]({action: "retry"})
-    await harness.session.handlers["openalma:pending-image"]({action: "discard"})
+    harness.live.pendingPhotoIds = [image.imageId]
+    await harness.session.handlers["openalma:pending-image"]({action: "retry", imageId: image.imageId})
+    await harness.session.handlers["openalma:pending-image"]({action: "discard", imageId: image.imageId})
     expect([harness.live.imageRetries, harness.live.imageDiscards]).toEqual([1, 1])
     await harness.session.handlers["openalma:stop"]({})
     for (const action of ["retry", "discard"]) {
-      await expect(harness.session.handlers["openalma:pending-image"]({action})).rejects.toThrow("Start Iris")
+      await expect(harness.session.handlers["openalma:pending-image"]({action, imageId: image.imageId})).rejects.toThrow("Unknown failed photo")
     }
   })
 
@@ -1749,7 +1865,8 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     expect(harness.session.micSubs).toBe(0)
     await expect(harness.session.handlers["openalma:image"]({})).rejects.toThrow("Camera is disabled")
-    await harness.session.handlers["openalma:pending-image"]({action: "retry"})
+    harness.live.pendingPhotoIds = ["camera-disabled-photo"]
+    await harness.session.handlers["openalma:pending-image"]({action: "retry", imageId: "camera-disabled-photo"})
     expect(harness.live.imageRetries).toBe(1)
 
     await harness.session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})

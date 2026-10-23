@@ -223,6 +223,17 @@ Its text can settle at
   do not block another accepted original. Transcript-boundary repair preserves
   independently recoverable originals and stable caption receipt IDs. Older
   clients archive unknown versions; a downgrade is not pending-photo acceptance.
+- Interruption and reconnect reset the actual photo attempt, not the queue head.
+  Retry/Discard require an explicit photo ID; there is no head-targeting fallback.
+  Graceful Stop drains runnable accepted photos, including those behind a
+  captioned original awaiting filing. Non-graceful Stop retains unsent originals.
+- `openalma:reserve-image` reserves phone-assigned timestamp IDs before replying,
+  using serialized, owner/Soul/day-scoped high-water counters in `session.storage`.
+  It merges pending and matching recovered-journal IDs. A lost unpublished reply
+  may leave an unused suffix; a known reference is reused, never renamed on Retry.
+  This naming adapter does not admit frames or send photos. The replacement
+  dispatcher must remove the old sender and IMAGE-accounting gates in its slice;
+  do not keep them as a fallback path.
 - `serverContent.generationComplete: true` means generation has finished; it is
   not a replacement for `turnComplete` in Iris transcript finalization.
 - `goAway.timeLeft` announces a provider disconnect deadline. Iris rotates

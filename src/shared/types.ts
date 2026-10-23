@@ -17,6 +17,14 @@ export type OpenAlmaProfile = {
 
 export type PhotoCaption = {imageId: string; caption: string; durable: boolean}
 
+export interface ImageTime {
+  timestamp: string
+  source: "DateTimeOriginal" | "CreateDate" | "receipt"
+  receivedAt: number
+  originalTime?: string
+  offset?: string
+}
+
 export interface SessionSnapshot {
   startGeneration: number
   configured: boolean
