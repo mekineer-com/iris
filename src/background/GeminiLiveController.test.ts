@@ -487,10 +487,16 @@ describe("GeminiLiveController", () => {
     } finally { release(); await h.controller.stop() }
   })
 
-  test("frame opportunity closes on reconnect and reopens only after replacement readiness", async () => {
-    const h = harness()
+  test.each([false, true])("frame opportunity survives reconnect without forgetting a photo continuation (pending receipt=%s)", async receipt => {
+    const h = harness({storage: new FakeStorage()})
     await start(h)
     try {
+      if (receipt) {
+        await h.controller.sendImage({imageId: "reconnecting-frame-gate", mimeType: "image/png", data: "AQID"})
+        await completePhotoCaption(h.sockets[0], "reconnecting-frame-gate", "A fictional stony beach.")
+        await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "caption-reconnecting-frame-gate"))
+        h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "fictional-frame-gate-handle"}})
+      }
       h.sockets[0].close()
       expect(h.controller.frameDeliveryOpen).toBe(false)
       expect(h.frameDeliveryChanges).toEqual([true, false])
@@ -498,10 +504,30 @@ describe("GeminiLiveController", () => {
       h.sockets[1].open()
       h.sockets[1].message({setupComplete: {}})
       await waitFor(() => h.reconnecting.at(-1) === false)
+      if (receipt) {
+        expect(h.controller.frameDeliveryOpen).toBe(false)
+        expect(h.frameDeliveryChanges).toEqual([true, false])
+        h.sockets[1].message({voiceActivity: {type: "ACTIVITY_START"}})
+        expect(h.controller.frameDeliveryOpen).toBe(false)
+        completeTurn(h, "A fictional question after reconnect.", "A fictional reply.", true)
+      }
       expect(h.controller.frameDeliveryOpen).toBe(true)
       expect(h.frameDeliveryChanges).toEqual([true, false, true])
     } finally { await h.controller.stop() }
     expect(h.controller.frameDeliveryOpen).toBe(false)
+  })
+
+  test("a socket error publishes a closed frame gate before a delayed close event", async () => {
+    const h = harness()
+    await start(h)
+    const close = h.sockets[0].close.bind(h.sockets[0])
+    h.sockets[0].close = () => {h.sockets[0].readyState = 2}
+    try {
+      h.sockets[0].error()
+      expect(h.controller.frameDeliveryOpen).toBe(false)
+      expect(h.frameDeliveryChanges).toEqual([true, false])
+      expect(h.reconnecting).toEqual([])
+    } finally { h.sockets[0].close = close; await h.controller.stop() }
   })
 
   test("Stop waits for nokoru's native reply before requesting reflection", async () => {

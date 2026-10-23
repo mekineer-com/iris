@@ -95,6 +95,7 @@ type SpokenRequest = {
 }
 
 type ToolBatch = {
+  // Outstanding native photo continuation, independent of caption/readiness sibling ownership.
   photo?: boolean
   invitation?: boolean
   request: SpokenRequest | null
@@ -312,7 +313,7 @@ export class GeminiLiveController {
       !this.photoJob && !this.imageUpload && !this.imageFinalization && !this.imageRetrying &&
       !this.pendingImages.some(image => !image.retryRequested) &&
       ![...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption") &&
-      !(this.toolBatch.started && this.toolBatch.photo === true)
+      this.toolBatch.photo !== true
   }
 
   private lastPublishedFrameDelivery = false
@@ -1173,6 +1174,7 @@ export class GeminiLiveController {
         const error = new Error(ready ? "Gemini socket failed" : "Gemini socket failed during setup")
         if (ready) {
           this.ready = false
+          this.publishFrameDelivery()
           socket.close()
         }
         else finish(error)
@@ -1913,7 +1915,8 @@ export class GeminiLiveController {
     // cannot acquire ownership of a later request.
     if (!this.toolBatch.started && (!this.toolBatch.request ||
         (this.toolBatch.request.settled && !this.toolBatch.request.continuing))) {
-      this.toolBatch = {request, completed: false, continuationSent: false, background: false, started: false}
+      this.toolBatch = {request, completed: false, continuationSent: false, background: false,
+        started: false, photo: this.toolBatch.photo}
     } else if (!this.toolBatch.request && !this.toolBatch.completed) {
       this.toolBatch.request = request
     }
@@ -1931,7 +1934,7 @@ export class GeminiLiveController {
       if (this.mode === "manual") this.callbacks.onTurnComplete(true)
     }
     this.toolBatch = {request: this.spokenRequest, completed: false, continuationSent: false,
-      background: !this.spokenRequest, started: false}
+      background: !this.spokenRequest, started: false, photo: this.toolBatch.photo}
   }
 
   private finalizeInterruptedTurn(userComplete = false): void {
