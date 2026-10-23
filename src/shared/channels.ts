@@ -8,6 +8,7 @@ export type ImageRequest = {
   mimeType: "image/jpeg" | "image/png"
   data: string
   speakDescription?: boolean
+  time?: ImageTime
 }
 
 export type SelectSoulResult =
@@ -26,7 +27,7 @@ export interface Channels {
     cameraEnabled?: boolean
   }, {ok: true}>
   "openalma:manual-action": Rpc<{action: ManualAction}, {ok: true}>
-  "openalma:image": Rpc<ImageRequest, {ok: true}>
+  "openalma:image": Rpc<ImageRequest, {ok: true} | {ok: false; conflict: true}>
   "openalma:reserve-image": Rpc<ImageReferenceRequest, {startGeneration: number; imageId: string}>
   "openalma:pending-image": Rpc<{action: "retry" | "discard"; imageId: string}, {ok: true}>
 }

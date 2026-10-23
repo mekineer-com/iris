@@ -29,6 +29,7 @@ test.each([
   "1900:02:29 01:02:03", "2026:02:30 10:17:23", "2026:00:08 10:17:23",
   "2026:13:08 10:17:23", "2026:01:00 10:17:23", "2026:01:08 24:17:23",
   "2026:01:08 10:60:23", "2026:01:08 10:17:60", "not a date", NaN,
+  "2026-01-08T10:17:23+99:99", "2026-01-08T10:17:23+24:00", "2026-01-08T10:17:23-05:60",
 ])("invalid metadata %s cannot silently become a different date", value => {
   expect(() => formatImageTimestamp(value)).toThrow("Invalid image timestamp")
 })

@@ -2,6 +2,7 @@ import {useEffect, useRef, useState} from "react"
 import {useRpc} from "@mentra/miniapp/ui"
 
 import type {Channels, ImageRequest, SelectSoulResult} from "../../shared/channels"
+import {readImageTime, type ImageTime} from "../imageTime"
 import {
   PHOTO_RETRY_MESSAGE,
   type ConnectionState,
@@ -76,10 +77,7 @@ export async function imageRequest(
   return {imageId, mimeType, data: btoa(binary), speakDescription}
 }
 
-export const newImageId = (now = Date.now(), random = Math.random()) =>
-  `image-${now.toString(36)}-${random.toString(36).slice(2)}`
-
-type PendingPhoto = {file: File; imageId: string; previewUrl: string | null}
+type PendingPhoto = {file: File; imageId: string; time: ImageTime; previewUrl: string | null}
 
 export default function SessionPage() {
   const snapshot = useChannel("openalma:update")
@@ -91,6 +89,7 @@ export default function SessionPage() {
   const capabilitiesRpc = useRpc<Channels, "openalma:set-capabilities">("openalma:set-capabilities")
   const manualRpc = useRpc<Channels, "openalma:manual-action">("openalma:manual-action")
   const imageRpc = useRpc<Channels, "openalma:image">("openalma:image")
+  const reserveImageRpc = useRpc<Channels, "openalma:reserve-image">("openalma:reserve-image")
   const pendingImageRpc = useRpc<Channels, "openalma:pending-image">("openalma:pending-image")
   const [startPending, setStartPending] = useState(false)
   const [stopPending, setStopPending] = useState(false)
@@ -124,6 +123,7 @@ export default function SessionPage() {
   })
   const startOwner = useRef(0)
   const imageOwner = useRef(0)
+  const pickerGeneration = useRef<number | null>(null)
   const filingOwner = useRef(0)
 
   useEffect(() => {
@@ -134,7 +134,7 @@ export default function SessionPage() {
 
   useEffect(() => () => {
     if (pendingPhoto?.previewUrl) URL.revokeObjectURL(pendingPhoto.previewUrl)
-  }, [pendingPhoto])
+  }, [pendingPhoto?.previewUrl])
 
   useEffect(() => {
     setSoulName(snapshot?.soulId ?? "")
@@ -303,8 +303,16 @@ export default function SessionPage() {
     try {
       const request = await imageRequest(photo.file, photo.imageId, speakPhotoDescriptions)
       if (owner !== imageOwner.current) return
-      await imageRpc(request)
+      const result = await imageRpc({...request, time: photo.time})
       if (owner !== imageOwner.current) return
+      if (!result.ok) {
+        const reference = await reserveImageRpc({startGeneration: snapshot!.startGeneration, time: photo.time})
+        if (owner !== imageOwner.current) return
+        setPendingPhoto({...photo, imageId: reference.imageId})
+        setRpcError("Photo reference was already in use. Retry will use a new reference.")
+        setImageStatus("Photo ready to retry")
+        return
+      }
       discardPhoto()
       setImageStatus("Photo sent")
     } catch (error) {
@@ -317,10 +325,17 @@ export default function SessionPage() {
     }
   }
 
-  const onImagePicked = (input: HTMLInputElement) => {
+  const onImagePicked = async (input: HTMLInputElement) => {
     const file = input.files?.[0]
     input.value = ""
+    const generation = pickerGeneration.current
+    pickerGeneration.current = null
     if (!file) return
+    if (generation === null || generation !== snapshot?.startGeneration) {
+      setRpcError("Choose the photo again for this sitting.")
+      return
+    }
+    const receivedAt = Date.now()
     setRpcError(null)
     setImageStatus(null)
     try {
@@ -329,15 +344,26 @@ export default function SessionPage() {
       setRpcError(error instanceof Error ? error.message : String(error))
       return
     }
-    discardPhoto()
-    const warnLarge = shouldWarnLargeImage(file.size, largeImageWarningDismissed)
-    const photo = {
-      file,
-      imageId: newImageId(),
-      previewUrl: previewImages || warnLarge ? URL.createObjectURL(file) : null,
+    const owner = ++imageOwner.current
+    setImagePending(true)
+    try {
+      const time = await readImageTime(file, receivedAt)
+      if (owner !== imageOwner.current) return
+      const reference = await reserveImageRpc({startGeneration: generation, time})
+      if (owner !== imageOwner.current || reference.startGeneration !== generation) return
+      discardPhoto()
+      const warnLarge = shouldWarnLargeImage(file.size, largeImageWarningDismissed)
+      const photo = {
+        file, time, imageId: reference.imageId,
+        previewUrl: previewImages || warnLarge ? URL.createObjectURL(file) : null,
+      }
+      setPendingPhoto(photo)
+      if (!previewImages && !warnLarge) await submitPhoto(photo)
+    } catch (error) {
+      if (owner === imageOwner.current) setRpcError(error instanceof Error ? error.message : String(error))
+    } finally {
+      if (owner === imageOwner.current) setImagePending(false)
     }
-    setPendingPhoto(photo)
-    if (!previewImages && !warnLarge) void submitPhoto(photo)
   }
 
   const dismissLargeImageWarning = () => {
@@ -550,6 +576,7 @@ export default function SessionPage() {
             type="file"
             accept="image/*"
             capture="environment"
+            onClick={() => {pickerGeneration.current = snapshot?.startGeneration ?? null}}
             disabled={!cameraEnabled || !voiceReady || imagePending || stopping}
             onChange={(event) => onImagePicked(event.currentTarget)}
           />
@@ -559,6 +586,7 @@ export default function SessionPage() {
           <input
             type="file"
             accept="image/*"
+            onClick={() => {pickerGeneration.current = snapshot?.startGeneration ?? null}}
             disabled={!cameraEnabled || !voiceReady || imagePending || stopping}
             onChange={(event) => onImagePicked(event.currentTarget)}
           />

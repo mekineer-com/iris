@@ -72,6 +72,25 @@ Because setup includes `sessionResumption`, Gemini may send:
 Keep only a non-empty `newHandle` when `resumable` is true. A false update
 clears the handle. The handle is provider state, never transcript content.
 
+### Internal invitation and photo identity
+
+The internal invitation is exactly `nokoru`, sent as text. Continuous uses
+`realtimeInput.text`; Manual reuses a completed `clientContent` text turn between
+takes. The startup instruction identifies it as Iris input, not human dialogue.
+Successful background recall may queue one invitation; native tool batches,
+human speech, playback drain and Manual recording/review hold it. An existing
+quiet choice can consume readiness without another cue. No audio cue, spelling
+filter, fixed mute interval or independent idle timer is used. Never replay a
+sent invitation on reconnect; an unsent reason stays within its current sitting.
+
+Picked photos use the phone's persisted timestamp reservation before upload.
+The journal carries original/receipt time and timezone provenance to finalization;
+filing uses that time, not the later caption arrival. Missing EXIF uses receipt
+time; a missing original timezone stays unspecified. Accepted filing metadata
+cannot be changed by a conflicting duplicate. Only a confirmed original-ID
+conflict before model delivery offers another suffix; uncertain uploads retry
+the same ID. The file picker is bound to the sitting in which it opened.
+
 ### Internal photo task
 
 Iris snapshots the original in OpenAlma before provider delivery; upload and

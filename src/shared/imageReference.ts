@@ -6,7 +6,7 @@ export function formatImageTimestamp(time: number | string): string {
     parts = [date.getFullYear(), date.getMonth() + 1, date.getDate(),
       date.getHours(), date.getMinutes(), date.getSeconds()]
   } else {
-    const match = /^(\d{4})[:-](\d{2})[:-](\d{2})[T ](\d{2})[:-](\d{2})[:-](\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$/.exec(time)
+    const match = /^(\d{4})[:-](\d{2})[:-](\d{2})[T ](\d{2})[:-](\d{2})[:-](\d{2})(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)?$/.exec(time)
     if (!match) throw new Error("Invalid image timestamp")
     parts = match.slice(1, 7).map(Number)
   }

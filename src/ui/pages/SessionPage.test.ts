@@ -4,10 +4,10 @@ import {runInNewContext} from "node:vm"
 import ts from "typescript"
 import * as jsx from "react/jsx-runtime"
 import manifest from "../../../miniapp.json"
+import {readImageTime} from "../imageTime"
 
 import {
   imageRequest,
-  newImageId,
   shouldWarnLargeImage,
   statusText,
   validateImageFile,
@@ -19,6 +19,7 @@ const nodes = (tree: any): any[] => !tree || typeof tree !== "object" ? []
   : Array.isArray(tree) ? tree.flatMap(nodes) : [tree, ...nodes(tree.props?.children)]
 
 function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Promise<unknown>) {
+  if (!("startGeneration" in snapshot)) Object.assign(snapshot, {startGeneration: 1})
   if (!("pendingPhotoIds" in snapshot)) Object.assign(snapshot, {pendingPhotoIds: ["local-photo"]})
   const states: unknown[] = []
   const refs: Array<{current: unknown}> = []
@@ -39,6 +40,7 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
       if (name === "react/jsx-runtime") return jsx
       if (name.endsWith("miniapp.json")) return {default: manifest, __esModule: true}
       if (name.endsWith("/useChannel")) return {useChannel: () => snapshot}
+      if (name.endsWith("/imageTime")) return {readImageTime}
       if (name === "@mentra/miniapp/ui") return {useRpc: (channel: string) => (payload: unknown) => rpc(channel, payload)}
       return {default: "", __esModule: true}
     },
@@ -49,6 +51,48 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
 }
 
 describe("SessionPage state projection", () => {
+  test("a picker opened before restart cannot attach its photo to the replacement sitting", async () => {
+    const calls: string[] = []
+    const snapshot = {configured: true, startGeneration: 1, soulId: "Quill", souls: ["Quill"],
+      soulConfirmed: true, connection: "listening", pendingPhotoIds: []}
+    const render = renderPage(snapshot, async channel => {calls.push(channel); return {ok: true}})
+    nodes(render()).find(node => node.props?.type === "file").props.onClick()
+    snapshot.startGeneration = 3
+    await nodes(render()).find(node => node.props?.type === "file").props.onChange({currentTarget: {
+      files: [new File([new Uint8Array([1, 2, 3])], "fictional.png", {type: "image/png"})], value: "",
+    }})
+    expect(calls).toEqual([])
+    expect(JSON.stringify(render())).toContain("Choose the photo again for this sitting.")
+  })
+
+  test("a confirmed upload conflict reserves a new reference only for explicit Retry", async () => {
+    const uploads: any[] = []
+    let reservations = 0
+    const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+      connection: "listening", photoRetryPending: false, pendingPhotoIds: []}
+    const render = renderPage(snapshot, async (channel, payload) => {
+      if (channel === "openalma:reserve-image") return {startGeneration: payload.startGeneration,
+        imageId: `2026-01-08T10-17-23${++reservations === 1 ? "" : "-2"}`}
+      if (channel === "openalma:image") {
+        uploads.push(payload)
+        return uploads.length === 1 ? {ok: false, conflict: true} : {ok: true}
+      }
+      return {ok: true}
+    })
+    nodes(render()).find(node => node.props?.type === "file").props.onClick()
+    await nodes(render()).find(node => node.props?.type === "file").props.onChange({currentTarget: {
+      files: [new File([new Uint8Array([1, 2, 3])], "fictional.png", {type: "image/png"})], value: "",
+    }})
+    expect(reservations).toBe(2)
+    expect(uploads).toHaveLength(1)
+    nodes(render()).find(node => node.props?.children === "Retry").props.onClick()
+    await new Promise(resolve => setTimeout(resolve, 5))
+    expect(uploads.map(payload => payload.imageId)).toEqual(["2026-01-08T10-17-23", "2026-01-08T10-17-23-2"])
+    expect(uploads[1].time).toEqual(uploads[0].time)
+    expect(uploads[1].data).toBe(uploads[0].data)
+    expect(JSON.stringify(render())).toContain("Photo sent")
+  })
+
   test("caption timeline is collapsed, keeps repeated text, and marks only accepted entries", () => {
     const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
       connection: "listening", photoCaptions: [
@@ -224,8 +268,9 @@ describe("SessionPage state projection", () => {
           soulConfirmed: true, soulLocked: false, connection: "idle", photoRetryPending: false}
         const pending: Array<{resolve: () => void; reject: (error: Error) => void}> = []
         const calls: string[] = []
-        const render = renderPage(snapshot, async (channel) => {
+        const render = renderPage(snapshot, async (channel, payload) => {
           calls.push(channel)
+          if (channel === "openalma:reserve-image") return {startGeneration: payload.startGeneration, imageId: payload.time.timestamp}
           if (channel === "openalma:pending-image") {
             return new Promise<void>((resolve, reject) => pending.push({resolve, reject}))
           }
@@ -235,9 +280,11 @@ describe("SessionPage state projection", () => {
         })
         const actions = () => nodes(render()).find(node => node.props?.className === "image-review").props.children.filter((node: any) => node.type === "button")
         const flush = () => new Promise(resolve => setTimeout(resolve, 0))
-        const pickPhoto = () => nodes(render()).find(node => node.props?.type === "file").props.onChange({currentTarget: {
+        const pickPhoto = () => {
+          nodes(render()).find(node => node.props?.type === "file").props.onClick()
+          return nodes(render()).find(node => node.props?.type === "file").props.onChange({currentTarget: {
           files: [new File([new Uint8Array([1, 2, 3])], "fictional.png", {type: "image/png"})], value: "",
-        }})
+        }})}
         const settingError = () => nodes(render()).find(node => node.props?.type === "checkbox").props.onChange({target: {checked: false}})
         const finishOld = () => fails ? pending[0].reject(new Error("Old photo failed")) : pending[0].resolve()
 
@@ -316,11 +363,11 @@ describe("SessionPage state projection", () => {
   test("encodes one validated file for the image RPC", async () => {
     const payload = await imageRequest(
       new File([new Uint8Array([1, 2, 3])], "photo.png", {type: "image/png"}),
-      newImageId(1234, 0.5),
+      "2026-01-08T10-17-23-2",
       false,
     )
     expect(payload).toEqual({
-      imageId: "image-ya-i",
+      imageId: "2026-01-08T10-17-23-2",
       mimeType: "image/png",
       data: "AQID",
       speakDescription: false,

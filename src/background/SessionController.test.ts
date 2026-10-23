@@ -34,6 +34,7 @@ function testPcm(value: number): string {
 }
 
 class FakeLive {
+  resumptions = 0
   starts = 0
   stops = 0
   stopArgs: boolean[] = []
@@ -63,6 +64,8 @@ class FakeLive {
     this.startModes.push(mode)
     if (this.startGate) await this.startGate
   }
+
+  resumeBackgroundWork(): void { this.resumptions += 1 }
 
   sendAudio(data: string, source?: MicSource): void {
     this.sent.push(data)
@@ -1517,6 +1520,58 @@ describe("SessionController", () => {
     }
   })
 
+  test("resumed speech retires an old writer still closing across reconnect", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    h.live.audio("AAAAAA==")
+    await new Promise(resolve => setTimeout(resolve, 1))
+    const old = h.session.streams.at(-1)!
+    let release!: () => void
+    h.session.closeGate = new Promise<void>(resolve => {release = resolve})
+    h.live.turnComplete()
+    await new Promise(resolve => setTimeout(resolve, 1))
+    expect(old.closed).toBe(true)
+    h.live.reconnecting(true)
+    h.live.reconnecting(false)
+    h.live.audio("AQEBAQ==")
+    await new Promise(resolve => setTimeout(resolve, 1))
+    expect(old.aborted).toBe(true)
+    expect(old.writes).toEqual(["AAAAAA=="])
+    expect(h.session.streams.at(-1)).not.toBe(old)
+    expect(h.session.streams.at(-1)!.writes).toEqual(["AQEBAQ=="])
+    release()
+    h.session.closeGate = null
+    await new Promise(resolve => setTimeout(resolve, 1))
+    expect(lastSnapshot(h.session)?.connection).toBe("speaking")
+    h.live.turnComplete()
+    await new Promise(resolve => setTimeout(resolve, 1))
+    expect(lastSnapshot(h.session)?.connection).toBe("listening")
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test("resumed Soul speech preempts a pending reconnect earcon instead of being dropped", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    let release!: () => void
+    h.session.playGate = new Promise<void>(resolve => {release = resolve})
+    h.live.reconnecting(true)
+    h.live.reconnecting(false)
+    await new Promise(resolve => setTimeout(resolve, 1))
+    expect(lastSnapshot(h.session)?.connection).toBe("reconnecting")
+    h.live.audio("AAAAAA==")
+    await new Promise(resolve => setTimeout(resolve, 1))
+    expect(lastSnapshot(h.session)?.connection).toBe("speaking")
+    expect(h.session.streams.at(-1)?.writes).toContain("AAAAAA==")
+    release()
+    h.session.playGate = null
+    await new Promise(resolve => setTimeout(resolve, 1))
+    expect(lastSnapshot(h.session)?.connection).toBe("speaking")
+    h.live.turnComplete()
+    await new Promise(resolve => setTimeout(resolve, 1))
+    expect(lastSnapshot(h.session)?.connection).toBe("listening")
+    await h.session.handlers["openalma:stop"]({})
+  })
+
   test("projects provider rollover as reconnecting with Stop ownership", async () => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
@@ -1528,8 +1583,9 @@ describe("SessionController", () => {
     await expect(harness.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"}))
       .rejects.toThrow("Wait for settings or stop")
     harness.live.reconnecting(false)
-    expect(lastSnapshot(harness.session)?.connection).toBe("listening")
+    expect(lastSnapshot(harness.session)?.connection).toBe("reconnecting")
     await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(lastSnapshot(harness.session)?.connection).toBe("listening")
     expect(harness.session.plays.at(-1)?.audioUrl).toEndWith("/earcons/listen-start.wav")
     await harness.session.handlers["openalma:stop"]({})
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "idle", startGeneration: 2, pendingPhotoIds: []})
@@ -1883,6 +1939,48 @@ describe("SessionController", () => {
       microphoneEnabled: false,
       cameraEnabled: true,
     })
+  })
+
+  test("invitation readiness waits for actual speaker drain", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    let release!: () => void
+    h.session.closeGate = new Promise<void>(resolve => {release = resolve})
+    h.live.audio()
+    h.live.turnComplete()
+    await new Promise(resolve => setTimeout(resolve, 5))
+    expect(h.live.callbacks.canInvite?.()).toBe(false)
+    const before = h.live.resumptions
+    release()
+    await new Promise(resolve => setTimeout(resolve, 5))
+    expect(h.live.callbacks.canInvite?.()).toBe(true)
+    expect(h.live.resumptions).toBeGreaterThan(before)
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test.each(["speech", "reconnect", "microphone disable"])("Manual preserves a take in Review on unexpected %s", async cause => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "manual"})
+    expect(h.live.callbacks.canInvite?.()).toBe(true)
+    h.session.handlers["openalma:manual-action"]({action: "talk"})
+    h.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000, source: "phone"})
+    expect(h.live.callbacks.canInvite?.()).toBe(false)
+    if (cause === "speech") {
+      h.live.audio(silentPcm())
+      h.live.turnComplete()
+    } else if (cause === "reconnect") {
+      h.live.reconnecting(true)
+      h.live.reconnecting(false)
+    } else {
+      await h.session.handlers["openalma:set-capabilities"]({microphoneEnabled: false})
+    }
+    await new Promise(resolve => setTimeout(resolve, 5))
+    expect(lastSnapshot(h.session)).toMatchObject({connection: "listening", manualPhase: "review"})
+    expect(h.live.callbacks.canInvite?.()).toBe(false)
+    h.session.micHandler?.({data: testPcm(2), format: "pcm_s16le", sampleRate: 16000, source: "phone"})
+    h.session.handlers["openalma:manual-action"]({action: "send"})
+    expect(h.live.activities).toEqual([[testPcm(1)]])
+    await h.session.handlers["openalma:stop"]({})
   })
 
   test("Manual records, reviews, redoes, and sends only the replacement", async () => {

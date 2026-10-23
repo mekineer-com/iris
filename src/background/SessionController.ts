@@ -14,7 +14,7 @@ import type {
   SessionSnapshot,
 } from "../shared/types"
 import {approxBase64ByteLength, normalizePcm16Audio} from "./audioHelpers"
-import {GeminiLiveController, journalImageIds, journalSoulId, readSessionJournal, readStoredValue, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
+import {GeminiLiveController, PhotoUploadConflict, journalImageIds, journalSoulId, readSessionJournal, readStoredValue, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
 import type {GeminiCallbacks} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {
@@ -311,6 +311,7 @@ export class SessionController {
             next.microphoneEnabled ? "1" : "0",
           )
           this.microphoneEnabled = next.microphoneEnabled
+          if (!this.microphoneEnabled) this.holdManualTake()
           if (!this.microphoneEnabled && this.micUnsub) this.stopMic()
           else if (
             this.microphoneEnabled &&
@@ -326,6 +327,7 @@ export class SessionController {
           this.cameraEnabled = next.cameraEnabled
         }
         this.pushSnapshot()
+        this.liveController?.resumeBackgroundWork()
         return {ok: true as const}
       }),
     )
@@ -353,7 +355,11 @@ export class SessionController {
           throw new Error("Start Iris before sending a photo")
         }
         if (!this.liveController) throw new Error("Gemini is not ready")
-        await this.liveController.sendImage(payload as ImageRequest)
+        try { await this.liveController.sendImage(payload as ImageRequest) }
+        catch (error) {
+          if (error instanceof PhotoUploadConflict) return {ok: false as const, conflict: true as const}
+          throw error
+        }
         return {ok: true as const}
       }),
     )
@@ -398,8 +404,10 @@ export class SessionController {
         }),
       ])
     } catch {
-      this.lastError ??= "Audio cue unavailable; voice is still active"
-      this.pushSnapshot()
+      if (epoch === this.speakerEpoch) {
+        this.lastError ??= "Audio cue unavailable; voice is still active"
+        this.pushSnapshot()
+      }
     } finally {
       if (timeout) clearTimeout(timeout)
     }
@@ -508,6 +516,8 @@ export class SessionController {
       this.recoverySoulId = this.soulId
       if (!this.liveController) {
         this.liveController = this.createLiveController({...this.currentConfig(), soulId: this.soulId}, {
+          canInvite: () => this.connection === "listening" &&
+            (this.mode === "continuous" || this.manualPhase === "idle"),
           onAudio: (pcm) => this.onGeminiAudio(pcm),
           onTurnComplete: (finalResponse) => {
             if (this.connection === "starting") this.startupTurnComplete = true
@@ -521,13 +531,18 @@ export class SessionController {
           },
           onReconnecting: (reconnecting) => {
             if (reconnecting && (this.connection === "listening" || this.connection === "speaking")) {
+              this.holdManualTake()
               this.connection = "reconnecting"
             } else if (!reconnecting && this.connection === "reconnecting") {
-              this.connection = "listening"
               const generation = this.startGeneration
-              void this.speechFinishTail.then(() => {
-                if (generation === this.startGeneration && this.connection === "listening") {
-                  return this.playEarcon("listen-start")
+              void this.speechFinishTail.then(async () => {
+                if (generation === this.startGeneration && this.connection === "reconnecting") {
+                  await this.playEarcon("listen-start")
+                  if (generation === this.startGeneration && this.connection === "reconnecting") {
+                    this.connection = "listening"
+                    this.pushSnapshot()
+                    this.liveController?.resumeBackgroundWork()
+                  }
                 }
               })
             }
@@ -816,7 +831,18 @@ export class SessionController {
       this.startupAudio.push(base64Pcm)
       return
     }
+    if (this.connection === "reconnecting") {
+      this.speakerEpoch += 1
+      try { this.session.speaker.stop() } catch { /* host may reject a stale cue */ }
+      const retiring = this.abortCurrentWriter()
+      this.interruptPromise = retiring
+      void retiring.finally(() => {
+        if (this.interruptPromise === retiring) this.interruptPromise = null
+      })
+      this.connection = "listening"
+    }
     if (!reflection && this.connection !== "listening" && this.connection !== "speaking") return
+    this.holdManualTake()
     if (this.manualPhase === "submitted") this.clearManualResponseWatchdog()
     if (!reflection && this.connection !== "speaking") {
       this.connection = "speaking"
@@ -828,9 +854,17 @@ export class SessionController {
     void write.finally(() => this.pendingSpeechWrites.delete(write))
   }
 
+  private holdManualTake(): void {
+    if (this.mode === "manual" && this.manualPhase === "recording") {
+      this.manualPhase = this.manualAudio.length ? "review" : "idle"
+    }
+  }
+
   private async writeSpeech(base64Pcm: string): Promise<void> {
     const epoch = this.speakerEpoch
     try {
+      if (this.interruptPromise) await this.interruptPromise
+      if (epoch !== this.speakerEpoch) return
       const writer = await this.ensureSpeechWriter(epoch)
       if (!writer || epoch !== this.speakerEpoch) return
       await writer.writeBase64(base64Pcm)
@@ -885,6 +919,7 @@ export class SessionController {
         } else if (manualFinished) {
           this.pushSnapshot()
         }
+        this.liveController?.resumeBackgroundWork()
         return
       }
       await writer.close()
@@ -898,6 +933,7 @@ export class SessionController {
         } else if (manualFinished) {
           this.pushSnapshot()
         }
+        this.liveController?.resumeBackgroundWork()
       }
     } catch {
       if (epoch === this.speakerEpoch) await this.fail(new Error("speaker close failed"))
