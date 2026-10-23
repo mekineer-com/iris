@@ -19,6 +19,7 @@ const nodes = (tree: any): any[] => !tree || typeof tree !== "object" ? []
   : Array.isArray(tree) ? tree.flatMap(nodes) : [tree, ...nodes(tree.props?.children)]
 
 function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Promise<unknown>) {
+  if (!("pendingPhotoIds" in snapshot)) Object.assign(snapshot, {pendingPhotoIds: ["local-photo"]})
   const states: unknown[] = []
   const refs: Array<{current: unknown}> = []
   let cursor = 0
@@ -207,7 +208,7 @@ describe("SessionPage state projection", () => {
     snapshot.photoRetryPending = true
     for (const connection of ["idle", "error", "starting", "stopping", "reconnecting", "listening", "speaking"]) {
       snapshot.connection = connection
-      const actions = nodes(render()).find(node => node.props?.className === "image-review").props.children
+      const actions = nodes(render()).find(node => node.props?.className === "image-review").props.children.filter((node: any) => node.type === "button")
       expect(actions.map((node: any) => node.props.disabled)).toEqual(
         ["listening", "speaking"].includes(connection) ? [false, false] : [true, true],
       )
@@ -232,7 +233,7 @@ describe("SessionPage state projection", () => {
           if (channel === "openalma:set-soul") return {soulId: "Quill", created: false}
           return {ok: true}
         })
-        const actions = () => nodes(render()).find(node => node.props?.className === "image-review").props.children
+        const actions = () => nodes(render()).find(node => node.props?.className === "image-review").props.children.filter((node: any) => node.type === "button")
         const flush = () => new Promise(resolve => setTimeout(resolve, 0))
         const pickPhoto = () => nodes(render()).find(node => node.props?.type === "file").props.onChange({currentTarget: {
           files: [new File([new Uint8Array([1, 2, 3])], "fictional.png", {type: "image/png"})], value: "",

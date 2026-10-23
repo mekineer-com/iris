@@ -346,21 +346,22 @@ export default function SessionPage() {
   }
 
   const handleStoredPhoto = async (action: "retry" | "discard", imageId?: string) => {
-    const ownerRef = imageId === undefined ? imageOwner : filingOwner
+    const local = imageId === undefined || snapshot?.pendingPhotoIds.includes(imageId)
+    const ownerRef = local ? imageOwner : filingOwner
     const owner = ++ownerRef.current
-    if (imageId === undefined) setImagePending(true)
+    if (local) setImagePending(true)
     else setFilingPending(imageId)
     setRpcError(null)
     try {
       await pendingImageRpc({action, ...(imageId === undefined ? {} : {imageId})})
       if (owner !== ownerRef.current) return
-      if (action === "discard" && imageId === undefined) setImageStatus(null)
+      if (action === "discard" && local) setImageStatus(null)
     } catch (error) {
       if (owner !== ownerRef.current) return
       setRpcError(error instanceof Error ? error.message : String(error))
     } finally {
       if (owner === ownerRef.current) {
-        if (imageId === undefined) setImagePending(false)
+        if (local) setImagePending(false)
         else setFilingPending(null)
       }
     }
@@ -557,7 +558,7 @@ export default function SessionPage() {
             type="file"
             accept="image/*"
             capture="environment"
-            disabled={!cameraEnabled || !voiceReady || imagePending || stopping || photoRetryPending}
+            disabled={!cameraEnabled || !voiceReady || imagePending || stopping}
             onChange={(event) => onImagePicked(event.currentTarget)}
           />
         </label>
@@ -566,7 +567,7 @@ export default function SessionPage() {
           <input
             type="file"
             accept="image/*"
-            disabled={!cameraEnabled || !voiceReady || imagePending || stopping || photoRetryPending}
+            disabled={!cameraEnabled || !voiceReady || imagePending || stopping}
             onChange={(event) => onImagePicked(event.currentTarget)}
           />
         </label>
@@ -611,10 +612,13 @@ export default function SessionPage() {
           <p role="status">{visible === "idle" || visible === "error"
             ? "Start Iris to retry or discard the pending photo"
             : PHOTO_RETRY_MESSAGE}</p>
-          <div className="image-review">
-            <button type="button" disabled={imagePending || stopping || !voiceReady} onClick={() => void handleStoredPhoto("retry")}>Retry</button>
-            <button type="button" disabled={imagePending || stopping || !voiceReady} onClick={() => void handleStoredPhoto("discard")}>Discard</button>
-          </div>
+          {snapshot?.pendingPhotoIds.map(imageId => (
+            <div className="image-review" key={imageId}>
+              <span>{imageId}</span>
+              <button type="button" disabled={imagePending || stopping || !voiceReady} onClick={() => void handleStoredPhoto("retry", imageId)}>Retry</button>
+              <button type="button" disabled={imagePending || stopping || !voiceReady} onClick={() => void handleStoredPhoto("discard", imageId)}>Discard</button>
+            </div>
+          ))}
         </div>
       ) : null}
       {snapshot?.failedPhotos?.length ? (

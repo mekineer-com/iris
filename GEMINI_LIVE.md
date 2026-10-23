@@ -14,6 +14,15 @@ No model/configuration cutover has occurred. Photo/tool plumbing, late-speech
 reservations and requested-answer scheduling are implemented locally.
 The current source is not a release-ready migration.
 
+Checkpoint-3 foundations, 2026-10-22: Start requires and echoes
+`photo_work_protocol: "iris-photo-work-v1"`. Iris refuses a missing/mismatched
+response marker before opening Gemini and releases any acquired lease. Token
+mint/renewal expose six NON_BLOCKING tools, including argument-free
+`nothing_to_add`; Iris handles its empty acknowledgment locally with SILENT,
+without taking away a pending human answer's continuation. Startup/photo prompt
+replacement and the text-invitation/inline-job dispatcher are not yet applied.
+The delivery/accounting behavior below still describes the current photo sender.
+
 ## Source Contract
 
 - Target model: `gemini-3.8-live`; installed model settings stay unchanged until
@@ -207,9 +216,13 @@ Its text can settle at
   does not close them. Drafts retain the expected sequence boundary, so a reset
   position archives them instead of mixing old speech into replacement history.
   Fresh cold-bootstrap context is still Slice 4 work.
-- The journal writes payload version 2 under the existing storage key and reads
-  existing version 1 at the boundary. Older clients already archive unknown
-  versions; they must not treat drafts as ignorable version-1 extension fields.
+- The journal writes payload version 3 with arrival-ordered `pendingImages` under
+  the existing storage key; version 1/2 singleton records normalize at the read
+  boundary. Filing/replay completions remove only their owned original, not a
+  newly selected queue head. Parked photos retain ID-specific Retry/Discard and
+  do not block another accepted original. Transcript-boundary repair preserves
+  independently recoverable originals and stable caption receipt IDs. Older
+  clients archive unknown versions; a downgrade is not pending-photo acceptance.
 - `serverContent.generationComplete: true` means generation has finished; it is
   not a replacement for `turnComplete` in Iris transcript finalization.
 - `goAway.timeLeft` announces a provider disconnect deadline. Iris rotates

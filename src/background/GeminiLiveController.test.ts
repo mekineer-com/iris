@@ -188,6 +188,7 @@ function harness(
       const result = startResults.shift()
       return Response.json(
         result?.body ?? options.startBody ?? {
+          photo_work_protocol: "iris-photo-work-v1",
           session_id: "sitting-1",
           next_transcript_sequence: options.startSequence ?? 41,
           ephemeral_token: "ephemeral/test",
@@ -402,6 +403,125 @@ function admitRequest(h: ReturnType<typeof harness>, mode: "continuous" | "manua
 }
 
 describe("GeminiLiveController", () => {
+  test("the empty local no-op is SILENT and does not create dialogue or a server write", async () => {
+    const history: NonNullable<Parameters<typeof harness>[0]>["history"] = []
+    const h = harness({storage: new FakeStorage(), history})
+    await start(h)
+    const before = h.requests.length
+    h.sockets[0].message({toolCall: {functionCalls: [{id: "quiet", name: "nothing_to_add", args: {}}]},
+      serverContent: {generationComplete: true, turnComplete: true}})
+    await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "quiet"))
+    expect(functionResponses(h.sockets[0]).find(response => response.id === "quiet"))
+      .toEqual({id: "quiet", name: "nothing_to_add", response: {ok: true}, scheduling: "SILENT"})
+    expect(h.requests).toHaveLength(before)
+    expect(history).toEqual([])
+    expect(h.audio).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("a second stored original survives the first photo's held filing and dispatches in order", async () => {
+    const storage = new FakeStorage()
+    let release!: () => void
+    const h = harness({storage, finalizeGates: [new Promise<void>(resolve => {release = resolve})],
+      replayBodies: [{mime_type: "image/png", data: "BAUG", media_ref: "mentra_media/test-phone/photo-b.png"}]})
+    await start(h)
+    try {
+      await h.controller.sendImage({imageId: "photo-a", mimeType: "image/png", data: "AQID"})
+      await completePhotoCaption(h.sockets[0], "photo-a", "A fictional red square.")
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+      await h.controller.sendImage({imageId: "photo-b", mimeType: "image/png", data: "BAUG"})
+      const journal = JSON.parse(storage.values.get(JOURNAL_KEY)!)
+      expect(journal.version).toBe(3)
+      expect(journal.pendingImage).toBeUndefined()
+      expect(journal.pendingImages.map((image: any) => image.imageId)).toEqual(["photo-a", "photo-b"])
+      expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(1)
+      release()
+      await waitPhotoTask(h.sockets[0], "photo-b")
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages.map((image: any) => image.imageId)).toEqual(["photo-b"])
+      await completePhotoCaption(h.sockets[0], "photo-b", "A fictional blue triangle.")
+      await waitFor(() => storage.values.get(JOURNAL_KEY) === "")
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot/finalize")).map(request => request.body.image_id))
+        .toEqual(["photo-a", "photo-b"])
+      expect(h.errors).toEqual([])
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
+  test("Start refuses an old server protocol and releases its lease before opening Gemini", async () => {
+    const h = harness({startBody: {session_id: "old-server", next_transcript_sequence: 1,
+      ephemeral_token: "ephemeral/test", websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
+        input_audio_rate_hz: 16000, output_audio_rate_hz: 24000}, lease_seconds: 90, session_warning_seconds: 0}})
+    await expect(h.controller.start("continuous")).rejects.toThrow("invalid session contract")
+    expect(h.sockets).toEqual([])
+    expect(h.requests.filter(request => request.url.endsWith("/old-server/end"))).toHaveLength(1)
+  })
+
+  test.each([false, true])("caption-ready filing resumes its optional description without another event (retry=%s)", async retry => {
+    const storage = new FakeStorage()
+    storage.values.set(JOURNAL_KEY, JSON.stringify({version: 3,
+      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+      resumption: null, pendingTranscripts: [], pendingImages: [{
+        imageId: "caption-ready", mediaRef: "mentra_media/test-phone/caption-ready.png", providerSent: true,
+        captureAfterCurrent: false, generation: 1, sessionId: "old-sitting", caption: "A fictional blue square.",
+        captionEventId: "old-sitting:photo:caption-ready", speakDescription: true, retryRequested: retry,
+      }]}))
+    const h = harness({storage})
+    await start(h)
+    if (retry) await h.controller.retryImage("caption-ready")
+    await waitFor(() => h.sockets[0].sent.some(value => textTurn(JSON.parse(value))))
+    expect(h.sockets[0].sent.filter(value => textTurn(JSON.parse(value)))).toHaveLength(1)
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot/finalize"))).toHaveLength(1)
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional blue square."},
+      modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+    expect(h.audio).toEqual(["AAAAAA=="])
+    expect(h.errors).toEqual([])
+    await h.controller.stop()
+  })
+
+  test.each([false, true])("an owed recall still wakes when its batch also chooses quiet (quietFirst=%s)", async quietFirst => {
+    let release!: () => void
+    const h = harness({recallGate: new Promise<void>(resolve => {release = resolve})})
+    await start(h)
+    try {
+      admitRequest(h, "continuous")
+      const calls = [{id: "owed-recall", name: "recall_memory", args: {query: "fictional comet"}},
+        {id: "quiet-sibling", name: "nothing_to_add", args: {}}]
+      if (quietFirst) calls.reverse()
+      h.sockets[0].message({toolCall: {functionCalls: calls}})
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      release()
+      await waitFor(() => functionResponses(h.sockets[0]).length === 2)
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "quiet-sibling")?.scheduling).toBe("SILENT")
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "owed-recall")?.scheduling).toBe("WHEN_IDLE")
+      expect(h.errors).toEqual([])
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
+  test("Stop does not open another filing lane after a held filing finishes", async () => {
+    const storage = new FakeStorage()
+    const images = ["photo-a", "photo-b"].map(imageId => ({imageId, mediaRef: `mentra_media/test-phone/${imageId}.png`,
+      providerSent: true, captureAfterCurrent: false, generation: 1, sessionId: "old-sitting",
+      caption: "A fictional retained caption.", captionEventId: `old-sitting:photo:${imageId}`}))
+    storage.values.set(JOURNAL_KEY, JSON.stringify({version: 3,
+      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+      resumption: null, pendingTranscripts: [], pendingImages: images}))
+    let release!: () => void
+    const h = harness({storage, finalizeGates: [new Promise<void>(resolve => {release = resolve})]})
+    await start(h)
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+    const stopping = h.controller.stop()
+    release()
+    await stopping
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot/finalize")).map(request => request.body.image_id))
+      .toEqual(["photo-a"])
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages.map((image: any) => image.imageId)).toEqual(["photo-b"])
+    expect(h.errors).toEqual([])
+  })
   test.each(["continuous", "manual"] as const)("%s photo sends original video then a complete unchanged text input after 500ms", async mode => {
     const h = harness({storage: new FakeStorage()})
     await start(h, mode)
@@ -448,14 +568,14 @@ describe("GeminiLiveController", () => {
     })
     try {
       await h.controller.sendImage({imageId: "manual-send-failure", mimeType: "image/png", data: "AQID"})
-      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryRequested)
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryRequested)
       expect(failed).toBe(true)
       expect(socket.sent.map(value => JSON.parse(value)).filter(message => message.realtimeInput?.activityStart || message.realtimeInput?.activityEnd))
         .toEqual([])
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe("manual-send-failure")
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].imageId).toBe("manual-send-failure")
       expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
       expect(h.audio).toEqual([])
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed ?? false).toBe(false)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed ?? false).toBe(false)
     } finally {
       sending.mockRestore()
       await h.controller.stop()
@@ -474,11 +594,11 @@ describe("GeminiLiveController", () => {
       // Accounting during the delivery delay is still the older reply's sample.
       h.sockets[0].message(imageUsage(329))
       await waitPhotoTask(h.sockets[0], "held-caption")
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageBaseline).toBe(266)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].imageBaseline).toBe(266)
       provisionalCaption(h.sockets[0], "held-caption", "A fictional green triangle.")
       await waitFor(() => h.photoCaptions.length === 1)
       const held = () => {
-        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.caption).toBeUndefined()
+        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].caption).toBeUndefined()
         expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
         expect(h.requests.flatMap(request => request.body.events ?? []).some(event => event.event_kind === "photo_caption")).toBe(false)
         expect(functionResponses(h.sockets[0]).some(response => response.response.durable)).toBe(false)
@@ -538,7 +658,7 @@ describe("GeminiLiveController", () => {
       expect(h.sockets[0].sent.some(value => photoTask(JSON.parse(value)))).toBe(false)
       expect(h.sockets[0].sent.map(value => JSON.parse(value)).filter(message => message.realtimeInput?.activityStart).length)
         .toBe(mode === "manual" ? 1 : 0)
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed ?? false).toBe(false)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed ?? false).toBe(false)
       if (mode === "continuous") h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
       h.sockets[0].message({serverContent: {inputTranscription: {text: "Where is the fictional beacon?"}}})
       h.sockets[0].message({toolCall: {functionCalls: [{id: "window-recall", name: "recall_memory", args: {query: "fictional beacon"}}]}})
@@ -556,7 +676,7 @@ describe("GeminiLiveController", () => {
         .toEqual([photoTaskText("speech-window", true)])
       expect(h.audio).toEqual(["AAAAAA=="])
       await waitFor(() => h.requests.flatMap(request => request.body.events ?? []).some(event => event.content === "Beside the fictional harbor."))
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed ?? false).toBe(false)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed ?? false).toBe(false)
       provisionalCaption(h.sockets[0], "speech-window", "A fictional green triangle.")
       h.sockets[0].message({...noImageUsage(), serverContent: {turnComplete: true}})
       await waitFor(() => h.sockets[0].sent.filter(value => photoTask(JSON.parse(value))).length === 2, 1_000)
@@ -581,7 +701,7 @@ describe("GeminiLiveController", () => {
         provisionalCaption(h.sockets[0], "interrupted-allowance", "Interrupted provisional scene.", `interrupted-${index}`)
         h.sockets[0].message({...imageUsage(63), serverContent: {interrupted: true, turnComplete: true}})
         await waitFor(() => h.sockets[0].sent.filter(value => photoInput(JSON.parse(value))).length === index + 2)
-        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed ?? false).toBe(false)
+        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed ?? false).toBe(false)
         expect(h.photoRetryChanges.at(-1)).not.toBe(true)
         expect(h.finalizations).toEqual([])
       }
@@ -589,7 +709,7 @@ describe("GeminiLiveController", () => {
       provisionalCaption(h.sockets[0], "interrupted-allowance", "A completed miss.", "normal-miss")
       h.sockets[0].message({...noImageUsage(), serverContent: {turnComplete: true}})
       await waitFor(() => h.sockets[0].sent.filter(value => photoTask(JSON.parse(value))).length === 5, 1_000)
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed).toBe(true)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed).toBe(true)
       provisionalCaption(h.sockets[0], "interrupted-allowance", "A grounded fictional triangle.", "normal-success")
       h.sockets[0].message({...imageUsage(126), serverContent: {turnComplete: true}})
       await waitFor(() => h.finalizations.length === 1)
@@ -616,7 +736,7 @@ describe("GeminiLiveController", () => {
       await h.controller.stop(true)
       expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
       expect(h.requests.flatMap(request => request.body.events ?? []).some(event => event.event_kind === "photo_caption")).toBe(false)
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage).toMatchObject({imageId: "unknown-photo"})
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0]).toMatchObject({imageId: "unknown-photo"})
       expect(h.photoCaptions.some(caption => caption.durable)).toBe(false)
       expect(h.photoRetryChanges.at(-1)).toBe(true)
     } finally {
@@ -645,7 +765,7 @@ describe("GeminiLiveController", () => {
       if (outcome !== "unfinished") {
         await waitFor(() => h.sockets[0].sent.filter(value => photoTask(JSON.parse(value))).length === 2, 1_000)
         expect(h.photoRetryChanges.at(-1)).not.toBe(true)
-        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed).toBe(true)
+        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed).toBe(true)
         provisionalCaption(h.sockets[0], "bounded-accounting", "Still unverified.", "second-unknown")
         h.sockets[0].message({...accounting, serverContent: {turnComplete: true}})
       }
@@ -653,12 +773,12 @@ describe("GeminiLiveController", () => {
       expect(bounds).toEqual(outcome === "unfinished" ? [30_000] : [30_000, 30_000])
       expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(outcome === "unfinished" ? 1 : 2)
       expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe("bounded-accounting")
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed ?? false).toBe(outcome !== "unfinished")
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].imageId).toBe("bounded-accounting")
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed ?? false).toBe(outcome !== "unfinished")
       expect(h.requests.flatMap(request => request.body.events ?? []).some(event => event.event_kind === "photo_caption")).toBe(false)
       expect(h.photoCaptions.some(caption => caption.durable)).toBe(false)
       await h.controller.discardImage()
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY) || "null")?.pendingImage ?? null).toBeNull()
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY) || "null")?.pendingImages[0] ?? null).toBeNull()
     } finally {
       timer.mockRestore()
       await h.controller.stop()
@@ -672,14 +792,14 @@ describe("GeminiLiveController", () => {
     try {
       await h.controller.sendImage({imageId: "resend-photo", mimeType: "image/png", data: "AQID"})
       await waitPhotoTask(h.sockets[0], "resend-photo")
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageBaseline).toBe(0)
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed ?? false).toBe(false)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].imageBaseline).toBe(0)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed ?? false).toBe(false)
       provisionalCaption(h.sockets[0], "resend-photo", "First unverified caption.", "first-attempt")
       h.sockets[0].message({...noImageUsage(), serverContent: {turnComplete: true}})
       await waitFor(() => h.sockets[0].sent.filter(value => photoTask(JSON.parse(value))).length === 2, 1_000)
       expect(h.sockets[0].sent.map(value => JSON.parse(value)).filter(photoInput))
         .toEqual([photoVideo(), photoVideo()])
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed).toBe(true)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed).toBe(true)
       expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
       provisionalCaption(h.sockets[0], "resend-photo", "Second fictional caption.", "second-attempt")
       h.sockets[0].message({...(outcome === "success" ? imageUsage(1) : noImageUsage()), serverContent: {turnComplete: true}})
@@ -693,9 +813,9 @@ describe("GeminiLiveController", () => {
         expect(h.requests.flatMap(request => request.body.events ?? []).some(event => event.event_kind === "photo_caption")).toBe(false)
         await h.controller.retryImage()
         await waitFor(() => h.sockets[0].sent.filter(value => photoTask(JSON.parse(value))).length === 3)
-        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed ?? false).toBe(false)
+        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed ?? false).toBe(false)
         await h.controller.discardImage()
-        expect(JSON.parse(storage.values.get(JOURNAL_KEY) || "null")?.pendingImage ?? null).toBeNull()
+        expect(JSON.parse(storage.values.get(JOURNAL_KEY) || "null")?.pendingImages[0] ?? null).toBeNull()
       }
     } finally {
       await h.controller.stop()
@@ -723,7 +843,7 @@ describe("GeminiLiveController", () => {
       expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
       expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(1)
       const journal = JSON.parse(storage.values.get(JOURNAL_KEY)!)
-      expect(journal.pendingImage).toMatchObject({imageId: "retained-attempt", imageBaseline: baseline, retryUsed: true})
+      expect(journal.pendingImages[0]).toMatchObject({imageId: "retained-attempt", imageBaseline: baseline, retryUsed: true})
       if (baseline !== null) expect(journal.resumption.imageTokens).toBe(329)
     } finally {
       await h.controller.stop()
@@ -753,20 +873,20 @@ describe("GeminiLiveController", () => {
           .toEqual([mode === "manual"
             ? {clientContent: {turns: [{role: "user", parts: [{text: photoTaskText("reconnect-allowance", true)}]}], turnComplete: true}}
             : {realtimeInput: {text: photoTaskText("reconnect-allowance", true)}}])
-        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageBaseline).toBe(329)
-        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed ?? false).toBe(false)
+        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].imageBaseline).toBe(329)
+        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed ?? false).toBe(false)
         expect(h.photoRetryChanges.at(-1)).not.toBe(true)
       }
       provisionalCaption(h.sockets[2], "reconnect-allowance", "A replacement unverified caption.", "replacement-caption")
       h.sockets[2].message({...imageUsage(329), serverContent: {turnComplete: true}})
       await waitFor(() => h.sockets[2].sent.filter(value => photoTask(JSON.parse(value))).length === 2, 1_000)
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed).toBe(true)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed).toBe(true)
       h.sockets[2].close()
       await waitFor(() => h.sockets.length === 4)
       h.sockets[3].open()
       h.sockets[3].message({setupComplete: {}})
       await waitPhotoTask(h.sockets[3], "reconnect-allowance", true)
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed).toBe(true)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed).toBe(true)
       provisionalCaption(h.sockets[3], "reconnect-allowance", "Another completed miss.", "final-miss")
       h.sockets[3].message({...imageUsage(329), serverContent: {turnComplete: true}})
       await waitFor(() => h.photoRetryChanges.at(-1) === true)
@@ -788,7 +908,7 @@ describe("GeminiLiveController", () => {
     let reserving = false
     const write = storage.set.bind(storage)
     const writeSpy = spyOn(storage, "set").mockImplementation(async (key, value) => {
-      if (!reserving && key === JOURNAL_KEY && JSON.parse(value || "null")?.pendingImage?.mediaRef) {
+      if (!reserving && key === JOURNAL_KEY && JSON.parse(value || "null")?.pendingImages[0]?.mediaRef) {
         reserving = true
         storage.setGate = gate
       }
@@ -814,12 +934,12 @@ describe("GeminiLiveController", () => {
       })
       if (stopping) await stopping
       if (action === "send") {
-        expect(journalAtFrame.pendingImage).toMatchObject({imageId: "durable-allowance", imageBaseline: 0})
-        expect(journalAtFrame.pendingImage.retryUsed ?? false).toBe(false)
+        expect(journalAtFrame.pendingImages[0]).toMatchObject({imageId: "durable-allowance", imageBaseline: 0})
+        expect(journalAtFrame.pendingImages[0].retryUsed ?? false).toBe(false)
       } else {
         if (action === "disconnect") expect(journalAtFrame).toBeUndefined()
         // Stop may deliver during its existing drain; neither path spends retry.
-        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed ?? false).toBe(false)
+        expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed ?? false).toBe(false)
         expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
       }
     } finally {
@@ -1469,7 +1589,7 @@ describe("GeminiLiveController", () => {
     try {
       await h.controller.sendImage({imageId: "overlap-original", mimeType: "image/png", data: "AQID"})
       expect(h.requests.find(request => request.url.endsWith("/snapshot"))?.body.image_id).toBe("overlap-original")
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.mediaRef).toBe("mentra_media/test-phone/overlap-original.png")
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].mediaRef).toBe("mentra_media/test-phone/overlap-original.png")
       await waitPhotoTask(h.sockets[0], "overlap-original")
       admitRequest(h, mode)
       await completePhotoCaption(h.sockets[0], "overlap-original", "A fictional green triangle.", "overlap-caption")
@@ -1505,7 +1625,7 @@ describe("GeminiLiveController", () => {
     await start(h)
     try {
       await h.controller.sendImage({imageId: "asr-copacket-original", mimeType: "image/png", data: "AQID"})
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.mediaRef)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].mediaRef)
         .toBe("mentra_media/test-phone/asr-copacket-original.png")
       await waitPhotoTask(h.sockets[0], "asr-copacket-original")
       // No START or Manual Send: these are the sitting's first spoken words.
@@ -1770,7 +1890,7 @@ describe("GeminiLiveController", () => {
     await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").draftTranscripts?.[0]?.content ===
       "Words from replaced history.")
     const raw = storage.values.get(JOURNAL_KEY)!
-    expect(JSON.parse(raw).version).toBe(2)
+    expect(JSON.parse(raw).version).toBe(3)
     expect(journalSoulId(raw, CONFIG)).toBe(CONFIG.soulId)
     expect(JSON.parse(raw).pendingTranscripts).toEqual([])
     expect(JSON.parse(raw).nextTranscriptSequence).toBe(41)
@@ -1871,7 +1991,7 @@ describe("GeminiLiveController", () => {
     expect(finalize).toBeGreaterThan(upload)
     expect(h.requests[finalize].body).toEqual({user_id: CONFIG.userId, soul_id: CONFIG.soulId,
       image_id: "late-photo", caption: "A fictional striped oval.", caption_event_id: "sitting-1:photo:late-photo"})
-    await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage === null)
+    await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages.length === 0)
     expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).draftTranscripts.map((draft: any) => draft.event_kind))
       .toEqual(["transcript", "transcript", "image", "photo_caption"])
     h.sockets[0].message({serverContent: {inputTranscription: {text: "The delayed photo question."}}})
@@ -2107,12 +2227,12 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.finalizations.length === 1)
     await h.controller.stop()
     const journal = JSON.parse(storage.values.get(JOURNAL_KEY)!)
-    expect(journal.pendingImage).toBeNull()
+    expect(journal.pendingImages).toEqual([])
     expect(journal.pendingTranscripts.find((event: any) => event.event_kind === "photo_caption").event_id)
       .toBe("sitting-1:42")
     expect(h.finalizations).toEqual([{ok: true, durable: true, queued: true}])
     const recovered = harness({storage, history, startBody: {
-      session_id: "replacement-sitting", next_transcript_sequence: recovery === "rekey" ? 41 : 45,
+      photo_work_protocol: "iris-photo-work-v1", session_id: "replacement-sitting", next_transcript_sequence: recovery === "rekey" ? 41 : 45,
       ephemeral_token: "ephemeral/test", websocket: {api_version: "v1beta",
         method: "BidiGenerateContentConstrained", input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
       lease_seconds: 90, session_warning_seconds: 0,
@@ -2142,14 +2262,14 @@ describe("GeminiLiveController", () => {
       }
       h.sockets[0].message({...imageUsage(63), serverContent: {outputTranscription: {text: "Unspoken photo reasoning."}, turnComplete: true}})
       await waitFor(() => h.sockets[0].sent.filter(value => photoInput(JSON.parse(value))).length === 2)
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed).toBe(true)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed).toBe(true)
       expect(h.photoRetryChanges.at(-1)).not.toBe(true)
       await waitFor(() => h.sockets[0].sent.filter(value => photoTask(JSON.parse(value))).length === 2, 1_000)
       h.sockets[0].message({...imageUsage(126), serverContent: {turnComplete: true}})
       await waitFor(() => h.photoRetryChanges.at(-1) === true)
       expect(h.persistenceErrors).toContain(PHOTO_RETRY_MESSAGE)
-      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage?.retryRequested === true)
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage).toMatchObject({
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0]?.retryRequested === true)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0]).toMatchObject({
         imageId: "skipped-caption", mediaRef: "mentra_media/test-phone/skipped-caption.png", retryRequested: true,
       })
       expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
@@ -2269,7 +2389,7 @@ describe("GeminiLiveController", () => {
       expect(h.requests.filter(request => request.url.endsWith("/snapshot")).map(request => request.body.image_id))
         .toEqual(["boundary-square", "boundary-triangle"])
       expect(images()).toEqual([{data: "AQID", mimeType: "image/png"}, {data: "BAUG", mimeType: "image/png"}])
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage).toMatchObject({
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0]).toMatchObject({
         imageId: "boundary-triangle", mediaRef: "mentra_media/test-phone/boundary-triangle.png", providerSent: true,
       })
       expect(images()).toHaveLength(2)
@@ -2400,7 +2520,7 @@ describe("GeminiLiveController", () => {
     await h.controller.sendImage({imageId: "photo-b", mimeType: "image/png", data: "BAUG"})
     await waitFor(() => history.some(event => event.event_kind === "image"))
     await new Promise(resolve => setTimeout(resolve, 0))
-    const pendingB = JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage
+    const pendingB = JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0]
     provisionalCaption(h.sockets[0], "photo-a", conflict ? "A different fictional scene." : "A fictional amber star.", "duplicate-a")
     const results = () => h.sockets[0].sent.flatMap(value => JSON.parse(value).toolResponse?.functionResponses ?? [])
     await waitFor(() => results().some(result => result.id === "duplicate-a"))
@@ -2408,7 +2528,7 @@ describe("GeminiLiveController", () => {
       .toEqual(conflict ? {ok: false, durable: false, status: "conflict"} : {ok: true, durable: true})
     expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay")).map(request => request.body))
       .toEqual([{user_id: CONFIG.userId, soul_id: CONFIG.soulId, image_id: "photo-a"}])
-    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage).toEqual(pendingB)
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0]).toEqual(pendingB)
     expect(history.filter(event => event.event_kind === "photo_caption")).toEqual([])
     expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
     expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(1)
@@ -2484,7 +2604,7 @@ describe("GeminiLiveController", () => {
     }
     expect(h.requests.filter(request => request.url.endsWith("/transcripts/append"))
       .flatMap(request => request.body.events).some(event => event.content === "Unheard timeout cleanup output.")).toBe(false)
-    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe("timeout-photo")
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].imageId).toBe("timeout-photo")
   })
 
   test("a silent photo does not mute the answer already in progress", async () => {
@@ -2518,7 +2638,7 @@ describe("GeminiLiveController", () => {
     expect(h.sockets[0].sent).toHaveLength(1)
     expect(h.photoRetryChanges.at(-1)).not.toBe(true)
     if (status < 500) expect(options.storage.values.get(JOURNAL_KEY)).toBe("")
-    else expect(JSON.parse(options.storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe("image-1")
+    else expect(JSON.parse(options.storage.values.get(JOURNAL_KEY)!).pendingImages[0].imageId).toBe("image-1")
     options.snapshotStatus = 200
     await h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"})
     expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(2)
@@ -2536,20 +2656,15 @@ describe("GeminiLiveController", () => {
     const image = {imageId: "uncertain-photo", mimeType: "image/png" as const, data: "AQID"}
     await expect(h.controller.sendImage(image)).rejects.toThrow("acknowledgment lost")
     expect(h.photoRetryChanges.at(-1)).not.toBe(true)
-    const uncertain = options.storage.values.get(JOURNAL_KEY)
-    await expect(h.controller.sendImage({...image, imageId: "different-photo"}))
-      .rejects.toThrow("Another photo is still pending")
-    expect(options.storage.values.get(JOURNAL_KEY)).toBe(uncertain)
-    expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
     options.snapshotThrows = false
+    await h.controller.sendImage({...image, imageId: "different-photo"})
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages.map((image: any) => image.imageId))
+      .toEqual(["uncertain-photo", "different-photo"])
     options.snapshotStatus = 503
     await expect(h.controller.sendImage(image)).rejects.toThrow("snapshot failed (503)")
-    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe(image.imageId)
-    const unknown = storage.values.get(JOURNAL_KEY)
-    await expect(h.controller.sendImage({...image, imageId: "different-photo"}))
-      .rejects.toThrow("Another photo is still pending")
-    expect(storage.values.get(JOURNAL_KEY)).toBe(unknown)
-    expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(2)
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].imageId).toBe(image.imageId)
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages).toHaveLength(2)
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(3)
     options.snapshotStatus = 200
     await h.controller.sendImage(image)
     expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(1)
@@ -2570,7 +2685,7 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
-  test("requires explicit Discard before a retake replaces an accepted provider-send failure", async () => {
+  test("a new photo preserves a failed original until that exact original is discarded", async () => {
     const storage = new FakeStorage()
     const h = harness({storage})
     await start(h)
@@ -2578,23 +2693,20 @@ describe("GeminiLiveController", () => {
     await expect(h.controller.sendImage({imageId: "image-1", mimeType: "image/png", data: "AQID"}))
       .rejects.toThrow("Gemini image send failed")
     expect(h.photoRetryChanges.at(-1)).toBe(true)
-    const retained = storage.values.get(JOURNAL_KEY)
-
     h.sockets[0].failAtSendCount = null
-    await expect(h.controller.sendImage({imageId: "image-2", mimeType: "image/png", data: "AQID"}))
-      .rejects.toThrow("Another photo is still pending")
-    expect(storage.values.get(JOURNAL_KEY)).toBe(retained)
-    expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
-    expect(h.photoRetryChanges.at(-1)).toBe(true)
-    await h.controller.discardImage()
-    expect(storage.values.get(JOURNAL_KEY)).toBe("")
     await h.controller.sendImage({imageId: "image-2", mimeType: "image/png", data: "AQID"})
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages.map((image: any) => image.imageId))
+      .toEqual(["image-1", "image-2"])
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(2)
+    expect(h.photoRetryChanges.at(-1)).toBe(true)
+    await h.controller.discardImage("image-1")
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages.map((image: any) => image.imageId)).toEqual(["image-2"])
 
     expect(h.sockets[0].sent.filter((value) => photoInput(JSON.parse(value)))).toHaveLength(1)
     await h.controller.stop()
   })
 
-  test("a retained unsent retry must be explicitly discarded before replacement clears its actions", async () => {
+  test("a retained unsent retry keeps its actions when another photo is accepted", async () => {
     const storage = new FakeStorage()
     storage.values.set("openalma:gemini-session-v1", JSON.stringify({
       version: 1,
@@ -2614,16 +2726,14 @@ describe("GeminiLiveController", () => {
     await start(h)
     await waitFor(() => h.photoRetryChanges.at(-1) === true)
 
-    const retained = storage.values.get(JOURNAL_KEY)
-    await expect(h.controller.sendImage({imageId: "image-2", mimeType: "image/png", data: "AQID"}))
-      .rejects.toThrow("Another photo is still pending")
-    expect(storage.values.get(JOURNAL_KEY)).toBe(retained)
-    expect(h.photoRetryChanges.at(-1)).toBe(true)
-    expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
-    await h.controller.discardImage()
-    expect(storage.values.get(JOURNAL_KEY)).toBe("")
-    expect(h.photoRetryChanges.at(-1)).toBe(false)
     await h.controller.sendImage({imageId: "image-2", mimeType: "image/png", data: "AQID"})
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages.map((image: any) => image.imageId))
+      .toEqual(["image-1", "image-2"])
+    expect(h.photoRetryChanges.at(-1)).toBe(true)
+    expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
+    await h.controller.discardImage("image-1")
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages.map((image: any) => image.imageId)).toEqual(["image-2"])
+    expect(h.photoRetryChanges.at(-1)).toBe(false)
 
     expect(h.photoRetryChanges.at(-1)).toBe(false)
     await h.controller.stop()
@@ -2652,7 +2762,7 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot")))
     expect(h.photoRetryChanges.at(-1)).not.toBe(true)
     await h.controller.stop()
-    expect(JSON.parse(uploadStorage.values.get(JOURNAL_KEY)!).pendingImage).toEqual(expect.objectContaining({
+    expect(JSON.parse(uploadStorage.values.get(JOURNAL_KEY)!).pendingImages[0]).toEqual(expect.objectContaining({
       imageId: "image-1", providerSent: false,
     }))
     expect(h.persistenceErrors.at(-1)).toContain("Photo may have been saved")
@@ -2695,7 +2805,7 @@ describe("GeminiLiveController", () => {
       completeTurn(replacement, "A fictional replacement question.", "A fictional replacement answer.")
       await waitFor(() => replacement.requests.some((request) => request.url.endsWith("/transcripts/append")))
       const journal = storage.values.get("openalma:gemini-session-v1")!
-      expect(JSON.parse(journal).pendingImage.imageId).toBe("image-1")
+      expect(JSON.parse(journal).pendingImages[0].imageId).toBe("image-1")
       expect(JSON.parse(journal).pendingTranscripts).toHaveLength(2)
       const callbacks = [old.photoRetryChanges.length, old.persistenceErrors.length, old.errors.length]
 
@@ -2728,23 +2838,22 @@ describe("GeminiLiveController", () => {
     await old.controller.stop()
 
     const replacement = harness({storage, appendStatuses: Array(100).fill(503), startBody: {
-      session_id: "replacement-sitting", next_transcript_sequence: 41, ephemeral_token: "ephemeral/test",
+      photo_work_protocol: "iris-photo-work-v1", session_id: "replacement-sitting", next_transcript_sequence: 41, ephemeral_token: "ephemeral/test",
       websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
         input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
       lease_seconds: 90, session_warning_seconds: 0,
     }})
     await start(replacement)
-    const retained = storage.values.get(JOURNAL_KEY)
-    await expect(replacement.controller.sendImage({imageId: "replacement-photo", mimeType: "image/png", data: "AQID"}))
-      .rejects.toThrow("Another photo is still pending")
-    expect(storage.values.get(JOURNAL_KEY)).toBe(retained)
-    expect(replacement.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
-    await replacement.controller.discardImage()
     await replacement.controller.sendImage({imageId: "replacement-photo", mimeType: "image/png", data: "AQID"})
+    const retained = storage.values.get(JOURNAL_KEY)
+    expect(JSON.parse(retained!).pendingImages.map((image: any) => image.imageId)).toEqual(["image-1", "replacement-photo"])
+    expect(replacement.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
+    await replacement.controller.discardImage("image-1")
     completeTurn(replacement, "A fictional replacement question.", "A fictional replacement caption.")
     await waitFor(() => replacement.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
+    await (replacement.controller as unknown as {appendTail: Promise<void>}).appendTail
     const journal = storage.values.get("openalma:gemini-session-v1")!
-    expect(JSON.parse(journal).pendingImage.imageId).toBe("replacement-photo")
+    expect(JSON.parse(journal).pendingImages[0].imageId).toBe("replacement-photo")
     expect(JSON.parse(journal).pendingTranscripts).toHaveLength(3)
     const callbacks = [old.photoRetryChanges.length, old.persistenceErrors.length, old.errors.length]
     const replacementCallbacks = [replacement.photoRetryChanges.length, replacement.persistenceErrors.length,
@@ -2821,7 +2930,7 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
-  test("a new photo cannot replace an accepted photo during automatic replay", async () => {
+  test("a new photo queues without replacing an accepted photo during automatic replay", async () => {
     let release!: () => void
     const replayGate = new Promise<void>((resolve) => { release = resolve })
     const storage = new FakeStorage()
@@ -2832,10 +2941,11 @@ describe("GeminiLiveController", () => {
       h.sockets[0].message({serverContent: {interrupted: true, turnComplete: true}})
       completeTurn(h)
       await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/replay")))
-      await expect(h.controller.sendImage({imageId: "new-photo", mimeType: "image/jpeg", data: "AQID"}))
-        .rejects.toThrow("Another photo is still pending")
-      expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe("original-photo")
+      await h.controller.sendImage({imageId: "new-photo", mimeType: "image/jpeg", data: "AQID"})
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(2)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages.map((image: any) => image.imageId))
+        .toEqual(["original-photo", "new-photo"])
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].imageId).toBe("original-photo")
     } finally {
       release()
       await h.controller.stop()
@@ -2930,7 +3040,7 @@ describe("GeminiLiveController", () => {
       .toMatchObject({response: {ok: false, status: "failed"}, scheduling: "SILENT"})
     expect(h.requests.filter(request => request.url.endsWith("/snapshot/finalize"))).toHaveLength(attemptsBeforeRetry)
     expect(h.photoRetryChanges.at(-1)).toBe(true)
-    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage)
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0])
       .toMatchObject({caption: "A fictional blue square.", retryRequested: true})
 
     h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
@@ -2954,7 +3064,7 @@ describe("GeminiLiveController", () => {
     await completePhotoCaption(old.sockets[0], "retained-photo", "A fictional paper kite.")
     await waitFor(() => old.photoRetryChanges.at(-1) === true)
     await old.controller.stop()
-    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.caption).toBe("A fictional paper kite.")
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].caption).toBe("A fictional paper kite.")
     const next = harness({storage, startSequence: 43})
     await start(next)
     expect(next.photoRetryChanges.at(-1)).toBe(true)
@@ -2975,8 +3085,8 @@ describe("GeminiLiveController", () => {
       await completePhotoCaption(old.sockets[0], "image-1", "A fictional blue square.")
       await waitFor(() => old.photoRetryChanges.at(-1) === true)
       const captionJournal = JSON.parse(storage.values.get("openalma:gemini-session-v1")!)
-      expect(captionJournal.pendingImage.caption).toBe("A fictional blue square.")
-      expect(captionJournal.pendingImage.captionEventId).toBe("sitting-1:photo:image-1")
+      expect(captionJournal.pendingImages[0].caption).toBe("A fictional blue square.")
+      expect(captionJournal.pendingImages[0].captionEventId).toBe("sitting-1:photo:image-1")
       expect(captionJournal.pendingTranscripts).toEqual([])
 
       let finishFinalize!: () => void
@@ -2993,7 +3103,7 @@ describe("GeminiLiveController", () => {
       await old.controller.stop()
 
       const replacement = harness({storage, appendStatuses: Array(100).fill(503), startBody: {
-        session_id: "replacement-sitting", next_transcript_sequence: 43, ephemeral_token: "ephemeral/test",
+        photo_work_protocol: "iris-photo-work-v1", session_id: "replacement-sitting", next_transcript_sequence: 43, ephemeral_token: "ephemeral/test",
         websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
           input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
         lease_seconds: 90, session_warning_seconds: 0,
@@ -3002,7 +3112,7 @@ describe("GeminiLiveController", () => {
       completeTurn(replacement, "A fictional replacement question.", "A fictional replacement answer.")
       await waitFor(() => replacement.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
       const journal = storage.values.get("openalma:gemini-session-v1")!
-      expect(JSON.parse(journal).pendingImage.imageId).toBe("image-1")
+      expect(JSON.parse(journal).pendingImages[0].imageId).toBe("image-1")
       expect(JSON.parse(journal).pendingTranscripts).toHaveLength(2)
       const callbacks = [old.photoRetryChanges.length, old.persistenceErrors.length, old.errors.length]
       const replacementCallbacks = [replacement.photoRetryChanges.length, replacement.persistenceErrors.length,
@@ -3061,7 +3171,7 @@ describe("GeminiLiveController", () => {
       await waitFor(() => h.reconnecting.at(-1) === false)
       expect(functionResponses(h.sockets[1])).toEqual([])
       expect(h.sockets[1].sent.some(value => photoInput(JSON.parse(value)) || photoTask(JSON.parse(value)))).toBe(false)
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.retryUsed ?? false).toBe(false)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed ?? false).toBe(false)
       release()
       await waitFor(() => functionResponses(h.sockets[1]).some(response => response.id === "held-filing-call"))
       expect(functionResponses(h.sockets[1]).find(response => response.id === "held-filing-call"))
@@ -3093,8 +3203,8 @@ describe("GeminiLiveController", () => {
     await start(h)
     await h.controller.retryImage()
     const journal = JSON.parse(storage.values.get(JOURNAL_KEY)!)
-    expect(journal.pendingImage.mediaRef).toBe("mentra_media/test-phone/upload-race.png")
-    expect(journal.pendingImage.providerSent).toBe(true)
+    expect(journal.pendingImages[0].mediaRef).toBe("mentra_media/test-phone/upload-race.png")
+    expect(journal.pendingImages[0].providerSent).toBe(true)
     expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
     await h.controller.stop()
   })
@@ -3112,7 +3222,7 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.requests.some((request) => request.url.endsWith("/snapshot/finalize")))
     expect(stopped).toBe(false)
     expect(h.requests.some((request) => request.url.endsWith("/end"))).toBe(false)
-    expect(JSON.parse(storage.values.get("openalma:gemini-session-v1")!).pendingImage.caption)
+    expect(JSON.parse(storage.values.get("openalma:gemini-session-v1")!).pendingImages[0].caption)
       .toBe("A fictional blue square.")
 
     finishFinalize()
@@ -3165,7 +3275,7 @@ describe("GeminiLiveController", () => {
       expect(h.errors).toEqual([])
       expect(h.photoRetryChanges.at(-1)).toBe(true)
       expect(h.persistenceErrors.at(-1)).toBe(PHOTO_RETRY_MESSAGE)
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageId).toBe("missing-image")
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].imageId).toBe("missing-image")
       await h.controller.stop()
     }
   })
@@ -3366,14 +3476,14 @@ describe("GeminiLiveController", () => {
       await start(h)
       h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "photo-delivery-handle"}})
       await h.controller.sendImage({imageId: "resumed-photo", mimeType: "image/png", data: "AQID"})
-      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage?.imageRecorded === true)
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0]?.imageRecorded === true)
       h.sockets[0].close()
       await waitFor(() => h.sockets.length === 2)
       h.sockets[1].open()
       expect(JSON.parse(h.sockets[1].sent[0])).toEqual({setup: {sessionResumption: {handle: "photo-delivery-handle"}}})
       h.sockets[1].message({setupComplete: {}})
       await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/replay")))
-      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage?.providerSent === false)
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0]?.providerSent === false)
       provisionalCaption(h.sockets[1], "resumed-photo", "A fictional green crescent.", "lost-delivery")
       h.sockets[1].message({...imageUsage(63), serverContent: {turnComplete: true}})
       await new Promise(resolve => setTimeout(resolve, 0))
@@ -3464,7 +3574,7 @@ describe("GeminiLiveController", () => {
     if (!combined) h.sockets[0].message({serverContent: {turnComplete: true}})
     await new Promise(resolve => setTimeout(resolve, 0))
     expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(1)
-    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.providerSent).toBe(false)
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].providerSent).toBe(false)
     expect(h.photoRetryChanges.at(-1)).not.toBe(true)
     expect(h.persistenceErrors).not.toContain(PHOTO_RETRY_MESSAGE)
     h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
@@ -3616,7 +3726,7 @@ describe("GeminiLiveController", () => {
     if (boundary !== "input") {
       expect(rows.some(event => event.event_kind === "transcript_gap")).toBe(false)
     }
-    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage).toEqual(expect.objectContaining({
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0]).toEqual(expect.objectContaining({
       imageId: "gap-photo", mediaRef: "mentra_media/test-phone/gap-photo.png", providerSent: ["empty", "output"].includes(boundary),
     }))
     expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
@@ -3675,6 +3785,7 @@ describe("GeminiLiveController", () => {
         user_id: "Test User",
         soul_id: "Test Soul",
         device_session_id: "test-phone",
+        photo_work_protocol: "iris-photo-work-v1",
         mode: "continuous",
       },
       authorization: null,
@@ -3775,7 +3886,7 @@ describe("GeminiLiveController", () => {
         {
           status: 200,
           body: {
-            session_id: "sitting-2",
+            photo_work_protocol: "iris-photo-work-v1", session_id: "sitting-2",
             next_transcript_sequence: 42,
             ephemeral_token: "ephemeral/retry",
             websocket: {
@@ -4694,7 +4805,7 @@ describe("GeminiLiveController", () => {
     expect(storage.values.has(RECOVERED_CHATS_KEY)).toBe(false)
   })
 
-  test("photo-only backup outside restored history is archived before any finalization", async () => {
+  test("photo-only backup outside restored history remains recoverable independently of archived dialogue", async () => {
     const storage = new FakeStorage()
     const raw = JSON.stringify({version: 1,
       scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
@@ -4703,12 +4814,13 @@ describe("GeminiLiveController", () => {
         providerSent: true, captureAfterCurrent: false, generation: 1, sessionId: "old",
         imageSequence: 41, caption: "A retained description", assistantSequence: 42}})
     storage.values.set(JOURNAL_KEY, raw)
-    const h = harness({storage, startBody: {session_id: "restored", next_transcript_sequence: 1,
+    const h = harness({storage, startBody: {photo_work_protocol: "iris-photo-work-v1", session_id: "restored", next_transcript_sequence: 1,
       ephemeral_token: "ephemeral/test", websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
         input_audio_rate_hz: 16000, output_audio_rate_hz: 24000}, lease_seconds: 90, session_warning_seconds: 0}})
     await start(h)
     expect(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)).toEqual([raw])
-    expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+    expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id).toBe("old:42")
     expect(JSON.parse(h.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
     await h.controller.stop()
   })
@@ -4722,8 +4834,8 @@ describe("GeminiLiveController", () => {
     await completePhotoCaption(h.sockets[0], "long-caption", caption)
     await waitFor(() => h.photoRetryChanges.at(-1) === true)
     const recovered = JSON.parse(storage.values.get(JOURNAL_KEY)!)
-    expect(recovered.pendingImage.caption).toBe(caption)
-    expect(recovered.pendingImage.captionEventId).toBe("sitting-1:photo:long-caption")
+    expect(recovered.pendingImages[0].caption).toBe(caption)
+    expect(recovered.pendingImages[0].captionEventId).toBe("sitting-1:photo:long-caption")
     const saved = h.requests.filter(request => request.url.endsWith("/transcripts/append")).flatMap(request => request.body.events)
     expect(saved.filter(event => event.role === "assistant").map(event => event.content).join("")).toBe(caption)
     expect(storage.values.has(RECOVERED_CHATS_KEY)).toBe(false)
@@ -4850,7 +4962,7 @@ describe("GeminiLiveController", () => {
     const h = harness({
       storage,
       startBody: {
-        session_id: "replacement-sitting",
+        photo_work_protocol: "iris-photo-work-v1", session_id: "replacement-sitting",
         next_transcript_sequence: 41,
         ephemeral_token: "ephemeral/test",
         websocket: {
@@ -4898,14 +5010,14 @@ describe("GeminiLiveController", () => {
       providerSent: false, captureAfterCurrent: false, generation: 1, sessionId: "old-sitting"}
     storage.values.set("openalma:gemini-session-v1", JSON.stringify(recovery))
     const gap = harness({storage, startBody: {
-      session_id: "different-history", next_transcript_sequence: 39, ephemeral_token: "ephemeral/test",
+      photo_work_protocol: "iris-photo-work-v1", session_id: "different-history", next_transcript_sequence: 39, ephemeral_token: "ephemeral/test",
       websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
         input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
       lease_seconds: 90, session_warning_seconds: 0,
     }})
     await start(gap)
     expect(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)).toContain(JSON.stringify(recovery))
-    expect(storage.values.get(JOURNAL_KEY)).toBe("")
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].imageId).toBe("pending-photo")
     expect(JSON.parse(gap.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
     expect(gap.requests.some((request) => request.url.endsWith("/transcripts/append"))).toBe(false)
     await gap.controller.stop()
@@ -4952,7 +5064,7 @@ describe("GeminiLiveController", () => {
     expect(storage.values.get("openalma:gemini-session-v1")).toBe("")
     await h.controller.sendImage({imageId: "fresh-after-rejection", mimeType: "image/png", data: "AQID"})
     await waitPhotoTask(h.sockets[1], "fresh-after-rejection")
-    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage.imageBaseline).toBe(0)
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].imageBaseline).toBe(0)
     provisionalCaption(h.sockets[1], "fresh-after-rejection", "A fictional fresh-context triangle.")
     h.sockets[1].message({...imageUsage(1), serverContent: {turnComplete: true}})
     await waitFor(() => h.finalizations.length === 1)
@@ -5347,7 +5459,7 @@ describe("GeminiLiveController", () => {
       const rows = h.requests.flatMap(request => request.body.events ?? [])
       expect(rows.filter(row => row.event_kind === "sitting_summary").map(row => row.content))
         .toEqual(["A reflection despite the failed upload."])
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage).toMatchObject({
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0]).toMatchObject({
         imageId: "failed-photo", providerSent: false, retryRequested: true,
       })
       expect(h.requests.some(request => request.url.endsWith("/snapshot/replay"))).toBe(false)
@@ -5421,7 +5533,7 @@ describe("GeminiLiveController", () => {
       expect(h.persistenceErrors).toContain("Some spoken words could not be transcribed")
       expect(h.errors).toEqual([])
       expect(h.audio).toEqual(["AAAAAA=="])
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImage)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0])
         .toMatchObject({imageId: "heard-timeout", retryRequested: true})
       expect(h.sockets[0].sent.some(value => textTurn(JSON.parse(value)))).toBe(false)
       expect(h.requests.filter(request => request.url.endsWith("/end"))).toHaveLength(1)

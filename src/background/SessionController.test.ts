@@ -45,6 +45,9 @@ class FakeLive {
   images: unknown[] = []
   imageRetries = 0
   imageDiscards = 0
+  imageRetryIds: Array<string | undefined> = []
+  imageDiscardIds: Array<string | undefined> = []
+  pendingPhotoIds: string[] = []
   activityError: Error | null = null
   startGate: Promise<void> | null = null
   stopGate: Promise<void> | null = null
@@ -75,12 +78,14 @@ class FakeLive {
     this.images.push(image)
   }
 
-  async retryImage(): Promise<void> {
+  async retryImage(imageId?: string): Promise<void> {
     this.imageRetries += 1
+    this.imageRetryIds.push(imageId)
   }
 
-  async discardImage(): Promise<void> {
+  async discardImage(imageId?: string): Promise<void> {
     this.imageDiscards += 1
+    this.imageDiscardIds.push(imageId)
   }
 
   async stop(graceful = false): Promise<void> {
@@ -404,16 +409,35 @@ describe("SessionController", () => {
     expect(lastSnapshot(session)).toMatchObject({soulId: selected, memuAvailable: true, soulConfirmed: true})
   })
 
-  test("an older failed filing never takes over the current photo's recovery action", async () => {
-    const h = setup({failedPhotos: ["older-photo"]})
+  test.each(["retry", "discard"])("local parked photo %s targets its ID without touching another photo or server recovery", async action => {
+    const failedPhotos = ["parked-a", "server-c"]
+    const actions: Array<{url: string; body: unknown}> = []
+    const h = setup({failedPhotos, fetchFn: (async (url, init) => {
+      if (String(url).includes("/photos/")) {
+        actions.push({url: String(url), body: JSON.parse(String(init?.body))})
+        failedPhotos.splice(failedPhotos.indexOf("server-c"), 1)
+        return Response.json({ok: true})
+      }
+      return Response.json({souls: [CONFIG.soulId]})
+    }) as typeof fetch})
     await h.session.handlers["openalma:start"]({mode: "continuous"})
-    expect(lastSnapshot(h.session)).toMatchObject({photoRetryPending: false, failedPhotos: ["older-photo"]})
-    await h.session.handlers["openalma:image"]({imageId: "current-photo", mimeType: "image/png", data: "AQID"})
-    expect(h.live.images).toHaveLength(1)
+    h.live.pendingPhotoIds = ["parked-a", "local-b"]
     h.live.photoRetry(true)
-    await h.session.handlers["openalma:pending-image"]({action: "retry"})
-    expect(h.live.imageRetries).toBe(1)
-    expect(lastSnapshot(h.session)?.failedPhotos).toEqual(["older-photo"])
+    expect(lastSnapshot(h.session)).toMatchObject({
+      photoRetryPending: true, pendingPhotoIds: ["parked-a", "local-b"], failedPhotos: ["parked-a", "server-c"],
+    })
+    await h.session.handlers["openalma:pending-image"]({action, imageId: "parked-a"})
+    expect(h.live.imageRetryIds).toEqual(action === "retry" ? ["parked-a"] : [])
+    expect(h.live.imageDiscardIds).toEqual(action === "discard" ? ["parked-a"] : [])
+    expect([h.live.imageRetries, h.live.imageDiscards]).toEqual(action === "retry" ? [1, 0] : [0, 1])
+    expect(h.live.pendingPhotoIds).toEqual(["parked-a", "local-b"])
+    expect(actions).toEqual([])
+    await h.session.handlers["openalma:pending-image"]({action, imageId: "server-c"})
+    expect(actions).toEqual([{url: `${CONFIG.baseUrl}/integration/mentra/photos/server-c/${action}`,
+      body: {user_id: CONFIG.userId, soul_id: CONFIG.soulId}}])
+    expect(h.live.imageRetryIds).toEqual(action === "retry" ? ["parked-a"] : [])
+    expect(h.live.imageDiscardIds).toEqual(action === "discard" ? ["parked-a"] : [])
+    expect(lastSnapshot(h.session)).toMatchObject({pendingPhotoIds: ["parked-a", "local-b"], failedPhotos: ["parked-a"]})
     await h.session.handlers["openalma:stop"]({})
   })
   test("does no network work until a phone-local profile is saved", async () => {
@@ -1380,7 +1404,9 @@ describe("SessionController", () => {
   test("projects provider rollover as reconnecting with Stop ownership", async () => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(lastSnapshot(harness.session)?.startGeneration).toBe(1)
     harness.live.reconnecting(true)
+    expect(lastSnapshot(harness.session)?.startGeneration).toBe(1)
     expect(lastSnapshot(harness.session)?.connection).toBe("reconnecting")
     expect(lastSnapshot(harness.session)?.connectionLocked).toBe(true)
     await expect(harness.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"}))
@@ -1390,6 +1416,11 @@ describe("SessionController", () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(harness.session.plays.at(-1)?.audioUrl).toEndWith("/earcons/listen-start.wav")
     await harness.session.handlers["openalma:stop"]({})
+    expect(lastSnapshot(harness.session)).toMatchObject({connection: "idle", startGeneration: 2, pendingPhotoIds: []})
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(lastSnapshot(harness.session)?.startGeneration).toBe(3)
+    await harness.session.handlers["openalma:stop"]({})
+    expect(lastSnapshot(harness.session)?.startGeneration).toBe(4)
   })
 
   test("starts Gemini before mic and stops both", async () => {
@@ -1659,6 +1690,7 @@ describe("SessionController", () => {
     const harness = setup()
     harness.session.onOpenCb?.()
     expect(harness.session.snapshots[0]).toEqual({
+      startGeneration: 0,
       configured: true,
       connectionProfile: {baseUrl: CONFIG.baseUrl,
         userId: CONFIG.userId, deviceSessionId: CONFIG.deviceSessionId},
@@ -1675,6 +1707,7 @@ describe("SessionController", () => {
       microphoneEnabled: true,
       cameraEnabled: true,
       photoRetryPending: false,
+      pendingPhotoIds: [],
       photoCaptions: [],
       failedPhotos: [],
       lastError: null,

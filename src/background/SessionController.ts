@@ -259,7 +259,13 @@ export class SessionController {
         await this.preferencesLoaded
         if (action !== "retry" && action !== "discard") throw new Error("Unknown pending photo action")
         if (imageId !== undefined) {
-          if (typeof imageId !== "string" || !this.failedPhotos.includes(imageId)) throw new Error("Unknown failed photo")
+          if (typeof imageId !== "string") throw new Error("Unknown failed photo")
+          if (this.liveController?.pendingPhotoIds.includes(imageId)) {
+            if (action === "retry") await this.liveController.retryImage(imageId)
+            else await this.liveController.discardImage(imageId)
+            return {ok: true as const}
+          }
+          if (!this.failedPhotos.includes(imageId)) throw new Error("Unknown failed photo")
           const config = this.currentConfig()
           const soulId = this.soulId
           const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/photos/${encodeURIComponent(imageId)}/${action}`, {
@@ -400,6 +406,7 @@ export class SessionController {
 
   private snapshot(): SessionSnapshot {
     return {
+      startGeneration: this.startGeneration,
       configured: Boolean(this.config),
       connectionProfile: this.config ? {baseUrl: this.config.baseUrl,
         userId: this.config.userId, deviceSessionId: this.config.deviceSessionId} : null,
@@ -416,6 +423,7 @@ export class SessionController {
       microphoneEnabled: this.microphoneEnabled,
       cameraEnabled: this.cameraEnabled,
       photoRetryPending: this.photoRetryPending,
+      pendingPhotoIds: this.liveController?.pendingPhotoIds ?? [],
       photoCaptions: this.photoCaptions.map(caption => ({...caption})),
       failedPhotos: [...this.failedPhotos],
       lastError: this.liveController?.activityPauseReason || this.lastError || this.photoStatusError,

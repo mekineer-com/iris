@@ -5,6 +5,7 @@ import type {ImageRequest} from "../shared/channels"
 import {MIC_SOURCES, PHOTO_RETRY_MESSAGE, type MicSource, type PhotoCaption, type SessionMode} from "../shared/types"
 
 type StartResponse = {
+  photo_work_protocol: "iris-photo-work-v1"
   session_id: string
   next_transcript_sequence: number
   ephemeral_token: string
@@ -71,13 +72,14 @@ type StorageLike = {
 }
 
 type SessionJournal = {
-  version: 1 | 2
+  version: 1 | 2 | 3
   scope: {userId: string; soulId: string; deviceSessionId: string}
   resumption: {handle: string; updatedAt: number; imageTokens?: number | null} | null
   pendingTranscripts: TranscriptEvent[]
   draftTranscripts?: TranscriptDraft[]
   nextTranscriptSequence?: number
   pendingImage?: PendingImage | null
+  pendingImages?: PendingImage[]
 }
 
 type SpokenRequest = {
@@ -201,14 +203,15 @@ export function journalSoulId(raw: string | null, config: Pick<OpenAlmaConfig, "
     const journal = JSON.parse(raw ?? "") as Partial<SessionJournal>
     const scope = journal.scope
     if (
-      (journal.version !== 1 && journal.version !== 2) ||
+      (journal.version !== 1 && journal.version !== 2 && journal.version !== 3) ||
       scope?.userId !== config.userId ||
       scope.deviceSessionId !== config.deviceSessionId ||
       typeof scope.soulId !== "string" ||
       !scope.soulId.trim()
     ) return null
     if (
-      !journal.pendingTranscripts?.length && !journal.draftTranscripts?.length && !journal.pendingImage &&
+      !journal.pendingTranscripts?.length && !journal.draftTranscripts?.length &&
+      !(journal.version === 3 ? journal.pendingImages?.length : journal.pendingImage) &&
       !(journal.resumption?.handle?.trim() && Number.isFinite(journal.resumption.updatedAt) &&
         Date.now() - journal.resumption.updatedAt <= RESUMPTION_MAX_AGE_MS)
     ) return null
@@ -264,7 +267,25 @@ export class GeminiLiveController {
   private pendingEvents: TranscriptEvent[] = []
   private draftEvents: TranscriptDraft[] = []
   private missingSpeech = false
-  private pendingImage: PendingImage | null = null
+  private pendingImages: PendingImage[] = []
+  private get pendingImage(): PendingImage | null {
+    // Keep a settling attempt's owner; parked originals do not block later work.
+    const active = this.photoAttempt?.image
+    if (active && this.pendingImages.includes(active)) return active
+    return this.pendingImages.find(image => !image.retryRequested && image.mediaRef) ?? this.pendingImages[0] ?? null
+  }
+
+  get pendingPhotoIds(): string[] {
+    return this.pendingImages.filter(image => image.retryRequested).map(image => image.imageId)
+  }
+
+  private removePendingImage(image: PendingImage): void {
+    this.pendingImages = this.pendingImages.filter(pending => pending !== image)
+  }
+
+  private publishPhotoRetry(): void {
+    this.callbacks.onPhotoRetryChange(this.pendingImages.some(image => image.retryRequested))
+  }
   private photoBatch: ToolBatch | null = null
   private acceptedCaptions = new Map<string, string>()
   private spokenPhotos: string[] = []
@@ -276,7 +297,7 @@ export class GeminiLiveController {
   private drainResolve: (() => void) | null = null
   private imageRetrying = false
   private appendTail: Promise<void> = Promise.resolve()
-  private imageFinalization: Promise<void> | null = null
+  private imageFinalization: {image: PendingImage; promise: Promise<void>} | null = null
   private imageFinalizationExplicit = false
   private journalTail: Promise<void> = Promise.resolve()
   private journalLoaded = false
@@ -341,7 +362,7 @@ export class GeminiLiveController {
     this.pendingEvents = []
     this.draftEvents = []
     this.missingSpeech = false
-    this.pendingImage = null
+    this.pendingImages = []
     this.photoBatch = null
     this.acceptedCaptions.clear()
     this.spokenPhotos = []
@@ -501,25 +522,20 @@ export class GeminiLiveController {
     if (!this.ready || this.stopping || !socket || socket.readyState !== WS_OPEN) {
       throw new Error("Gemini socket is not ready")
     }
-    if (this.pendingImage && this.pendingImage.imageId !== image.imageId) {
-      if (this.pendingImage.retryRequested) this.callbacks.onPhotoRetryChange(true)
-      throw new Error("Another photo is still pending")
-    }
-    if (this.pendingImage?.providerSent) return
-
     const generation = this.generation
     const sessionId = this.sessionId
-    const pendingBeforeUpload = this.pendingImage
+    const pendingBeforeUpload = this.pendingImages.find(pending => pending.imageId === image.imageId)
+    if (pendingBeforeUpload?.providerSent) return
     const pending: PendingImage = pendingBeforeUpload ?? {
       imageId: image.imageId, mediaRef: "", providerSent: false, captureAfterCurrent: false,
       generation, sessionId,
     }
     pending.speakDescription = image.speakDescription === true
     pending.retryRequested = true
-    this.pendingImage = pending
+    if (!pendingBeforeUpload) this.pendingImages.push(pending)
     await this.persistJournal()
     if (this.journalUnavailable) throw new Error("Local image journal unavailable")
-    if (this.stopping || this.reflecting || generation !== this.generation || this.pendingImage !== pending) {
+    if (this.stopping || this.reflecting || generation !== this.generation || !this.pendingImages.includes(pending)) {
       throw new Error("Photo send cancelled")
     }
     const response = await this.request(`/integration/mentra/session/${this.sessionId}/snapshot`, {
@@ -531,9 +547,9 @@ export class GeminiLiveController {
     }, SNAPSHOT_TIMEOUT_MS)
     if (!response.ok) {
       if (!this.stopping && !this.reflecting && generation === this.generation &&
-          this.pendingImage === pending && !pending.mediaRef && !pendingBeforeUpload &&
+          this.pendingImages.includes(pending) && !pending.mediaRef && !pendingBeforeUpload &&
           response.status >= 400 && response.status < 500) {
-        this.pendingImage = null
+        this.removePendingImage(pending)
         await this.persistJournal()
       }
       throw new Error(`OpenAlma snapshot failed (${response.status})`)
@@ -544,7 +560,7 @@ export class GeminiLiveController {
     ) {
       throw new Error("Photo send cancelled")
     }
-    if (this.pendingImage !== pending) throw new Error("Photo send cancelled")
+    if (!this.pendingImages.includes(pending)) throw new Error("Photo send cancelled")
     const mediaRef = typeof result.media_ref === "string" ? result.media_ref.trim() : ""
     if (!mediaRef.startsWith("mentra_media/") || mediaRef.includes("..")) {
       throw new Error("OpenAlma snapshot returned an invalid media reference")
@@ -556,10 +572,9 @@ export class GeminiLiveController {
     pending.captureAfterCurrent = this.turnActive
     pending.generation = this.generation
     pending.sessionId = this.sessionId
-    this.pendingImage = pending
     await this.persistJournal()
     if (this.journalUnavailable) throw new Error("Local image journal unavailable")
-    if (this.pendingImage !== pending || generation !== this.generation) throw new Error("Photo send cancelled")
+    if (!this.pendingImages.includes(pending) || generation !== this.generation) throw new Error("Photo send cancelled")
     if (pending.providerSent) return
     if (this.stopPromise) {
       pending.retryRequested = false
@@ -572,7 +587,7 @@ export class GeminiLiveController {
       throw new Error("Photo send cancelled")
     }
     pending.retryRequested = false
-    if (this.photoDeliveryFenced()) {
+    if (!this.pendingImages.includes(pending) || this.photoAttempt || this.imageFinalization || this.photoDeliveryFenced()) {
       pending.captureAfterCurrent = true
       await this.persistJournal()
       return
@@ -580,7 +595,7 @@ export class GeminiLiveController {
     let sent: boolean
     try {
       pending.captureAfterCurrent = this.turnActive && !this.draining
-      sent = await this.sendImageTurn(activeSocket, image.mimeType, image.data)
+      sent = await this.sendImageTurn(activeSocket, image.mimeType, image.data, false, pending)
     } catch {
       await this.requestPhotoRetry(pending)
       throw new Error(this.activityPauseReason || "Gemini image send failed")
@@ -588,53 +603,59 @@ export class GeminiLiveController {
     if (!sent) throw new Error("Photo send cancelled")
     pending.providerSent = true
     pending.retryRequested = false
-    this.callbacks.onPhotoRetryChange(false)
+    this.publishPhotoRetry()
     this.enqueueImageMarker()
     await this.persistJournal()
     this.scheduleAppend()
   }
 
-  async retryImage(): Promise<void> {
+  async retryImage(imageId?: string): Promise<void> {
+    const image = imageId === undefined ? this.pendingImage : this.pendingImages.find(image => image.imageId === imageId)
+    if (!image) throw new Error("No photo is waiting to retry")
+    if (this.photoAttempt && this.photoAttempt.image !== image) throw new Error("Wait for the current photo to finish before retrying")
     if (this.stopping || this.imageRetrying || !this.ready || this.socket?.readyState !== WS_OPEN) {
       throw new Error("Wait for Gemini to reconnect before retrying the photo")
     }
-    if (this.turnActive && !this.pendingImage?.caption) throw new Error("Wait for the current reply to finish before retrying the photo")
-    if (this.pendingImage?.caption) {
-      await this.scheduleImageFinalize(true)
+    if (this.turnActive && !image.caption) throw new Error("Wait for the current reply to finish before retrying the photo")
+    if (image.caption) {
+      await this.scheduleImageFinalize(true, image)
       return
     }
-    if (!this.pendingImage || (this.pendingImage.providerSent && !this.pendingImage.retryRequested)) {
+    if (image.providerSent && !image.retryRequested) {
       throw new Error("No photo is waiting to retry")
     }
-    this.pendingImage.providerSent = false
-    this.pendingImage.retryUsed = false
-    this.pendingImage.imageBaseline = this.latestImageTokens
-    this.clearPhotoAttempt()
-    await this.retryPendingImage(true)
+    image.providerSent = false
+    image.retryUsed = false
+    image.imageBaseline = this.latestImageTokens
+    if (this.photoAttempt?.image === image) this.clearPhotoAttempt()
+    await this.retryPendingImage(true, image)
   }
 
-  async discardImage(): Promise<void> {
+  async discardImage(imageId?: string): Promise<void> {
     if (!this.journalLoaded) throw new Error("Wait for local recovery to finish before discarding the photo")
-    if (this.pendingImage) {
-      this.clearPhotoAttempt()
-      this.pendingImage = null
+    const image = imageId === undefined ? this.pendingImage : this.pendingImages.find(image => image.imageId === imageId)
+    if (imageId !== undefined && !image) throw new Error("Unknown pending photo")
+    if (image) {
+      if (this.photoAttempt?.image === image) this.clearPhotoAttempt()
+      this.removePendingImage(image)
       await this.persistJournal()
     }
-    this.callbacks.onPhotoRetryChange(false)
+    this.publishPhotoRetry()
     this.clearPersistenceErrorIfSynced()
+    void this.retryPendingImage()
   }
 
-  private async sendImageTurn(socket: SocketLike, mimeType: "image/jpeg" | "image/png", data: string, repeatCaption = false): Promise<boolean> {
+  private async sendImageTurn(socket: SocketLike, mimeType: "image/jpeg" | "image/png", data: string, repeatCaption = false, pending = this.pendingImage): Promise<boolean> {
     if (this.activityPauseReason) throw new Error(this.activityPauseReason)
     if (this.stopping || this.reflecting || this.photoDeliveryFenced() || !this.ready || this.socket !== socket || socket.readyState !== WS_OPEN) return false
     if ((this.draining && !this.drainInputFlushed) || (this.stopPromise && !this.draining)) return false
-    const pending = this.pendingImage!
+    if (!pending || !this.pendingImages.includes(pending)) return false
     this.clearPhotoAttempt()
     if (pending.imageBaseline === undefined) pending.imageBaseline = this.latestImageTokens
     const generation = this.generation
     await this.persistJournal()
     if (this.journalUnavailable) throw new Error("Local image journal unavailable")
-    if (this.pendingImage !== pending || this.generation !== generation || this.socket !== socket ||
+    if (!this.pendingImages.includes(pending) || this.generation !== generation || this.socket !== socket ||
         socket.readyState !== WS_OPEN || !this.ready || this.stopping || (this.stopPromise && !this.draining)) return false
     if (this.photoDeliveryFenced() || (this.draining && !this.drainInputFlushed)) {
       return false
@@ -692,7 +713,7 @@ export class GeminiLiveController {
     console.error("[OpenAlma] Photo delivery not confirmed", {imageId: image.imageId,
       baseline: attempt.baseline, imageTokens: attempt.imageTokens ?? null, resend: retry})
     this.completePhotoCalls(attempt)
-    if (this.pendingImage !== image) return
+    if (!this.pendingImages.includes(image)) return
     if (retry) {
       image.retryUsed = true
       if (image.imageBaseline === null && attempt.imageTokens !== null && attempt.imageTokens !== undefined) {
@@ -732,18 +753,20 @@ export class GeminiLiveController {
     if (this.photoTimer) clearTimeout(this.photoTimer)
     this.photoTimer = null
     const image = attempt.image
-    if (this.pendingImage !== image) return
+    if (!this.pendingImages.includes(image)) return
     image.caption = captions[0][1].provisionalCaption!
     image.captionEventId = `${image.sessionId}:photo:${image.imageId}`
     image.retryRequested = false
-    this.callbacks.onPhotoRetryChange(false)
+    this.publishPhotoRetry()
     this.enqueueEvent("photo_caption", "assistant", image.caption, undefined, image.mediaRef)
     await this.persistJournal()
-    if (this.photoAttempt !== attempt || this.pendingImage !== image || image.generation !== this.generation) return
+    if (this.photoAttempt !== attempt || !this.pendingImages.includes(image) || image.generation !== this.generation) return
     this.scheduleAppend()
     await this.scheduleImageFinalize()
     this.completePhotoCalls(attempt)
     if (this.photoAttempt === attempt) this.clearPhotoAttempt()
+    this.requestSpokenPhotoDescription()
+    void this.retryPendingImage()
   }
 
   private photoDeliveryFenced(): boolean {
@@ -752,8 +775,7 @@ export class GeminiLiveController {
       Boolean(this.spokenRequest && !this.spokenRequest.retired)
   }
 
-  private async retryPendingImage(userRequested = false): Promise<void> {
-    const pending = this.pendingImage
+  private async retryPendingImage(userRequested = false, pending = this.pendingImage): Promise<void> {
     const socket = this.socket
     if (
       this.activityPauseReason || this.photoDeliveryFenced() || (this.draining && !this.drainInputFlushed) ||
@@ -764,13 +786,13 @@ export class GeminiLiveController {
     let retryOnReplacement = false
     try {
       pending.retryRequested = false
-      this.callbacks.onPhotoRetryChange(false)
+      this.publishPhotoRetry()
       const response = await this.request(`/integration/mentra/session/${this.sessionId}/snapshot/replay`, {
         user_id: this.config.userId,
         soul_id: this.config.soulId,
         image_id: pending.imageId,
       }, SNAPSHOT_TIMEOUT_MS).catch(() => null)
-      if (this.pendingImage !== pending || pending.providerSent || this.stopping) return
+      if (!this.pendingImages.includes(pending) || pending.providerSent || this.stopping) return
       if (!response?.ok) {
         await this.requestPhotoRetry(pending)
         return
@@ -778,14 +800,14 @@ export class GeminiLiveController {
       const replay = await response.json().catch(() => null) as {
         mime_type?: unknown; data?: unknown; media_ref?: unknown; filing?: unknown
       } | null
-      if (this.pendingImage !== pending || pending.providerSent || this.stopping) return
+      if (!this.pendingImages.includes(pending) || pending.providerSent || this.stopping) return
       const filing = this.filingCaption(replay?.filing)
       if (filing !== null) {
         this.acceptedCaptions.set(pending.imageId, filing)
         this.callbacks.onPhotoCaption?.({imageId: pending.imageId, caption: filing, durable: true}, false)
-        this.pendingImage = null
+        this.removePendingImage(pending)
         await this.persistJournal()
-        this.callbacks.onPhotoRetryChange(false)
+        this.publishPhotoRetry()
         this.clearPersistenceErrorIfSynced()
         this.finishPhotoDrainIfAcknowledged()
         return
@@ -813,8 +835,8 @@ export class GeminiLiveController {
       }
       try {
         pending.captureAfterCurrent = this.turnActive && !this.draining
-        if (!await this.sendImageTurn(socket, mimeType, data, true)) {
-          retryOnReplacement = this.pendingImage === pending
+        if (!await this.sendImageTurn(socket, mimeType, data, true, pending)) {
+          retryOnReplacement = this.pendingImages.includes(pending)
           return
         }
       } catch {
@@ -827,11 +849,11 @@ export class GeminiLiveController {
       this.enqueueImageMarker()
       await this.persistJournal()
       this.scheduleAppend()
-      this.callbacks.onPhotoRetryChange(false)
+      this.publishPhotoRetry()
       this.clearPersistenceErrorIfSynced()
     } finally {
       this.imageRetrying = false
-      if (retryOnReplacement) void this.retryPendingImage()
+      if (retryOnReplacement || this.pendingImage !== pending) void this.retryPendingImage()
     }
   }
 
@@ -900,7 +922,11 @@ export class GeminiLiveController {
       trace("provider.transcript_queue.drained")
       if (!this.persistenceFatal) await this.flushPendingEvents()
       // Explicit Retry may outlive Stop; its generation checks retain uncertain recovery.
-      if (!this.imageFinalizationExplicit && !drainAttempted) await this.imageFinalization
+      if (!this.imageFinalizationExplicit && !drainAttempted) {
+        const admitted = this.photoAttempt?.settling ? this.photoAttempt.image : null
+        if (admitted?.caption) await this.scheduleImageFinalize(false, admitted)
+        else await this.imageFinalization?.promise
+      }
       if (this.pendingEvents.length) {
         this.callbacks.onPersistenceError(!this.storage || this.journalUnavailable
           ? "Transcript sync failed; local transcript backup unavailable"
@@ -969,7 +995,7 @@ export class GeminiLiveController {
         }
         if (!this.draining) return
         this.drainInputFlushed = true
-        if (this.pendingImage === pending) {
+        if (this.pendingImages.includes(pending)) {
           pending.captureAfterCurrent = false
           if (!pending.providerSent) await this.retryPendingImage()
         }
@@ -990,15 +1016,16 @@ export class GeminiLiveController {
       this.clearPhotoAttempt()
       this.drainResolve?.()
       this.drainResolve = null
-      if (this.pendingImage) {
+      if (this.pendingImages.length) {
         console.error("[OpenAlma] Photo caption drain ended before durable handoff; retaining pending work")
-        await this.requestPhotoRetry(this.pendingImage)
+        for (const image of this.pendingImages) await this.requestPhotoRetry(image)
       }
     }
   }
 
   private finishPhotoDrainIfAcknowledged(): void {
-    if (!this.pendingImage && (!this.photoBatch || this.photoBatch.completed) &&
+    if (!this.pendingImages.some(image => !image.retryRequested) && !this.imageFinalization &&
+        (!this.photoBatch || this.photoBatch.completed) &&
         ![...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption")) {
       this.drainResolve?.()
     }
@@ -1011,6 +1038,7 @@ export class GeminiLiveController {
         user_id: this.config.userId,
         soul_id: this.config.soulId,
         device_session_id: this.config.deviceSessionId,
+        photo_work_protocol: "iris-photo-work-v1",
         mode,
       })
       if (response.ok) break
@@ -1031,6 +1059,7 @@ export class GeminiLiveController {
     }
     const ws = body.websocket
     if (
+      body.photo_work_protocol !== "iris-photo-work-v1" ||
       typeof body.session_id !== "string" ||
       !body.session_id.trim() ||
       !Number.isSafeInteger(body.next_transcript_sequence) ||
@@ -1450,6 +1479,7 @@ export class GeminiLiveController {
           valid = typeof args.query === "string" && !!args.query.trim()
           break
         case "read_working_state":
+        case "nothing_to_add":
           keys = []
           valid = true
           break
@@ -1503,6 +1533,7 @@ export class GeminiLiveController {
           ok: false, status: "invalid", message: "Invalid tool arguments; no calls in this batch were run.",
         }, false)
         else if (name === "recall_memory") void this.runRecall(id, args.query as string, pending)
+        else if (name === "nothing_to_add") this.completeToolCall(id, pending, {ok: true}, false)
         else if (name === "save_photo_caption") void this.runPhotoCaption(id, args, pending).catch(error => {
           if (this.isCurrentToolCall(id, pending)) this.reportError(error instanceof Error ? error : new Error(String(error)))
         })
@@ -1629,7 +1660,7 @@ export class GeminiLiveController {
         ...(accepted === caption ? {} : {status: "conflict"})}, false)
       return
     }
-    const image = this.pendingImage
+    const image = this.pendingImages.find(image => image.imageId === imageId)
     if (!image?.mediaRef || image.imageId !== imageId || (!image.providerSent && !image.imageRecorded) ||
         (image.caption !== undefined && image.caption !== caption)) {
       this.completeToolCall(id, call, {ok: false, status: "invalid", message: "Photo does not match the pending original."}, false)
@@ -1651,7 +1682,7 @@ export class GeminiLiveController {
       return
     }
     this.scheduleAppend()
-    await this.scheduleImageFinalize()
+    await this.scheduleImageFinalize(false, image)
     this.completeToolCall(id, call, {ok: this.acceptedCaptions.get(imageId) === caption,
       durable: this.acceptedCaptions.get(imageId) === caption}, false)
   }
@@ -1744,13 +1775,13 @@ export class GeminiLiveController {
       }
       if (!this.ready || !this.socket || this.socket.readyState !== WS_OPEN) continue
       const request = pending.batch.request
-      const needsAnswer = request && !request.retired && !request.audible && !this.outputMuted
+      const needsAnswer = pending.name !== "nothing_to_add" && request && !request.retired && !request.audible && !this.outputMuted
       if (needsAnswer && (!request.settled || [...this.pendingToolCalls.values()].some(call =>
-        call.batch.request === request && !call.batch.continuationSent &&
+        call.name !== "nothing_to_add" && call.batch.request === request && !call.batch.continuationSent &&
         (call.response === undefined || !call.batch.completed)))) continue
       const resume = needsAnswer && !pending.batch.continuationSent && !request.continuing &&
         ![...this.pendingToolCalls.values()].some(call => call !== pending &&
-          call.batch.request === request && !call.batch.continuationSent)
+          call.name !== "nothing_to_add" && call.batch.request === request && !call.batch.continuationSent)
       this.socket.send(JSON.stringify({
         toolResponse: {
           functionResponses: [{
@@ -1974,29 +2005,39 @@ export class GeminiLiveController {
   }
 
   private clearPersistenceErrorIfSynced(): void {
-    if (!this.pendingEvents.length && !this.missingSpeech && !this.journalUnavailable) this.callbacks.onPersistenceError(null)
+    if (!this.pendingEvents.length && !this.missingSpeech && !this.journalUnavailable &&
+        !this.pendingImages.some(image => image.retryRequested)) this.callbacks.onPersistenceError(null)
   }
 
   private async requestPhotoRetry(pending: PendingImage): Promise<void> {
-    if (this.pendingImage !== pending) return
+    if (!this.pendingImages.includes(pending)) return
     pending.retryRequested = true
     this.callbacks.onPhotoRetryChange(true)
     this.callbacks.onPersistenceError(pending.mediaRef ? PHOTO_RETRY_MESSAGE : PHOTO_UPLOAD_UNCONFIRMED_MESSAGE)
     await this.persistJournal()
+    if (this.pendingImage !== pending) void this.retryPendingImage()
   }
 
-  private scheduleImageFinalize(userRequested = false): Promise<void> {
-    const pending = this.pendingImage
-    if (!pending?.caption || (pending.retryRequested && !userRequested) || !pending.captionEventId) return Promise.resolve()
-    if (this.imageFinalization) return this.imageFinalization
+  private scheduleImageFinalize(userRequested = false, pending = this.pendingImages.find(image => image.caption && !image.retryRequested)): Promise<void> {
+    const admitted = pending && this.photoAttempt?.image === pending && this.photoAttempt.settling
+    // Stop may finish its already-verified caption, but must not admit the next image.
+    if ((this.stopping || (this.stopPromise && !this.draining)) && !admitted) return Promise.resolve()
+    if (!pending?.caption || !this.pendingImages.includes(pending) || (pending.retryRequested && !userRequested) || !pending.captionEventId) return Promise.resolve()
+    if (this.imageFinalization) return this.imageFinalization.image === pending
+      ? this.imageFinalization.promise
+      : this.imageFinalization.promise.then(() => this.scheduleImageFinalize(userRequested, pending))
     this.imageFinalizationExplicit = userRequested
     const finalization = this.finalizePendingImage(pending).finally(() => {
-      if (this.imageFinalization === finalization) {
+      if (this.imageFinalization?.promise === finalization) {
         this.imageFinalization = null
         this.imageFinalizationExplicit = false
+        void this.scheduleImageFinalize()
+        void this.retryPendingImage()
+        this.finishPhotoDrainIfAcknowledged()
+        this.requestSpokenPhotoDescription()
       }
     })
-    this.imageFinalization = finalization
+    this.imageFinalization = {image: pending, promise: finalization}
     return finalization
   }
 
@@ -2006,7 +2047,8 @@ export class GeminiLiveController {
       this.callbacks.onPhotoCaption?.({imageId: pending.imageId, caption: pending.caption!, durable: false}, false)
     }
     await this.persistJournal()
-    if (generation !== this.generation || this.pendingImage !== pending) return
+    if ((this.stopping && !(this.photoAttempt?.image === pending && this.photoAttempt.settling)) ||
+        generation !== this.generation || !this.pendingImages.includes(pending)) return
     let response: Response
     try {
       response = await this.request(`/integration/mentra/session/${this.sessionId}/snapshot/finalize`, {
@@ -2017,17 +2059,17 @@ export class GeminiLiveController {
         caption_event_id: pending.captionEventId,
       })
     } catch {
-      if (generation !== this.generation || this.pendingImage !== pending) return
+      if (generation !== this.generation || !this.pendingImages.includes(pending)) return
       await this.requestPhotoRetry(pending)
       return
     }
-    if (generation !== this.generation || this.pendingImage !== pending) return
+    if (generation !== this.generation || !this.pendingImages.includes(pending)) return
     if (!response.ok) {
       await this.requestPhotoRetry(pending)
       return
     }
     const result = await response.json().catch(() => null) as {ok?: boolean; durable?: boolean} | null
-    if (generation !== this.generation || this.pendingImage !== pending) return
+    if (generation !== this.generation || !this.pendingImages.includes(pending)) return
     if (result?.ok !== true) {
       await this.requestPhotoRetry(pending)
       return
@@ -2039,9 +2081,9 @@ export class GeminiLiveController {
     this.acceptedCaptions.set(pending.imageId, pending.caption!)
     this.callbacks.onPhotoCaption?.({imageId: pending.imageId, caption: pending.caption!, durable: true}, true)
     if (pending.speakDescription) this.spokenPhotos.push(pending.imageId)
-    this.pendingImage = null
+    this.removePendingImage(pending)
     await this.persistJournal()
-    this.callbacks.onPhotoRetryChange(false)
+    this.publishPhotoRetry()
     this.clearPersistenceErrorIfSynced()
     if (![...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption")) this.requestSpokenPhotoDescription()
     this.finishPhotoDrainIfAcknowledged()
@@ -2049,6 +2091,7 @@ export class GeminiLiveController {
 
   private requestSpokenPhotoDescription(): void {
     if (!this.spokenPhotos.length || this.turnActive || this.stopPromise || this.stopping || this.reflecting ||
+        this.photoAttempt || this.imageFinalization || this.pendingImages.some(image => !image.retryRequested) ||
         (this.spokenRequest && !this.spokenRequest.retired) ||
         !this.ready || this.socket?.readyState !== WS_OPEN) return
     const imageId = this.spokenPhotos.shift()!
@@ -2086,7 +2129,7 @@ export class GeminiLiveController {
     const scope = journal?.scope
     if (
       !journal ||
-      (journal.version !== 1 && journal.version !== 2) ||
+      (journal.version !== 1 && journal.version !== 2 && journal.version !== 3) ||
       scope?.userId !== this.config.userId ||
       scope.soulId !== this.config.soulId ||
       scope.deviceSessionId !== this.config.deviceSessionId ||
@@ -2094,19 +2137,22 @@ export class GeminiLiveController {
       !this.validDraftEvents(journal.draftTranscripts) ||
       (Boolean(journal.draftTranscripts?.length) &&
         (!Number.isSafeInteger(journal.nextTranscriptSequence) || Number(journal.nextTranscriptSequence) < 1)) ||
-      !this.validPendingImage(journal.pendingImage)
+      !(journal.version === 3
+        ? Array.isArray(journal.pendingImages) && journal.pendingImages.every(image => image && this.validPendingImage(image)) &&
+          new Set(journal.pendingImages.map(image => image.imageId)).size === journal.pendingImages.length
+        : this.validPendingImage(journal.pendingImage))
     ) {
       await this.preserveJournal(raw, generation)
       this.journalLoaded = true
-      this.callbacks.onPhotoRetryChange(false)
+      this.publishPhotoRetry()
       this.callbacks.onPersistenceError("Original conversation backup kept on this device")
       return
     }
     this.pendingEvents = journal.pendingTranscripts.map((event) => ({...event}))
     this.draftEvents = journal.draftTranscripts ?? []
-    this.pendingImage = journal.pendingImage ? {...journal.pendingImage} : null
-    if (this.pendingImage) {
-      const image = this.pendingImage
+    this.pendingImages = (journal.version === 3 ? journal.pendingImages! : journal.pendingImage ? [journal.pendingImage] : [])
+      .map(image => ({...image}))
+    for (const image of this.pendingImages) {
       if (image.imageRecorded === undefined && image.imageSequence !== undefined) image.imageRecorded = true
       if (!image.captionEventId && image.assistantSequence !== undefined) image.captionEventId = `${image.sessionId}:${image.assistantSequence}`
     }
@@ -2225,7 +2271,7 @@ export class GeminiLiveController {
         break
       }
     }
-    const photoOutsideHistory = [this.pendingImage?.imageSequence, this.pendingImage?.assistantSequence]
+    const photoOutsideHistory = this.pendingImages.flatMap(image => [image.imageSequence, image.assistantSequence])
       .some(sequence => sequence !== undefined && sequence >= this.nextTranscriptSequence + keep)
     const draftBoundaryChanged = Boolean(this.draftEvents.length && this.loadedJournal &&
       JSON.parse(this.loadedJournal).nextTranscriptSequence !== this.nextTranscriptSequence + keep)
@@ -2235,16 +2281,15 @@ export class GeminiLiveController {
     if (keep !== pendingEvents.length || photoOutsideHistory || draftBoundaryChanged) {
       this.resumptionHandle = ""
       this.resumptionUpdatedAt = 0
-      this.pendingImage = null
       this.draftEvents = []
-      this.callbacks.onPhotoRetryChange(false)
+      this.publishPhotoRetry()
     }
     this.pendingEvents = pendingEvents.slice(0, keep)
     this.journalLoaded = true
-    if (this.pendingImage?.caption && this.pendingEvents.some(
-      (event) => event.event_id === `${this.pendingImage!.sessionId}:${this.pendingImage!.assistantSequence}`,
-    )) {
-      this.pendingImage.sessionId = this.sessionId
+    for (const image of this.pendingImages) {
+      if (image.caption && this.pendingEvents.some(event => event.event_id === `${image.sessionId}:${image.assistantSequence}`)) {
+        image.sessionId = this.sessionId
+      }
     }
     this.pendingEvents = this.pendingEvents.map((event) => ({
       ...event,
@@ -2252,13 +2297,15 @@ export class GeminiLiveController {
     }))
     this.nextTranscriptSequence += this.pendingEvents.length
     this.sealSpeechDrafts()
-    if (this.pendingImage && !this.pendingImage.caption) {
-      this.pendingImage.providerSent = false
-      this.pendingImage.captureAfterCurrent = false
-      this.pendingImage.generation = this.generation
-      this.pendingImage.sessionId = this.sessionId
-      this.callbacks.onPhotoRetryChange(this.pendingImage.retryRequested === true)
+    for (const image of this.pendingImages) {
+      if (!image.caption) {
+        image.providerSent = false
+        image.captureAfterCurrent = false
+        image.generation = this.generation
+        image.sessionId = this.sessionId
+      }
     }
+    this.publishPhotoRetry()
     await this.persistJournal()
   }
 
@@ -2267,7 +2314,7 @@ export class GeminiLiveController {
       if (!this.storage || !this.journalLoaded) return
       try {
         this.journalKey ??= selectJournalKey(await this.storage.keys(), true)
-        const empty = !this.resumptionHandle && !this.pendingEvents.length && !this.draftEvents.length && !this.pendingImage
+        const empty = !this.resumptionHandle && !this.pendingEvents.length && !this.draftEvents.length && !this.pendingImages.length
         await this.storage.set(this.journalKey, empty ? "" : this.journalSnapshot())
         this.journalUnavailable = false
       } catch {
@@ -2281,7 +2328,7 @@ export class GeminiLiveController {
 
   private journalSnapshot(): string {
     const journal: SessionJournal = {
-      version: 2,
+      version: 3,
       scope: {
         userId: this.config.userId,
         soulId: this.config.soulId,
@@ -2293,7 +2340,7 @@ export class GeminiLiveController {
       pendingTranscripts: this.pendingEvents,
       draftTranscripts: this.draftEvents,
       nextTranscriptSequence: this.nextTranscriptSequence,
-      pendingImage: this.pendingImage,
+      pendingImages: this.pendingImages,
     }
     return JSON.stringify(journal)
   }
