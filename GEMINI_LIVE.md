@@ -219,7 +219,12 @@ The sequence rejects late arrivals. One bounded collection retains recent
 candidates while protecting offered/chosen originals; full retention does not
 block current-view delivery. Shared `VISION_SETTINGS` provides qualification
 inputs (2s cadence, 12 entries, 8MiB encoded payload), not phone-proven settings.
-`openalma:frames` reads exact originating-sitting references, including Stop drain.
+The background send guard allows half-period jitter; the UI still samples every
+2s. A waiting, unsent selection is dropped when a new human request starts so
+it cannot close current-view delivery through the human's turn.
+`openalma:frames` reads exact originating-sitting references, including Stop drain;
+its bridge response contains only original bytes and imageId/mimeType/time, not
+unused stamped copies or the intake reservation sequence.
 
 The background projects one `catchUpRender` descriptor; the visible UI renders
 those originals and returns JPEG data through `openalma:catch-up-rendered`.
@@ -230,19 +235,23 @@ Camera/UI wiring and physical-phone qualification remain separate work.
 
 Selection uses the same readiness/settling dispatcher, not another queue.
 Deliberate photos have priority. Every offer needs remaining allowance; keep-none
-is valid only on actual native completion. One per-sitting chosen-ID set counts
-admission once, preserving uncertainty without a second upload charge. Normal
-capture refreshes the current view between selection batches; Stop does not
+is valid only on actual native completion, without requiring a further readiness
+call. One per-sitting chosen-ID set counts admission once, preserving uncertainty
+without a second upload charge. Normal capture refreshes the current view
+between selection batches; Stop does not
 wait for a new view after capture has closed. Maximum-photo preference is pinned
 at Start and allowance time freezes at Stop.
 
 Chosen originals are cached before their metadata commit is acknowledged.
+Every admitted choice saves its bytes and metadata before waiting for an earlier
+upload; Stop can preserve all choices, not just the first one in the upload lane.
 Upload returns the original-byte receipt; acknowledged media-reference metadata
 precedes cache deletion and finalization. Retry reuses the same bytes, caption
 and original receipt, without recaptioning or renaming. Caption rows belong only
 to the originating sitting; a later sitting can finish filing without claiming
 the old caption as its own dialogue. Discard commits metadata removal before
 cache cleanup; an unacknowledged removal warns rather than pretending durability.
+Discard rejects during Stop rather than acknowledging an unsaved removal.
 
 Stop closes new admission and gives retained candidates the existing shared
 30-second/five-minute window. At expiry, still-unselected candidates are

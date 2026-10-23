@@ -111,7 +111,6 @@ export class SessionController {
   private imageReferenceTail: Promise<void> = Promise.resolve()
   private reservationSequence = 0
   private archivedImageIds: Promise<string[]> | null = null
-  private recoveryRaw: string | null = null
   private speakerEpoch = 0
   private speakerWriter: SpeakerWriter | null = null
   private speakerOpenPromise: Promise<SpeakerWriter | null> | null = null
@@ -450,7 +449,8 @@ export class SessionController {
     this.unsubs.push(ui.handle("openalma:frames", async payload => {
       await this.preferencesLoaded
       const request = payload as {startGeneration: number; imageIds: string[]}
-      return {frames: this.frameController(request?.startGeneration).readFrames(request?.imageIds)}
+      return {frames: this.frameController(request?.startGeneration).readFrames(request?.imageIds)
+        .map(({imageId, mimeType, data, time}) => ({imageId, mimeType, data, time}))}
     }))
     this.unsubs.push(
       ui.handle("openalma:image", async (payload) => {
@@ -602,12 +602,16 @@ export class SessionController {
 
   private readArchivedImageIds(userId: string, soulId: string): Promise<string[]> {
     if (!this.archivedImageIds) {
-      this.archivedImageIds = readStoredValue(this.session.storage, RECOVERED_CHATS_KEY).then(recovered => {
+      const read = readStoredValue(this.session.storage, RECOVERED_CHATS_KEY).then(recovered => {
         let archives: unknown
         try {archives = JSON.parse(recovered ?? "[]")} catch {archives = null}
         const entries = Array.isArray(archives) ? archives : recovered === null ? [] : [recovered]
         return entries.flatMap(entry => typeof entry === "string" ? journalImageIds(entry, {userId, soulId}) : [])
+      }).catch(error => {
+        if (this.archivedImageIds === read) this.archivedImageIds = null
+        throw error
       })
+      this.archivedImageIds = read
     }
     return this.archivedImageIds
   }
@@ -1336,10 +1340,6 @@ export class SessionController {
   private async refreshRecoveryLock(): Promise<void> {
     if (!this.config || this.installationPending()) return
     const journal = await this.journalOwner.read()
-    if (!journal.unreadable && journal.raw !== this.recoveryRaw) {
-      this.recoveryRaw = journal.raw
-      this.archivedImageIds = null
-    }
     if (!journal.unreadable) this.recoverySoulId = journalSoulId(journal.raw, this.currentConfig())
   }
 

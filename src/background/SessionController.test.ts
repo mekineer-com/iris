@@ -35,6 +35,8 @@ function testPcm(value: number): string {
   return Buffer.alloc(8, value).toString("base64")
 }
 
+function originalFrame({imageId, mimeType, data, time}: PassiveFrame) { return {imageId, mimeType, data, time} }
+
 function passiveFrame(imageId = "camera-frame", reservationSequence = 1): PassiveFrame {
   return {imageId, reservationSequence, mimeType: "image/jpeg", data: "AQID", modelData: "BAUG",
     time: {source: "receipt", timestamp: "2026-01-02T03-04-05", receivedAt: 1_767_323_045_000}}
@@ -854,7 +856,7 @@ describe("SessionController", () => {
       expect(await h.session.handlers["openalma:frame"]({...speaking, startGeneration})).toEqual({retained: true, delivery: "not-sent"})
       expect(admit).toHaveBeenLastCalledWith({...speaking, startGeneration}, true)
       expect(await h.session.handlers["openalma:frames"]({startGeneration, imageIds: [speaking.imageId, frame.imageId]}))
-        .toEqual({frames: [speaking, frame]})
+        .toEqual({frames: [speaking, frame].map(originalFrame)})
       expect(read).toHaveBeenLastCalledWith([speaking.imageId, frame.imageId])
       expect(h.live.images).toEqual([])
     } finally {
@@ -880,7 +882,7 @@ describe("SessionController", () => {
         expect(admit).toHaveBeenLastCalledWith(fresh, false)
         expect(await h.session.handlers["openalma:frame"](request)).toEqual({retained: true, delivery: "not-sent"})
         expect(admit).toHaveBeenLastCalledWith(request, false)
-        expect(await h.session.handlers["openalma:frames"]({startGeneration, imageIds: [frame.imageId]})).toEqual({frames: [frame]})
+        expect(await h.session.handlers["openalma:frames"]({startGeneration, imageIds: [frame.imageId]})).toEqual({frames: [originalFrame(frame)]})
         expect(h.live.frames).toEqual([frame])
 
         if (gate === "hidden") h.session.onOpenCb!()
@@ -923,7 +925,7 @@ describe("SessionController", () => {
         await expect(h.session.handlers["openalma:frames"]({startGeneration, imageIds: [frame.imageId]})).rejects.toThrow("Unknown retained frame")
         const replacement = {...frame, data: "BwgJ", modelData: "CgsM"}
         expect(await h.session.handlers["openalma:frame"]({...replacement, startGeneration})).toEqual({retained: true, delivery: "not-sent"})
-        expect(await h.session.handlers["openalma:frames"]({startGeneration, imageIds: [frame.imageId]})).toEqual({frames: [replacement]})
+        expect(await h.session.handlers["openalma:frames"]({startGeneration, imageIds: [frame.imageId]})).toEqual({frames: [originalFrame(replacement)]})
         await expect(h.session.handlers["openalma:frames"]({startGeneration: oldGeneration, imageIds: [frame.imageId]})).rejects.toThrow("inactive sitting")
         expect(original.frames).toEqual([frame])
         expect(h.live.frames).toEqual([replacement])
@@ -954,7 +956,7 @@ describe("SessionController", () => {
       await expect(h.session.handlers["openalma:frames"]({startGeneration: startGeneration + 1, imageIds: [frame.imageId]})).rejects.toThrow("inactive sitting")
       expect(admit).not.toHaveBeenCalled()
       expect(read).not.toHaveBeenCalled()
-      expect(await h.session.handlers["openalma:frames"]({startGeneration, imageIds: [frame.imageId]})).toEqual({frames: [frame]})
+      expect(await h.session.handlers["openalma:frames"]({startGeneration, imageIds: [frame.imageId]})).toEqual({frames: [originalFrame(frame)]})
       expect(await h.session.handlers["openalma:frame"]({...passiveFrame("too-late"), startGeneration}))
         .toEqual({retained: false, delivery: "not-sent", reason: "unavailable"})
       expect(admit).toHaveBeenLastCalledWith({...passiveFrame("too-late"), startGeneration}, false)
@@ -1279,6 +1281,26 @@ describe("SessionController", () => {
     expect(await reserve()).toMatchObject({imageId: `${timestamp}-17`})
     expect(archiveReads).toBe(2)
     await h.session.handlers["openalma:stop"]({})
+  })
+
+  test("a failed archive naming read is retried by the next reservation", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous", callMode: "video"})
+    const get = h.session.storage.get
+    let reads = 0
+    h.session.storage.get = async key => {
+      if (key === RECOVERED_CHATS_KEY && ++reads === 1) throw new Error("Fictional storage hiccup")
+      return get(key)
+    }
+    const reserve = () => h.session.handlers["openalma:reserve-image"]({
+      startGeneration: lastSnapshot(h.session)!.startGeneration, time: passiveFrame().time,
+    })
+    try {
+      await expect(reserve()).rejects.toThrow("Fictional storage hiccup")
+      expect(await reserve()).toMatchObject({imageId: passiveFrame().time.timestamp})
+      await reserve()
+      expect(reads).toBe(2)
+    } finally { await h.session.handlers["openalma:stop"]({}) }
   })
 
   test.each(["pending", "v1", "v2", "v3"])("phone naming includes the highest reservation from %s", async highest => {

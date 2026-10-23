@@ -35,7 +35,7 @@ export interface Channels {
   "openalma:image": Rpc<ImageRequest, {ok: true} | {ok: false; conflict: true}>
   "openalma:reserve-image": Rpc<ImageReferenceRequest, {startGeneration: number; imageId: string; reservationSequence: number}>
   "openalma:frame": Rpc<FrameRequest, FrameIntakeResult>
-  "openalma:frames": Rpc<{startGeneration: number; imageIds: string[]}, {frames: PassiveFrame[]}>
+  "openalma:frames": Rpc<{startGeneration: number; imageIds: string[]}, {frames: Array<Pick<PassiveFrame, "imageId" | "mimeType" | "data" | "time">>}>
   "openalma:catch-up-rendered": Rpc<CatchUpResult, void>
   "openalma:pending-image": Rpc<{action: "retry" | "discard"; imageId: string}, {ok: true}>
 }
