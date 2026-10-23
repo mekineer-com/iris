@@ -92,8 +92,28 @@ describe("SessionPage state projection", () => {
 
   test("submitted manual recording names the selected Soul", () => {
     for (const soulId of ["Quill", "Paper Moon"]) {
-      expect(statusText("listening", "manual", "submitted", soulId)).toBe(`Waiting for ${soulId}...`)
+      for (const microphoneEnabled of [true, false]) {
+        expect(statusText("listening", "manual", "submitted", soulId, microphoneEnabled)).toBe(`Waiting for ${soulId}...`)
+      }
     }
+  })
+
+  test.each(["idle", "recording", "review"] as const)("Manual %s status respects a disabled microphone", phase => {
+    expect(statusText("listening", "manual", phase, "Quill", false))
+      .toBe(phase === "review" ? "Review recording" : "Microphone off")
+    expect(statusText("speaking", "manual", phase, "Quill", false)).toBe("Speaking")
+  })
+
+  test.each(["continuous", "manual"] as const)("camera-only %s sitting does not claim microphone capture", mode => {
+    const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+      connection: "listening", mode, manualPhase: "idle", microphoneEnabled: false, cameraEnabled: true}
+    const render = renderPage(snapshot, async () => ({ok: true}))
+    const status = () => nodes(render()).find(node => node.props?.className === "status")
+    expect(status().props.children).toContain("Microphone off")
+    expect(nodes(render()).filter(node => node.props?.type === "file").map(node => node.props.disabled))
+      .toEqual([false, false])
+    snapshot.microphoneEnabled = true
+    expect(status().props.children).toContain(mode === "continuous" ? "Listening" : "Ready")
   })
 
   test("creates without a human-name field, defers creation to Start, and preserves existing selection", async () => {
