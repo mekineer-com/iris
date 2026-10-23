@@ -2890,6 +2890,27 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)?.manualPhase).toBe("idle")
   })
 
+  test("Manual Talk recovers after audio, an intermediate boundary and socket recovery", async () => {
+    const harness = setup({responseWatchdogMs: 10})
+    await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.handlers["openalma:manual-action"]({action: "done"})
+    harness.session.handlers["openalma:manual-action"]({action: "send"})
+    harness.live.audio()
+    harness.live.turnComplete(false)
+    await flush()
+    expect(lastSnapshot(harness.session)?.manualPhase).toBe("submitted")
+    harness.live.reconnecting(true)
+    harness.live.turnComplete(true)
+    harness.live.reconnecting(false)
+    await flush()
+    expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", manualPhase: "idle", lastError: null})
+    harness.session.handlers["openalma:manual-action"]({action: "talk"})
+    expect(lastSnapshot(harness.session)?.manualPhase).toBe("recording")
+    await harness.session.handlers["openalma:stop"]({})
+  })
+
   test("Manual interruption waits for a pending native stream to abort", async () => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "manual"})

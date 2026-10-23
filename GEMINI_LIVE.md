@@ -192,6 +192,12 @@ handoff preceded Stop. A receipt turn that genuinely completes without another
 readiness call is sufficient; parked originals alone do not hold Stop open.
 Stop waits for a pending nokoru reply before reflection rather than silently
 skipping the summary because an internal cue was outstanding. An unrelated failed photo does not suppress reflection.
+Thinking also waits for an unfinished interaction's IDLE within that same
+allowance before reflecting. A disconnect retires the interrupted interaction
+and releases Manual Talk, even after an intermediate response segment.
+Reflection-time tool requests receive an unavailable result without executing
+tools. A GoAway preparation warning does not truncate reflection; actual socket
+closure, interruption and the existing deadlines still retain received text.
 Its text can settle at
 `generationComplete` rather than waiting for delayed playback completion.
 

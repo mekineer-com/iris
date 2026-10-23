@@ -53,6 +53,7 @@ const MICROPHONE_ENABLED_KEY = "openalma.microphone-enabled"
 const CAMERA_ENABLED_KEY = "openalma.camera-enabled"
 const CLOSING_THOUGHTS_KEY = "openalma.closing-thoughts"
 const SOUL_ID_KEY = "openalma.soul-id"
+const LIVE_MODEL_KEY = "openalma.live-model"
 
 function trace(event: string, detail: Record<string, unknown> = {}): void {
   if (process.env.NODE_ENV === "test") return
@@ -321,7 +322,7 @@ export class SessionController {
       this.modelSaving = true
       this.pushSnapshot()
       try {
-        await this.session.storage.set("openalma.live-model", model)
+        await this.session.storage.set(LIVE_MODEL_KEY, model)
         this.modelChoice = model
       } finally {
         this.modelSaving = false
@@ -1129,7 +1130,7 @@ export class SessionController {
         this.session.storage.get(CLOSING_THOUGHTS_KEY),
         this.session.storage.get(SOUL_ID_KEY),
         readSessionJournal(this.session.storage),
-        this.session.storage.get("openalma.live-model").catch(() => {
+        this.session.storage.get(LIVE_MODEL_KEY).catch(() => {
           this.lastError = "Saved model choice unavailable; using server setting"
           return null
         }),

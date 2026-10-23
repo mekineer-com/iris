@@ -966,7 +966,7 @@ export class GeminiLiveController {
       this.flushToolResponses()
       const drainAttempted = graceful && Boolean(
         this.imageUpload || this.pendingImages.some(image => !image.retryRequested) ||
-        this.photoJob || (this.toolBatch.started && this.toolBatch.background))
+        this.photoJob || (this.toolBatch.started && (this.toolBatch.background || this.thinking)))
       const stoppedMidTurn = this.turnActive && (!this.toolBatch.invitation || this.turnAudioDelivered ||
         Boolean(this.spokenRequest && !this.spokenRequest.retired))
       if (drainAttempted) await this.drainPhoto()
@@ -1326,10 +1326,7 @@ export class GeminiLiveController {
     if (!this.goAwayPending || this.reconnecting || this.stopping) return
     const deadlineAt = this.goAwayDeadlineAt
     this.clearGoAway()
-    if (this.reflecting) {
-      this.finishReflection()
-      return
-    }
+    if (this.reflecting) return
     if (!this.resumptionHandle) {
       this.reportError(new Error("Gemini requested rollover without a resumable handle"))
       return
@@ -1530,7 +1527,7 @@ export class GeminiLiveController {
   }
 
   private handleToolCall(value: unknown): () => void {
-    if (this.stopping || this.reflecting) throw new Error("Gemini requested memory during teardown")
+    if (this.stopping) throw new Error("Gemini requested memory during teardown")
     if (!value || typeof value !== "object") throw new Error("Gemini returned malformed tool call")
     const calls = (value as {functionCalls?: unknown}).functionCalls
     if (!Array.isArray(calls) || !calls.length) {
@@ -1587,6 +1584,13 @@ export class GeminiLiveController {
       parsed.push({id, name, args: Object.fromEntries(Object.entries(args).map(([key, value]) =>
         [key, typeof value === "string" ? value.trim() : value],
       ))})
+    }
+    if (this.reflecting) return () => {
+      this.socket!.send(JSON.stringify({toolResponse: {functionResponses: parsed.map(({id, name}) => {
+        this.deliveredToolResultIds.add(id)
+        return {id, name, ...(!this.thinking ? {scheduling: "SILENT"} : {}),
+          response: {ok: false, status: "unavailable", message: "Tools are unavailable during Closing Thoughts."}}
+      })}}))
     }
     this.beginToolBatch()
     const dispatch: Array<() => void> = []
@@ -1992,7 +1996,8 @@ export class GeminiLiveController {
     }
     // A dropped socket is not proof of native completion. Preserve settled
     // obligations, but do not manufacture a wake for unfinished provider work.
-    if (this.spokenRequest && (!this.spokenRequest.settled || this.spokenRequest.continuing)) {
+    if (this.spokenRequest && (!this.spokenRequest.settled || this.spokenRequest.continuing ||
+        (this.thinking && this.toolBatch.started))) {
       this.spokenRequest.retired = true
       this.spokenRequest = null
       if (this.mode === "manual") this.callbacks.onTurnComplete(true)

@@ -1272,6 +1272,7 @@ describe("GeminiLiveController", () => {
       if (completeClose) {
         await waitFor(() => h.sockets[0].readyState === 2)
         expect(h.controller.frameDeliveryOpen).toBe(false)
+        expect(h.frameDeliveryChanges.at(-1)).toBe(false)
         completeClose()
       }
       if (resumable) {
@@ -1280,7 +1281,10 @@ describe("GeminiLiveController", () => {
         h.sockets[1].message({setupComplete: {}})
         await waitFor(() => h.reconnecting.at(-1) === false)
         if (withNext) await waitPhotoTask(h.sockets[1], "after-stall", false)
-        else expect(h.controller.frameDeliveryOpen).toBe(true)
+        else {
+          expect(h.controller.frameDeliveryOpen).toBe(true)
+          expect(h.frameDeliveryChanges.at(-1)).toBe(true)
+        }
         expect(h.errors).toEqual([])
       } else {
         await waitFor(() => h.errors.includes("Gemini connection closed"))
@@ -6642,11 +6646,13 @@ describe("GeminiLiveController", () => {
     )
   })
 
-  test.each([false, true])("Thinking Stop during IN_PROGRESS cannot start reflection or release native work (interrupted=%s)", async interrupted => {
+  test.each([false, true])("Thinking Stop waits for IDLE before reflection (interrupted=%s)", async interrupted => {
     const h = harness()
     await start(h, "manual", "", THINKING)
     try {
+      admitRequest(h, "manual")
       completeTurn(h, "First fictional question.", "First fictional answer.")
+      admitRequest(h, "manual")
       completeTurn(h, "Second fictional question.", "Second fictional answer.")
       admitRequest(h, "manual")
       h.sockets[0].message({serverContent: {inputTranscription: {text: "A third fictional question."},
@@ -6656,13 +6662,42 @@ describe("GeminiLiveController", () => {
       expect(completed).toBe(2)
       if (interrupted) h.sockets[0].message({serverContent: {interrupted: true, turnComplete: true, interactionStatus: "IN_PROGRESS"}})
       expect(h.events.filter(event => event === "turnComplete")).toHaveLength(completed)
-      await h.controller.stop(true)
+      const stopping = h.controller.stop(true)
+      await new Promise(resolve => setTimeout(resolve, 0))
       expect(h.sockets[0].sent.some(value => textTurn(JSON.parse(value)))).toBe(false)
-      expect(h.requests.flatMap(request => request.body.events ?? []).some(row => row.event_kind === "sitting_summary")).toBe(false)
+      expect(h.requests.filter(request => request.url.endsWith("/end"))).toHaveLength(0)
+      h.sockets[0].message({serverContent: {interactionStatus: "IDLE"}})
+      await waitFor(() => h.sockets[0].sent.some(value => textTurn(JSON.parse(value))))
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional closing thought."},
+        modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}, interactionStatus: "IDLE"}})
+      await stopping
+      expect(h.requests.flatMap(request => request.body.events ?? [])
+        .filter(row => row.event_kind === "sitting_summary")).toMatchObject([{content: "A fictional closing thought."}])
       expect(h.requests.filter(request => request.url.endsWith("/end"))).toHaveLength(1)
-      expect(h.audio).toEqual(["AQABAA==", "AQABAA==", "AQABAA=="])
+      expect(h.audio).toEqual(["AQABAA==", "AQABAA==", "AQABAA==", "AQABAA=="])
       expect(h.errors).toEqual([])
     } finally { await h.controller.stop() }
+  })
+
+  test("Thinking Stop without IDLE ends at the shared deadline rather than starting reflection", async () => {
+    let deadline = Date.now() + 30_000
+    const h = harness({getStopDeadline: () => deadline})
+    await start(h, "manual", "", THINKING)
+    admitRequest(h, "manual")
+    completeTurn(h, "First fictional question.", "First answer.")
+    admitRequest(h, "manual")
+    completeTurn(h, "Second fictional question.", "Second answer.")
+    admitRequest(h, "manual")
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "Third question."},
+      outputTranscription: {text: "An intermediate answer."},
+      modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}, turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+    const stopping = h.controller.stop(true)
+    deadline = Date.now() - 1
+    h.controller.refreshStopDeadline()
+    await stopping
+    expect(h.sockets[0].sent.some(value => textTurn(JSON.parse(value)))).toBe(false)
+    expect(h.requests.filter(request => request.url.endsWith("/end"))).toHaveLength(1)
+    expect(h.errors).toEqual([])
   })
 
   test("graceful Stop skips reflection while a normal turn is unfinished", async () => {
@@ -7059,7 +7094,7 @@ describe("GeminiLiveController", () => {
     expect(h.requests.filter((request) => request.url.endsWith("/end"))).toHaveLength(1)
   })
 
-  test.each(["close", "interrupted", "goAway"])("%s during reflection saves received thoughts without starting another socket", async reason => {
+  test.each(["close", "interrupted"])("%s during reflection saves received thoughts without starting another socket", async reason => {
     const h = harness()
     await start(h)
     completeTurn(h, "one", "answer one")
@@ -7071,8 +7106,7 @@ describe("GeminiLiveController", () => {
     h.sockets[0].message({serverContent: {outputTranscription: {text: "A partial fictional reflection."},
       modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}}})
     if (reason === "close") h.sockets[0].close()
-    else if (reason === "interrupted") h.sockets[0].message({serverContent: {interrupted: true}})
-    else h.sockets[0].message({goAway: {timeLeft: "1s"}})
+    else h.sockets[0].message({serverContent: {interrupted: true}})
     await stopping
 
     const events = h.requests
@@ -7082,6 +7116,61 @@ describe("GeminiLiveController", () => {
       .toMatchObject([{content: "A partial fictional reflection."}])
     expect(h.sockets).toHaveLength(1)
     expect(h.requests.some(request => request.url.endsWith("/token"))).toBe(false)
+    expect(h.errors).toEqual([])
+  })
+
+  test.each([LIVE, THINKING])("GoAway preparation does not cut Closing Thoughts short (%s)", async model => {
+    const h = harness()
+    await start(h, "manual", "", model)
+    admitRequest(h, "manual")
+    completeTurn(h, "First fictional question.", "First answer.")
+    admitRequest(h, "manual")
+    completeTurn(h, "Second fictional question.", "Second answer.")
+    const stopping = h.controller.stop(true)
+    await waitFor(() => h.sockets[0].sent.some(value => textTurn(JSON.parse(value))))
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional "}}})
+    h.sockets[0].message({goAway: {timeLeft: "20s"}})
+    await new Promise(resolve => setTimeout(resolve, 5))
+    expect(h.requests.some(request => request.url.endsWith("/end"))).toBe(false)
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "closing thought."},
+      modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}, turnComplete: true,
+      ...(model === THINKING ? {interactionStatus: "IDLE"} : {})}})
+    await stopping
+    expect(h.requests.flatMap(request => request.body.events ?? [])
+      .filter(row => row.event_kind === "sitting_summary")).toMatchObject([{content: "A fictional closing thought."}])
+    expect(h.sockets).toHaveLength(1)
+    expect(h.requests.some(request => request.url.endsWith("/token"))).toBe(false)
+    expect(h.errors).toEqual([])
+  })
+
+  test.each([[LIVE, false], [LIVE, true], [THINKING, false], [THINKING, true]] as const)(
+    "Closing Thoughts decline tools without dropping text (%s, co-packet=%s)", async (model, coPacket) => {
+    const h = harness()
+    await start(h, "manual", "", model)
+    admitRequest(h, "manual")
+    completeTurn(h, "First fictional question.", "First answer.")
+    admitRequest(h, "manual")
+    completeTurn(h, "Second fictional question.", "Second answer.")
+    const stopping = h.controller.stop(true)
+    await waitFor(() => h.sockets[0].sent.some(value => textTurn(JSON.parse(value))))
+    const content = {serverContent: {outputTranscription: {text: "A fictional closing thought."},
+      modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}}}
+    if (!coPacket) h.sockets[0].message(content)
+    h.sockets[0].message({toolCall: {functionCalls: [
+      {id: "reflection-read", name: "recall_memory", args: {query: "fictional memory"}},
+      {id: "reflection-write", name: "save_working_thought", args: {thought: "fictional thought"}},
+    ]}, ...(coPacket ? {serverContent: {...content.serverContent, turnComplete: true,
+      ...(model === THINKING ? {interactionStatus: "IDLE"} : {})}} : {})})
+    expect(functionResponses(h.sockets[0]).slice(-2)).toEqual([
+      ["reflection-read", "recall_memory"], ["reflection-write", "save_working_thought"],
+    ].map(([id, name]) => ({id, name, ...(model === LIVE ? {scheduling: "SILENT"} : {}),
+      response: {ok: false, status: "unavailable", message: "Tools are unavailable during Closing Thoughts."}})))
+    expect(h.requests.some(request => /\/(recall|working-state|working-thought|annul-intention)/.test(request.url))).toBe(false)
+    if (!coPacket) h.sockets[0].message({serverContent: {turnComplete: true,
+      ...(model === THINKING ? {interactionStatus: "IDLE"} : {})}})
+    await stopping
+    expect(h.requests.flatMap(request => request.body.events ?? [])
+      .filter(row => row.event_kind === "sitting_summary")).toMatchObject([{content: "A fictional closing thought."}])
     expect(h.errors).toEqual([])
   })
 
@@ -7399,6 +7488,31 @@ describe("GeminiLiveController", () => {
     }
     await waitFor(() => h.sockets.length === 2)
     await h.controller.stop()
+  })
+
+  test.each(["close", "goAway"])("Thinking Manual releases Talk after an intermediate answer and %s", async reason => {
+    const h = harness()
+    await start(h, "manual", "", THINKING)
+    try {
+      h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "manual-drop"}})
+      admitRequest(h, "manual")
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "A fictional question."},
+        outputTranscription: {text: "An intermediate answer."},
+        modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]},
+        turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      expect(h.events.filter(event => event === "turnComplete")).toHaveLength(0)
+      if (reason === "close") h.sockets[0].close()
+      else h.sockets[0].message({goAway: {timeLeft: "1s"}})
+      await waitFor(() => h.sockets.length === 2)
+      h.sockets[1].open()
+      h.sockets[1].message({setupComplete: {}})
+      await waitFor(() => h.reconnecting.at(-1) === false)
+      expect(h.events.filter(event => event === "turnComplete")).toHaveLength(1)
+      admitRequest(h, "manual")
+      completeTurn(h, "A new question.", "A new answer.")
+      expect(h.events.filter(event => event === "turnComplete")).toHaveLength(2)
+      expect(h.errors).toEqual([])
+    } finally { await h.controller.stop() }
   })
 
   test("GoAway keeps the old socket until transient token mint recovers", async () => {
