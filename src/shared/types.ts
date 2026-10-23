@@ -1,4 +1,6 @@
 export type SessionMode = "continuous" | "manual"
+export const LIVE_MODELS = ["gemini-3.8-live", "gemini-3.8-live-extended-thinking"] as const
+export type LiveModel = typeof LIVE_MODELS[number]
 export const MIC_SOURCES = ["glasses", "phone", "bluetooth", "bluetoothClassic"] as const
 export type MicSource = typeof MIC_SOURCES[number]
 export type ConnectionState = "idle" | "starting" | "reconnecting" | "listening" | "speaking" | "stopping" | "error"
@@ -49,6 +51,10 @@ export interface SessionSnapshot {
   configured: boolean
   connectionProfile: OpenAlmaProfile | null
   mode: SessionMode
+  modelChoice: LiveModel | null
+  model: string | null
+  configuredModel: string | null
+  modelSaving: boolean
   connection: ConnectionState
   soulId: string
   souls: string[]

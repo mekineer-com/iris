@@ -4,9 +4,10 @@ import type {OpenAlmaConfig} from "./openAlmaConfig"
 import type {ImageRequest} from "../shared/channels"
 import {formatImageTimestamp} from "../shared/imageReference"
 import type {FrameIntakeResult, FrameRetention, PassiveFrame} from "../shared/types"
-import {MIC_SOURCES, PHOTO_RETRY_MESSAGE, STOP_FOREGROUND_MS, type ImageTime, type MicSource, type PhotoCaption, type SessionMode} from "../shared/types"
+import {MIC_SOURCES, PHOTO_RETRY_MESSAGE, STOP_FOREGROUND_MS, type ImageTime, type LiveModel, type MicSource, type PhotoCaption, type SessionMode} from "../shared/types"
 
 type StartResponse = {
+  model: string
   recovery?: {sitting_id: string; ack_sequence: number} | null
   photo_work_protocol: typeof PHOTO_WORK_PROTOCOL
   session_id: string
@@ -80,6 +81,7 @@ type StorageLike = {
 }
 
 type SessionJournal = {
+  model?: string
   sessionId?: string
   version: 1 | 2 | 3
   scope: {userId: string; soulId: string; deviceSessionId: string}
@@ -256,6 +258,8 @@ class TokenRefreshError extends Error {
 }
 
 export class GeminiLiveController {
+  model = ""
+  private get thinking(): boolean { return this.model === "gemini-3.8-live-extended-thinking" }
   private readonly frameRetention: FrameRetention | undefined
   private candidateFrames: PassiveFrame[] = []
   private readonly fetchFn: typeof fetch
@@ -443,7 +447,7 @@ export class GeminiLiveController {
     this.frameRetention = options.frameRetention ? {...options.frameRetention} : undefined
   }
 
-  async start(mode: SessionMode = "continuous"): Promise<void> {
+  async start(mode: SessionMode = "continuous", model?: LiveModel): Promise<void> {
     trace("provider.start.begin")
     const generation = ++this.generation
     await this.journalTail
@@ -453,6 +457,7 @@ export class GeminiLiveController {
     this.ready = false
     this.ended = true
     this.sessionId = ""
+    this.model = ""
     this.resumptionHandle = ""
     this.resumptionUpdatedAt = 0
     this.reconnectAttempted = false
@@ -508,11 +513,12 @@ export class GeminiLiveController {
       if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
       const recovery = await this.prepareRecovery(generation)
       if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
-      const response = await this.requestStart(mode, recovery, generation)
+      const response = await this.requestStart(mode, recovery, generation, model)
       if (this.stopping || generation !== this.generation) {
         await this.endLease()
         throw new Error("Gemini start cancelled")
       }
+      this.model = response.model
       await this.reconcileJournal(Boolean(response.recovery))
       trace("provider.bootstrap.ready")
       this.token = response.ephemeral_token
@@ -1145,7 +1151,7 @@ export class GeminiLiveController {
     }
   }
 
-  private async requestStart(mode: SessionMode, recovery: TranscriptRecovery | null, generation: number): Promise<StartResponse> {
+  private async requestStart(mode: SessionMode, recovery: TranscriptRecovery | null, generation: number, model?: LiveModel): Promise<StartResponse> {
     let response: Response
     let historyRetried = false
     for (;;) {
@@ -1156,6 +1162,7 @@ export class GeminiLiveController {
         device_session_id: this.config.deviceSessionId,
         photo_work_protocol: PHOTO_WORK_PROTOCOL,
         mode,
+        ...(model ? {model} : {}),
         ...(recovery ? {recovery} : {}),
       })
       if (response.ok) break
@@ -1187,6 +1194,7 @@ export class GeminiLiveController {
     const ws = body.websocket
     if (
       body.photo_work_protocol !== PHOTO_WORK_PROTOCOL ||
+      typeof body.model !== "string" || !body.model.trim() || (model !== undefined && body.model !== model) ||
       typeof body.session_id !== "string" ||
       !body.session_id.trim() ||
       !Number.isSafeInteger(body.next_transcript_sequence) ||
@@ -1348,7 +1356,8 @@ export class GeminiLiveController {
       this.handlingMessage = false
     }
     this.flushToolResponses()
-    if (this.goAwayPending && !this.turnActive && !this.reflecting && !this.photoJob) void this.rotateForGoAway()
+    if (this.goAwayPending && !this.turnActive && !this.reflecting && !this.photoJob &&
+        (!this.thinking || !this.toolBatch.started)) void this.rotateForGoAway()
   }
 
   private handleGoAway(value: unknown): void {
@@ -1455,8 +1464,11 @@ export class GeminiLiveController {
       }
       if (!this.outputMuted || this.reflecting) {
         this.callbacks.onAudio(inline.data)
-        this.turnAudioDelivered = true
-        if (this.toolBatch.request) this.toolBatch.request.audible = true
+        // Exact zero PCM is playback, but not spoken words requiring a transcript.
+        if (!this.thinking || !/^A+={0,2}$/.test(inline.data)) {
+          this.turnAudioDelivered = true
+          if (this.toolBatch.request) this.toolBatch.request.audible = true
+        }
       }
       this.providerAudioChunks += 1
     }
@@ -1467,7 +1479,8 @@ export class GeminiLiveController {
         trace("provider.reflection.interrupted")
         this.callbacks.onInterrupted()
         this.finishReflection(null)
-      } else if (content.generationComplete === true || content.turnComplete === true) {
+      } else if (this.thinking ? content.interactionStatus === "IDLE"
+        : content.generationComplete === true || content.turnComplete === true) {
         this.callbacks.onTurnComplete(true)
         this.finishReflection(this.outputTranscript.trim() || null)
       }
@@ -1485,7 +1498,8 @@ export class GeminiLiveController {
       this.finalizeInterruptedTurn(true)
       this.callbacks.onInterrupted()
     }
-    if (content.turnComplete === true) {
+    if (content.turnComplete === true || (this.thinking && content.interactionStatus === "IDLE")) {
+      const interactionComplete = !this.thinking || content.interactionStatus === "IDLE"
       hasToolCall ||= this.turnHasToolCall
       this.hasCompletedProviderTurn = true
       trace("provider.turn_complete", {
@@ -1502,7 +1516,7 @@ export class GeminiLiveController {
       if (interruptedTurn) {
         this.interruptionFinalized = false
       } else {
-        this.finalizeCompleteTurn()
+        this.finalizeCompleteTurn(interactionComplete)
       }
       this.turnActive = this.voiceActive
       this.turnHasToolCall = false
@@ -1512,20 +1526,24 @@ export class GeminiLiveController {
       if (!interruptedTurn && request && (this.mode === "manual" || !this.voiceActive)) {
         request.settled = true
         request.continuing = false
-        if (request.audible || !this.hasUnconsumedTools(request)) request.retired = true
+        if (interactionComplete && (request.audible || !this.hasUnconsumedTools(request))) request.retired = true
       }
       if (this.spokenRequest?.retired) this.spokenRequest = null
       this.toolBatch = {request: this.spokenRequest, completed: false, continuationSent: false,
-        background: !this.spokenRequest, started: !interruptedTurn && batch.photoContinuation === true,
-        photo: !interruptedTurn && batch.photoContinuation === true && batch.photo === true}
+        background: !this.spokenRequest,
+        invitation: !interactionComplete && batch.invitation,
+        started: !interactionComplete || (!this.thinking && !interruptedTurn && batch.photoContinuation === true),
+        photo: !interruptedTurn && (interactionComplete
+          ? !this.thinking && batch.photoContinuation === true && batch.photo === true
+          : batch.photo === true || batch.photoContinuation === true)}
       this.reconnectAttempted = false
       if (this.latestUsageTotal !== null) this.callbacks.onUsage(this.latestUsageTotal)
       this.materializeDrafts()
-      this.callbacks.onTurnComplete(!this.spokenRequest)
-      this.requestSpokenPhotoDescription()
+      this.callbacks.onTurnComplete(interactionComplete && !this.spokenRequest)
+      if (interactionComplete) this.requestSpokenPhotoDescription()
       // Barge-in completes the old response before the interrupting voice turn is finished.
-      if (!interruptedTurn || (!this.voiceActive && (!this.spokenRequest || this.spokenRequest.retired) &&
-          this.pendingImage && !this.pendingImage.providerSent && !this.pendingImage.retryRequested)) {
+      if (interactionComplete && (!interruptedTurn || (!this.voiceActive && (!this.spokenRequest || this.spokenRequest.retired) &&
+          this.pendingImage && !this.pendingImage.providerSent && !this.pendingImage.retryRequested))) {
         void this.retryPendingImage()
       }
     }
@@ -1539,14 +1557,14 @@ export class GeminiLiveController {
     return (value as {text: string}).text
   }
 
-  private finalizeCompleteTurn(): void {
+  private finalizeCompleteTurn(settleInput = true): void {
     const output = this.turnAudioDelivered ? this.outputTranscript.trim() : ""
     const audible = this.turnAudioDelivered
     const closeUncertainGroup = this.spokenRequest !== null && !this.spokenRequest.retired &&
       this.toolBatch.request === this.spokenRequest && (!this.toolBatch.background || audible)
     this.clearTurn()
     try { this.recordAssistantOutput(output, audible, this.outputMuted) }
-    finally { this.settleSpeechDraft(true, closeUncertainGroup) }
+    finally { if (settleInput) this.settleSpeechDraft(true, closeUncertainGroup) }
     this.deliveredToolResultIds.clear()
     this.scheduleAppend()
   }
@@ -1667,7 +1685,8 @@ export class GeminiLiveController {
       if (this.photoJob?.callId === id) this.resetImageDelivery()
     }
     const request = this.spokenRequest
-    if (request?.settled && !request.continuing && !this.hasUnconsumedTools(request)) {
+    if (request?.settled && !request.continuing && !this.hasUnconsumedTools(request) &&
+        (!this.thinking || !this.toolBatch.started)) {
       request.retired = true
       this.spokenRequest = null
       this.callbacks.onTurnComplete(true)
@@ -1914,9 +1933,10 @@ export class GeminiLiveController {
       }
       const request = pending.batch.request
       const needsAnswer = pending.name !== "nothing_to_add" && request && !request.retired && !request.audible && !this.outputMuted
-      if (pending.scheduling === "WHEN_IDLE" && !this.draining && !needsAnswer && this.callbacks.canInvite?.() === false) continue
+      if (pending.scheduling === "WHEN_IDLE" && !this.draining && !needsAnswer &&
+          (!this.thinking || pending.parts) && this.callbacks.canInvite?.() === false) continue
       if (pending.parts && !this.draining && (this.voiceActive || this.turnActive || (this.spokenRequest && !this.spokenRequest.retired))) continue
-      if (needsAnswer && (!request.settled || [...this.pendingToolCalls.values()].some(call =>
+      if (needsAnswer && !this.thinking && (!request.settled || [...this.pendingToolCalls.values()].some(call =>
         call.name !== "nothing_to_add" && call.batch.request === request && !call.batch.continuationSent &&
         (call.response === undefined || !call.batch.completed)))) continue
       const resume = needsAnswer && !pending.batch.continuationSent && !request.continuing &&
@@ -1928,7 +1948,7 @@ export class GeminiLiveController {
             id,
             name: pending.name,
             response: typeof pending.response === "string" ? {result: pending.response} : pending.response,
-            scheduling: pending.scheduling ?? (resume ? "WHEN_IDLE" : "SILENT"),
+            ...(!this.thinking ? {scheduling: pending.scheduling ?? (resume ? "WHEN_IDLE" : "SILENT")} : {}),
             ...(pending.parts ? {parts: pending.parts} : {}),
           }],
         },
@@ -2503,6 +2523,11 @@ export class GeminiLiveController {
   }
 
   private async reconcileJournal(recovered: boolean): Promise<void> {
+    const savedModel = this.loadedJournal ? (JSON.parse(this.loadedJournal) as SessionJournal).model : undefined
+    if (savedModel !== this.model) {
+      this.resumptionHandle = ""
+      this.resumptionUpdatedAt = 0
+    }
     const generation = this.generation
     if (recovered) this.pendingEvents = []
     const photoOutsideHistory = this.pendingImages.flatMap(image => [image.imageSequence, image.assistantSequence])
@@ -2551,6 +2576,7 @@ export class GeminiLiveController {
   private journalSnapshot(): string {
     const journal: SessionJournal = {
       version: 3,
+      ...(this.model ? {model: this.model} : {}),
       ...(this.sessionId ? {sessionId: this.sessionId} : {}),
       scope: {
         userId: this.config.userId,

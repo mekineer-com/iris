@@ -5,6 +5,8 @@ import ts from "typescript"
 import * as jsx from "react/jsx-runtime"
 import manifest from "../../../miniapp.json"
 import {readImageTime} from "../imageTime"
+import {LIVE_MODELS, type LiveModel} from "../../shared/types"
+import * as sharedTypes from "../../shared/types"
 
 import {
   imageRequest,
@@ -27,6 +29,9 @@ function labelledCheckbox(tree: any, text: string) {
 }
 
 function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Promise<unknown>, now?: number) {
+  for (const [field, value] of Object.entries({modelChoice: null, model: null, configuredModel: null, modelSaving: false})) {
+    if (!(field in snapshot)) Object.assign(snapshot, {[field]: value})
+  }
   if (!("startGeneration" in snapshot)) Object.assign(snapshot, {startGeneration: 1})
   if (!("pendingPhotoIds" in snapshot)) Object.assign(snapshot, {pendingPhotoIds: ["local-photo"]})
   const states: unknown[] = []
@@ -50,6 +55,7 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
       if (name.endsWith("miniapp.json")) return {default: manifest, __esModule: true}
       if (name.endsWith("/useChannel")) return {useChannel: () => snapshot}
       if (name.endsWith("/imageTime")) return {readImageTime}
+      if (name.endsWith("/shared/types")) return sharedTypes
       if (name === "@mentra/miniapp/ui") return {useRpc: (channel: string) => (payload: unknown) => rpc(channel, payload)}
       return {default: "", __esModule: true}
     },
@@ -60,6 +66,92 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
 }
 
 describe("SessionPage state projection", () => {
+  const modelButtons = (tree: any) => nodes(nodes(tree).find(node => node.props?.["aria-label"] === "Live model"))
+    .filter(node => node.type === "button")
+
+  test("no saved override implies neither model, including custom or offered server settings", () => {
+    const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"],
+      configuredModel: null as string | null}
+    const render = renderPage(snapshot, async () => ({ok: true}))
+    for (const model of [null, "custom-server-model", ...LIVE_MODELS]) {
+      snapshot.configuredModel = model
+      const tree = render()
+      expect(modelButtons(tree).map(button => button.props["aria-pressed"])).toEqual([false, false])
+      const selector = nodes(tree).find(node => node.props?.["aria-label"] === "Live model")
+      expect(nodes(selector).find(node => node.type === "p").props.children)
+        .toBe(model ? `Using server setting: ${model}` : "Using server setting")
+      const controls = nodes(tree).find(node => node.props?.["aria-label"] === "Voice controls")
+      expect(modelButtons(controls)).toHaveLength(2)
+      const settings = nodes(tree).find(node => node.props?.id === "iris-settings")
+      expect(modelButtons(settings)).toHaveLength(0)
+    }
+  })
+
+  for (const [index, choice] of LIVE_MODELS.entries()) {
+    for (const fails of [false, true]) {
+      test(`${choice} save ${fails ? "failure retains" : "success updates"} the confirmed choice and locks Start`, async () => {
+        const previous = index === 0 ? LIVE_MODELS[1] : null
+        const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
+          soulConfirmed: true, soulLocked: false, connection: "idle", modelChoice: previous as LiveModel | null}
+        let resolve!: () => void
+        let reject!: (error: Error) => void
+        const pending = new Promise<void>((res, rej) => {resolve = res; reject = rej})
+        const calls: Array<{channel: string; payload: unknown}> = []
+        const render = renderPage(snapshot, async (channel, payload) => {
+          calls.push({channel, payload})
+          if (channel === "openalma:set-soul") return {soulId: "Quill", created: false}
+          if (channel === "openalma:set-model") return pending
+          return {ok: true}
+        })
+        const start = () => nodes(render()).find(node => node.props?.className === "sitting-button")
+        nodes(render()).find(node => node.props?.onFocus).props.onChange({target: {value: "Quill"}})
+        nodes(render()).find(node => node.props?.["aria-label"] === "Use soul").props.onClick()
+        await new Promise(resolve => setTimeout(resolve, 0))
+        expect(start().props.disabled).toBe(false)
+        calls.length = 0
+        modelButtons(render())[index].props.onClick()
+        expect(calls).toEqual([{channel: "openalma:set-model", payload: {model: choice}}])
+        expect(modelButtons(render()).map(button => button.props.disabled)).toEqual([true, true])
+        expect(modelButtons(render()).map(button => button.props["aria-pressed"]))
+          .toEqual(LIVE_MODELS.map(model => model === previous))
+        expect(start().props.disabled).toBe(true)
+        if (fails) reject(new Error("Fictional model preference storage failure"))
+        else {
+          snapshot.modelChoice = choice
+          resolve()
+        }
+        await new Promise(resolve => setTimeout(resolve, 0))
+        expect(modelButtons(render()).map(button => button.props["aria-pressed"]))
+          .toEqual(LIVE_MODELS.map(model => model === (fails ? previous : choice)))
+        expect(modelButtons(render()).map(button => button.props.disabled)).toEqual([false, false])
+        expect(start().props.disabled).toBe(false)
+        if (fails) expect(JSON.stringify(render())).toContain("Fictional model preference storage failure")
+      })
+    }
+  }
+
+  test("model selection locks for the whole sitting and background save; active label uses actual model", () => {
+    const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"], connection: "idle",
+      modelChoice: LIVE_MODELS[0], model: "actual-lease-model", configuredModel: "custom-server-model", modelSaving: false}
+    const render = renderPage(snapshot, async () => ({ok: true}))
+    for (const connection of ["idle", "error", "starting", "reconnecting", "listening", "speaking", "stopping"]) {
+      snapshot.connection = connection
+      const locked = connection !== "idle" && connection !== "error"
+      expect(modelButtons(render()).map(button => button.props.disabled)).toEqual([locked, locked])
+      if (locked) expect(JSON.stringify(render())).toContain("Using model: actual-lease-model")
+    }
+    snapshot.connection = "idle"
+    nodes(render()).find(node => node.props?.onFocus).props.onChange({target: {value: "Fable"}})
+    nodes(render()).find(node => node.props?.["aria-label"] === "Use soul").props.onClick()
+    const start = () => nodes(render()).find(node => node.props?.className === "sitting-button")
+    expect(start().props.disabled).toBe(false)
+    snapshot.modelSaving = true
+    expect(modelButtons(render()).map(button => button.props.disabled)).toEqual([true, true])
+    expect(start().props.disabled).toBe(true)
+    snapshot.connection = "listening"
+    expect(start().props.disabled).toBe(false)
+  })
+
   test("Closing thoughts lives beside Start/Stop, defaults checked, and follows the remembered snapshot", () => {
     const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
       soulConfirmed: true, connection: "idle", closingThoughts: undefined as boolean | undefined}
@@ -133,6 +225,7 @@ describe("SessionPage state projection", () => {
       try {
         expect(calls).toEqual([active ? "openalma:stop" : "openalma:start"])
         expect(labelledCheckbox(render(), "Closing thoughts").props.disabled).toBe(true)
+        expect(modelButtons(render()).map(button => button.props.disabled)).toEqual([true, true])
       } finally {
         release()
         await new Promise(resolve => setTimeout(resolve, 0))

@@ -2,7 +2,10 @@ import {describe, expect, spyOn, test} from "bun:test"
 
 import {GeminiLiveController, PhotoUploadConflict, journalSoulId, JOURNAL_KEY, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
-import {PHOTO_RETRY_MESSAGE, type FrameRetention, type PassiveFrame, type PhotoCaption} from "../shared/types"
+import {PHOTO_RETRY_MESSAGE, type FrameRetention, type LiveModel, type PassiveFrame, type PhotoCaption} from "../shared/types"
+
+const LIVE: LiveModel = "gemini-3.8-live"
+const THINKING: LiveModel = "gemini-3.8-live-extended-thinking"
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://127.0.0.1:9999",
@@ -108,6 +111,7 @@ function fakeStart(body: any = {}, nextSequence = 41) {
   const recovery = body.recovery
   const ack = recovery?.events.at(-1)?.sequence
   return {
+    model: body.model ?? LIVE,
     photo_work_protocol: "iris-photo-work-v2",
     session_id: "sitting-1",
     next_transcript_sequence: Math.max(nextSequence, (ack ?? 0) + 1),
@@ -126,7 +130,7 @@ function recoveryBackup(overrides: Record<string, unknown> = {}) {
   const storage = new FakeStorage()
   const journal = {version: 3, sessionId: "original-sitting",
     scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
-    resumption: {handle: "original-handle", updatedAt: Date.now()},
+    model: LIVE, resumption: {handle: "original-handle", updatedAt: Date.now()},
     pendingTranscripts: [{event_id: "original-sitting:41", sequence: 41, event_kind: "transcript",
       role: "user", content: "Original fictional words.", status: "complete", mic_source: "phone"}],
     draftTranscripts: [], nextTranscriptSequence: 42, pendingImages: [], ...overrides}
@@ -369,9 +373,10 @@ async function waitFor(predicate: () => boolean, timeoutMs = 700): Promise<void>
 
 const PHOTO_NEXT = {next: "A photo task is ready. Call nothing_to_add to receive it."}
 
-async function providerReady(socket: FakeSocket, id = `provider-ready-${++FakeSocket.readinessCalls}`, complete = true) {
+async function providerReady(socket: FakeSocket, id = `provider-ready-${++FakeSocket.readinessCalls}`, complete = true,
+  interactionStatus?: "IN_PROGRESS" | "IDLE") {
   socket.message({toolCall: {functionCalls: [{id, name: "nothing_to_add", args: {}}]},
-    ...(complete ? {serverContent: {turnComplete: true}} : {})})
+    ...(complete ? {serverContent: {turnComplete: true, ...(interactionStatus ? {interactionStatus} : {})}} : {})})
   await waitFor(() => functionResponses(socket).some(response => response.id === id))
   return functionResponses(socket).find(response => response.id === id)!
 }
@@ -411,8 +416,8 @@ async function completePhotoCaption(socket: FakeSocket, imageId: string, caption
   socket.message({serverContent: {turnComplete: true}})
 }
 
-async function start(h: ReturnType<typeof harness>, mode: "continuous" | "manual" = "continuous", handle = ""): Promise<void> {
-  const starting = h.controller.start(mode)
+async function start(h: ReturnType<typeof harness>, mode: "continuous" | "manual" = "continuous", handle = "", model?: LiveModel): Promise<void> {
+  const starting = h.controller.start(mode, model)
   await waitFor(() => h.sockets.length === 1)
   h.sockets[0].open()
   expect(JSON.parse(h.sockets[0].sent[0])).toEqual({setup: {sessionResumption: handle ? {handle} : {}}})
@@ -429,13 +434,14 @@ function completeTurn(h: ReturnType<typeof harness>, input = "hello", output = "
     serverContent: {
       inputTranscription: {text: input},
       outputTranscription: {text: output},
-      ...(output.trim() ? {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}} : {}),
+      ...(output.trim() ? {modelTurn: {parts: [{inlineData: {data: h.controller.model === THINKING ? "AQABAA==" : "AAAAAA=="}}]}} : {}),
       turnComplete: true,
+      ...(h.controller.model === THINKING ? {interactionStatus: "IDLE"} : {}),
     },
   })
 }
 
-function functionResponses(socket: FakeSocket): Array<{id: string; name: string; scheduling: string; response: any; parts?: Array<{inlineData: {mimeType: string; data: string}}>}> {
+function functionResponses(socket: FakeSocket): Array<{id: string; name: string; scheduling?: string; response: any; parts?: Array<{inlineData: {mimeType: string; data: string}}>}> {
   return socket.sent.flatMap(value => JSON.parse(value).toolResponse?.functionResponses ?? [])
 }
 
@@ -449,6 +455,314 @@ function admitRequest(h: ReturnType<typeof harness>, mode: "continuous" | "manua
 }
 
 describe("GeminiLiveController", () => {
+  test.each([LIVE, THINKING])("Start sends the exact %s override on stale-bootstrap retry", async model => {
+    const h = harness({startResults: [{status: 409, body: {detail: {code: "mentra_history_changed"}}}]})
+    await start(h, "manual", "", model)
+    try {
+      expect(h.requests.filter(request => request.url.endsWith("/session/start")).map(request => request.body))
+        .toEqual(Array(2).fill({user_id: CONFIG.userId, soul_id: CONFIG.soulId,
+          device_session_id: CONFIG.deviceSessionId, photo_work_protocol: "iris-photo-work-v2", mode: "manual", model}))
+      expect(h.controller.model).toBe(model)
+    } finally { await h.controller.stop() }
+  })
+
+  test("Start without a choice uses the actual custom server model", async () => {
+    const h = harness({startBody: {...fakeStart(), model: "fictional-custom-live"}})
+    await start(h)
+    try {
+      expect(h.requests[0].body).not.toHaveProperty("model")
+      expect(h.controller.model).toBe("fictional-custom-live")
+    } finally { await h.controller.stop() }
+  })
+
+  test.each([undefined, null, "", "   ", 38, LIVE])("Thinking Start rejects invalid/mismatched actual model %j before setup", async model => {
+    const h = harness({startBody: {...fakeStart(), model}})
+    await expect(h.controller.start("continuous", THINKING)).rejects.toThrow("invalid session contract")
+    expect(h.sockets).toEqual([])
+    expect(h.requests.filter(request => request.url.endsWith("/end"))).toHaveLength(1)
+    expect(h.requests.filter(request => request.url.endsWith("/session/start"))).toHaveLength(1)
+  })
+
+  test.each([
+    {version: 1, saved: undefined, actual: LIVE}, {version: 2, saved: undefined, actual: LIVE},
+    {version: 3, saved: undefined, actual: LIVE}, {version: 3, saved: THINKING, actual: LIVE},
+    {version: 3, saved: LIVE, actual: THINKING}, {version: 3, saved: THINKING, actual: THINKING},
+    {version: 3, saved: "fictional-custom-live", actual: "fictional-custom-live"},
+  ])("saved handle requires actual Start model provenance (%j)", async ({version, saved, actual}) => {
+    const {storage} = recoveryBackup({version, pendingTranscripts: [], model: saved})
+    const h = harness({storage, startBody: {...fakeStart(), model: actual}})
+    await start(h, "continuous", saved === actual ? "original-handle" : "")
+    try {
+      expect(h.controller.model).toBe(actual)
+      expect(h.requests[0].body).not.toHaveProperty("recovery")
+      expect(storage.values.has(RECOVERED_CHATS_KEY)).toBe(false)
+      if (saved === actual) expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).model).toBe(actual)
+    } finally { await h.controller.stop() }
+  })
+
+  test.each([undefined, LIVE])("Thinking cold recovery preserves rows and original photo identity (saved model=%j)", async model => {
+    const photo = {imageId: "original-photo", mediaRef: "mentra_media/test-phone/original-photo.png",
+      providerSent: false, captureAfterCurrent: false, generation: 1, sessionId: "original-sitting", retryRequested: true}
+    const {storage, journal} = recoveryBackup({model, pendingImages: [photo]})
+    const h = harness({storage})
+    await start(h, "continuous", "", THINKING)
+    try {
+      expect(h.requests[0].body.recovery).toEqual({sitting_id: "original-sitting", events: journal.pendingTranscripts})
+      const saved = JSON.parse(storage.values.get(JOURNAL_KEY)!)
+      expect(saved.model).toBe(THINKING)
+      expect(saved.pendingImages).toMatchObject([{imageId: photo.imageId, mediaRef: photo.mediaRef, retryRequested: true}])
+      expect(saved.pendingTranscripts).toEqual([])
+      expect(storage.values.has(RECOVERED_CHATS_KEY)).toBe(false)
+      expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    } finally { await h.controller.stop() }
+  })
+
+  test.each(["continuous", "manual"] as const)("Thinking %s sends pending recall before IDLE despite canInvite=false", async mode => {
+    let release!: () => void
+    const h = harness({canInvite: () => false, recallGate: new Promise<void>(resolve => {release = resolve})})
+    await start(h, mode, "", THINKING)
+    try {
+      admitRequest(h, mode)
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "Where is the fictional beacon?"}, interactionStatus: "IN_PROGRESS"}})
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "thinking-recall", name: "recall_memory", args: {query: "fictional beacon"}}]},
+        serverContent: {outputTranscription: {text: "I will check."}, modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]},
+          turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      expect(h.events.at(-1)).toBe("toolBoundary")
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      release()
+      await waitFor(() => functionResponses(h.sockets[0]).length === 1)
+      expect(functionResponses(h.sockets[0])).toEqual([{id: "thinking-recall", name: "recall_memory",
+        response: {result: "A compact fictional memory."}}])
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "Beside the fictional harbor."},
+        modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}, turnComplete: true, interactionStatus: "IDLE"}})
+      expect(h.events.at(-1)).toBe("turnComplete")
+      await h.controller.stop()
+      expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.role === "assistant").map(row => row.content))
+        .toEqual(["I will check.", "Beside the fictional harbor."])
+      expect(h.errors).toEqual([])
+    } finally { release(); await h.controller.stop() }
+  })
+
+  test.each([false, true])("Thinking intermediate completion cannot invite; final IDLE releases once (co-packet=%s)", async coPacket => {
+    let idle = false
+    const h = harness({canInvite: () => idle})
+    await start(h, "continuous", "", THINKING)
+    const cues = () => h.sockets[0].sent.map(value => JSON.parse(value)).filter(value => value.realtimeInput?.text === "nokoru")
+    try {
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "thinking-background", name: "recall_memory", args: {query: "fictional background"}}]},
+        serverContent: {interactionStatus: "IN_PROGRESS"}})
+      await waitFor(() => functionResponses(h.sockets[0]).length === 1)
+      expect(functionResponses(h.sockets[0])[0]).not.toHaveProperty("scheduling")
+      idle = true
+      h.sockets[0].message({serverContent: {turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      h.controller.resumeBackgroundWork()
+      expect(cues()).toEqual([])
+      expect(h.events).toEqual(["toolBoundary"])
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional finding."},
+        modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}, turnComplete: true,
+        interactionStatus: coPacket ? "IDLE" : "IN_PROGRESS"}})
+      if (!coPacket) {
+        expect(h.events.at(-1)).toBe("toolBoundary")
+        expect(cues()).toEqual([])
+        h.sockets[0].message({serverContent: {interactionStatus: "IDLE"}})
+      }
+      expect(h.events.at(-1)).toBe("turnComplete")
+      expect(cues()).toEqual([{realtimeInput: {text: "nokoru"}}])
+      await h.controller.stop()
+      expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.role === "assistant"))
+        .toMatchObject([{event_kind: "transcript", content: "A fictional finding."}])
+      expect(h.errors).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
+  test("Thinking cancellation after IN_PROGRESS cannot release Manual before IDLE", async () => {
+    let release!: () => void
+    const h = harness({recallGate: new Promise<void>(resolve => {release = resolve})})
+    await start(h, "manual", "", THINKING)
+    try {
+      admitRequest(h, "manual")
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "thinking-cancel", name: "recall_memory", args: {query: "fictional beacon"}}]},
+        serverContent: {inputTranscription: {text: "Find the fictional beacon."}, turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      expect(h.events.at(-1)).toBe("toolBoundary")
+      h.sockets[0].message({toolCallCancellation: {ids: ["thinking-cancel"]}})
+      expect(h.events).toEqual(["toolBoundary"])
+      release()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(functionResponses(h.sockets[0])).toEqual([])
+      h.sockets[0].message({serverContent: {interactionStatus: "IDLE"}})
+      expect(h.events).toEqual(["toolBoundary", "turnComplete"])
+      expect(h.errors).toEqual([])
+    } finally { release(); await h.controller.stop() }
+  })
+
+  test.each(["continuous", "manual"] as const)("Thinking %s input prefix, intermediate segment and late suffix remain one user row", async mode => {
+    const storage = new FakeStorage()
+    const h = harness({storage})
+    await start(h, mode, "", THINKING)
+    try {
+      admitRequest(h, mode)
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "Locate the fictional "}, interactionStatus: "IN_PROGRESS"}})
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "Let me think."},
+        modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}, turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      expect(h.events.at(-1)).toBe("toolBoundary")
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.role === "user")).toEqual([])
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).draftTranscripts)
+        .toContainEqual(expect.objectContaining({role: "user", content: "Locate the fictional "}))
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "beacon."}, interactionStatus: "IN_PROGRESS"}})
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "It is beside the harbor."},
+        modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}, turnComplete: true, interactionStatus: "IDLE"}})
+      expect(h.events.at(-1)).toBe("turnComplete")
+      await h.controller.stop()
+      expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.role === "user"))
+        .toMatchObject([{content: "Locate the fictional beacon.", status: "complete", mic_source: "phone"}])
+      expect(h.errors).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
+  test.each([false, true])("Thinking zero-only PCM plays unchanged without a speech gap (co-packet IDLE=%s)", async coPacket => {
+    const h = harness()
+    await start(h, "continuous", "", THINKING)
+    try {
+      h.sockets[0].message({serverContent: {interactionStatus: "IN_PROGRESS",
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
+      h.sockets[0].message({serverContent: {turnComplete: true, interactionStatus: coPacket ? "IDLE" : "IN_PROGRESS"}})
+      if (!coPacket) h.sockets[0].message({serverContent: {interactionStatus: "IDLE"}})
+      await h.controller.stop()
+      expect(h.audio).toEqual(["AAAAAA=="])
+      expect(h.requests.flatMap(request => request.body.events ?? [])).toEqual([])
+      expect(h.errors).toEqual([])
+      expect(h.persistenceErrors.filter(Boolean)).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
+  test("Thinking zero-only PCM cannot satisfy an owed answer while recall remains pending", async () => {
+    let release!: () => void
+    const h = harness({recallGate: new Promise<void>(resolve => {release = resolve})})
+    await start(h, "manual", "", THINKING)
+    try {
+      admitRequest(h, "manual")
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "zero-recall", name: "recall_memory", args: {query: "fictional beacon"}}]},
+        serverContent: {inputTranscription: {text: "Find the fictional beacon."},
+          modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true, interactionStatus: "IDLE"}})
+      expect(h.events.at(-1)).toBe("toolBoundary")
+      expect(h.audio).toEqual(["AAAAAA=="])
+      release()
+      await waitFor(() => functionResponses(h.sockets[0]).length === 1)
+      expect(functionResponses(h.sockets[0])[0]).not.toHaveProperty("scheduling")
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "Beside the fictional harbor."},
+        modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}, turnComplete: true, interactionStatus: "IDLE"}})
+      expect(h.events.at(-1)).toBe("turnComplete")
+      await h.controller.stop()
+      expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.role === "assistant"))
+        .toMatchObject([{event_kind: "transcript", content: "Beside the fictional harbor."}])
+      expect(h.errors).toEqual([])
+    } finally { release(); await h.controller.stop() }
+  })
+
+  test("Thinking nonzero speech without transcription still fails at segment completion", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, "continuous", "", THINKING)
+    h.sockets[0].message({serverContent: {interactionStatus: "IN_PROGRESS",
+      modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}, turnComplete: true}})
+    await waitFor(() => h.errors.length === 1)
+    await h.controller.stop()
+    expect(h.audio).toEqual(["AQABAA=="])
+    expect(h.errors).toEqual(["Gemini completed audible speech without its transcription"])
+    expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.role === "assistant"))
+      .toMatchObject([{event_kind: "transcript_gap", content: "Transcript unavailable."}])
+  })
+
+  test.each([false, true])("Thinking photo readiness settles, sends inline original, files receipt and finishes quietly on IDLE (co-packet=%s)", async coPacket => {
+    let canInvite = true
+    const h = harness({storage: new FakeStorage(), canInvite: () => canInvite})
+    await start(h, "continuous", "", THINKING)
+    const socket = h.sockets[0]
+    try {
+      await h.controller.sendImage({imageId: "thinking-photo", mimeType: "image/png", data: "BAUG"})
+      expect(socket.sent.map(value => JSON.parse(value)).filter(photoInput)).toEqual([photoVideo("BAUG")])
+      expect(functionResponses(socket)).toEqual([])
+      expect(await providerReady(socket, "thinking-settle", true, "IN_PROGRESS"))
+        .toEqual({id: "thinking-settle", name: "nothing_to_add", response: PHOTO_NEXT})
+      expect(h.requests.some(request => request.url.endsWith("/snapshot/replay"))).toBe(false)
+      expect(await providerReady(socket, "thinking-inline", true, "IN_PROGRESS")).toEqual({id: "thinking-inline", name: "nothing_to_add",
+        response: {task: "please-caption-thinking-photo"}, parts: [{inlineData: {mimeType: "image/png", data: "BAUG"}}]})
+      canInvite = false
+      provisionalCaption(socket, "thinking-photo", "A fictional amber triangle.", "thinking-caption")
+      socket.message({serverContent: {turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      await waitFor(() => functionResponses(socket).some(response => response.id === "thinking-caption"))
+      expect(functionResponses(socket).find(response => response.id === "thinking-caption"))
+        .toEqual({id: "thinking-caption", name: "save_photo_caption", response: {ok: true, durable: true}})
+      expect(h.controller.frameDeliveryOpen).toBe(false)
+      expect(h.events.at(-1)).toBe("toolBoundary")
+      socket.message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true,
+        interactionStatus: coPacket ? "IDLE" : "IN_PROGRESS"}})
+      if (!coPacket) {
+        expect(h.controller.frameDeliveryOpen).toBe(false)
+        socket.message({serverContent: {interactionStatus: "IDLE"}})
+      }
+      expect(h.events.at(-1)).toBe("turnComplete")
+      expect(h.controller.frameDeliveryOpen).toBe(true)
+      expect(functionResponses(socket).every(response => !("scheduling" in response))).toBe(true)
+      await h.controller.stop()
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot/finalize")).map(request => request.body))
+        .toMatchObject([{image_id: "thinking-photo", caption: "A fictional amber triangle.", caption_event_id: "sitting-1:photo:thinking-photo"}])
+      expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.role === "assistant"))
+        .toMatchObject([{event_kind: "photo_caption", content: "A fictional amber triangle.", media_ref: "mentra_media/test-phone/thinking-photo.png"}])
+      expect(h.audio).toEqual(["AAAAAA=="])
+      expect(h.errors).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
+  test("Thinking caption segment does not strand readiness for the next accepted original", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, "continuous", "", THINKING)
+    const socket = h.sockets[0]
+    try {
+      await h.controller.sendImage({imageId: "thinking-first", mimeType: "image/png", data: "AQID"})
+      await h.controller.sendImage({imageId: "thinking-second", mimeType: "image/png", data: "BAUG"})
+      expect(await providerReady(socket, "two-settle", true, "IN_PROGRESS"))
+        .toEqual({id: "two-settle", name: "nothing_to_add", response: PHOTO_NEXT})
+      expect(await providerReady(socket, "two-first", true, "IN_PROGRESS"))
+        .toEqual({id: "two-first", name: "nothing_to_add", response: {task: "please-caption-thinking-first"},
+          parts: [{inlineData: {mimeType: "image/png", data: "AQID"}}]})
+      provisionalCaption(socket, "thinking-first", "A fictional blue triangle.", "two-caption")
+      socket.message({serverContent: {turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      await waitFor(() => functionResponses(socket).some(response => response.id === "two-caption"))
+      expect(await providerReady(socket, "two-second", true, "IN_PROGRESS"))
+        .toEqual({id: "two-second", name: "nothing_to_add", response: {task: "please-caption-thinking-second"},
+          parts: [{inlineData: {mimeType: "image/png", data: "BAUG"}}]})
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay")).map(request => request.body.image_id))
+        .toEqual(["thinking-first", "thinking-second"])
+      expect(functionResponses(socket).every(response => !("scheduling" in response))).toBe(true)
+      expect(h.errors).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
+  test.each([false, true])("Thinking reflection waits for IDLE, not generation/segment completion (co-packet=%s)", async coPacket => {
+    const h = harness()
+    await start(h, "continuous", "", THINKING)
+    completeTurn(h, "First fictional question.", "First fictional answer.")
+    completeTurn(h, "Second fictional question.", "Second fictional answer.")
+    let finished = false
+    const stopping = h.controller.stop(true).then(() => { finished = true })
+    try {
+      await waitFor(() => h.sockets[0].sent.some(value => textTurn(JSON.parse(value))))
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional reflection."},
+        modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}, generationComplete: true,
+        turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(finished).toBe(false)
+      expect(h.requests.some(request => request.url.endsWith("/end"))).toBe(false)
+      h.sockets[0].message({serverContent: {...(coPacket ? {turnComplete: true} : {}), interactionStatus: "IDLE"}})
+      await stopping
+      expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.event_kind === "sitting_summary"))
+        .toMatchObject([{content: "A fictional reflection."}])
+      expect(h.audio).toEqual(["AQABAA==", "AQABAA==", "AQABAA=="])
+      expect(h.errors).toEqual([])
+    } finally { h.sockets[0].close(); await stopping }
+  })
+
   const frame = (second: number): PassiveFrame => ({imageId: `2026-01-08T10-17-${String(second).padStart(2, "0")}`,
     mimeType: "image/jpeg", data: "AQID", modelData: "BAUG",
     time: {timestamp: `2026-01-08T10-17-${String(second).padStart(2, "0")}`, source: "receipt", receivedAt: second * 1000}})
@@ -1121,7 +1435,7 @@ describe("GeminiLiveController", () => {
   })
 
   test("Start refuses an old server protocol and releases its lease before opening Gemini", async () => {
-    const h = harness({startBody: {session_id: "old-server", next_transcript_sequence: 1,
+    const h = harness({startBody: {model: LIVE, session_id: "old-server", next_transcript_sequence: 1,
       ephemeral_token: "ephemeral/test", websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
         input_audio_rate_hz: 16000, output_audio_rate_hz: 24000}, lease_seconds: 90, session_warning_seconds: 0}})
     await expect(h.controller.start("continuous")).rejects.toThrow("invalid session contract")
@@ -1385,7 +1699,7 @@ describe("GeminiLiveController", () => {
     const storage = new FakeStorage()
     storage.values.set(JOURNAL_KEY, JSON.stringify({version: 2,
       scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
-      resumption: {handle: "retained-photo-context", updatedAt: Date.now(), imageTokens: 329},
+      model: LIVE, resumption: {handle: "retained-photo-context", updatedAt: Date.now(), imageTokens: 329},
       pendingTranscripts: [], draftTranscripts: [], nextTranscriptSequence: 41,
       pendingImage: {imageId: "legacy-original", mediaRef: "mentra_media/test-phone/legacy-original.png",
         providerSent: true, captureAfterCurrent: false, generation: 1, sessionId: "sitting-1", imageBaseline: 329, retryUsed: true}}))
@@ -3597,6 +3911,7 @@ describe("GeminiLiveController", () => {
     await old.controller.stop()
 
     const replacement = harness({storage, appendStatuses: Array(100).fill(503), startBody: {
+      model: LIVE,
       photo_work_protocol: "iris-photo-work-v2", session_id: "replacement-sitting", next_transcript_sequence: 41, ephemeral_token: "ephemeral/test",
       websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
         input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
@@ -3875,6 +4190,7 @@ describe("GeminiLiveController", () => {
       await old.controller.stop()
 
       const replacement = harness({storage, appendStatuses: Array(100).fill(503), startBody: {
+        model: LIVE,
         photo_work_protocol: "iris-photo-work-v2", session_id: "replacement-sitting", next_transcript_sequence: 43, ephemeral_token: "ephemeral/test",
         websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
           input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
@@ -4669,6 +4985,7 @@ describe("GeminiLiveController", () => {
         {
           status: 200,
           body: {
+            model: LIVE,
             photo_work_protocol: "iris-photo-work-v2", session_id: "sitting-2",
             next_transcript_sequence: 42,
             ephemeral_token: "ephemeral/retry",
@@ -5600,7 +5917,7 @@ describe("GeminiLiveController", () => {
         providerSent: true, captureAfterCurrent: false, generation: 1, sessionId: "old",
         imageSequence: 41, caption: "A retained description", assistantSequence: 42}})
     storage.values.set(JOURNAL_KEY, raw)
-    const h = harness({storage, startBody: {photo_work_protocol: "iris-photo-work-v2", session_id: "restored", next_transcript_sequence: 1,
+    const h = harness({storage, startBody: {model: LIVE, photo_work_protocol: "iris-photo-work-v2", session_id: "restored", next_transcript_sequence: 1,
       ephemeral_token: "ephemeral/test", websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
         input_audio_rate_hz: 16000, output_audio_rate_hz: 24000}, lease_seconds: 90, session_warning_seconds: 0}})
     await start(h)
@@ -5717,7 +6034,7 @@ describe("GeminiLiveController", () => {
       JSON.stringify({
         version: 1,
         scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
-        resumption: {handle: "private-handle", updatedAt: Date.now()},
+        model: LIVE, resumption: {handle: "private-handle", updatedAt: Date.now()},
         pendingTranscripts: [
           {
             event_id: "old-sitting:40",
@@ -5752,6 +6069,7 @@ describe("GeminiLiveController", () => {
     const h = harness({
       storage,
       startBody: {
+        model: LIVE,
         photo_work_protocol: "iris-photo-work-v2", session_id: "replacement-sitting",
         next_transcript_sequence: 43,
         recovery: {sitting_id: "old-sitting", ack_sequence: 42},
@@ -6030,7 +6348,7 @@ describe("GeminiLiveController", () => {
       JSON.stringify({
         version: 1,
         scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
-        resumption: {handle: "expired-handle", updatedAt: Date.now() - 31 * 60 * 1000},
+        model: LIVE, resumption: {handle: "expired-handle", updatedAt: Date.now() - 31 * 60 * 1000},
         pendingTranscripts: [],
       }),
     )
@@ -6047,7 +6365,7 @@ describe("GeminiLiveController", () => {
       JSON.stringify({
         version: 1,
         scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
-        resumption: {handle: "private-handle", updatedAt: Date.now()},
+        model: LIVE, resumption: {handle: "private-handle", updatedAt: Date.now()},
         pendingTranscripts: [],
       }),
     )
@@ -6077,7 +6395,7 @@ describe("GeminiLiveController", () => {
       JSON.stringify({
         version: 1,
         scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
-        resumption: {handle: "private-handle", updatedAt: Date.now()},
+        model: LIVE, resumption: {handle: "private-handle", updatedAt: Date.now()},
         pendingTranscripts: [],
       }),
     )
@@ -6206,6 +6524,29 @@ describe("GeminiLiveController", () => {
     expect(h.requests.findIndex((request) => request.url.endsWith("/transcripts/append"))).toBeLessThan(
       h.requests.findIndex((request) => request.url.endsWith("/end")),
     )
+  })
+
+  test.each([false, true])("Thinking Stop during IN_PROGRESS cannot start reflection or release native work (interrupted=%s)", async interrupted => {
+    const h = harness()
+    await start(h, "manual", "", THINKING)
+    try {
+      completeTurn(h, "First fictional question.", "First fictional answer.")
+      completeTurn(h, "Second fictional question.", "Second fictional answer.")
+      admitRequest(h, "manual")
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "A third fictional question."},
+        outputTranscription: {text: "A partial fictional answer."}, modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]},
+        turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      const completed = h.events.filter(event => event === "turnComplete").length
+      expect(completed).toBe(2)
+      if (interrupted) h.sockets[0].message({serverContent: {interrupted: true, turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      expect(h.events.filter(event => event === "turnComplete")).toHaveLength(completed)
+      await h.controller.stop(true)
+      expect(h.sockets[0].sent.some(value => textTurn(JSON.parse(value)))).toBe(false)
+      expect(h.requests.flatMap(request => request.body.events ?? []).some(row => row.event_kind === "sitting_summary")).toBe(false)
+      expect(h.requests.filter(request => request.url.endsWith("/end"))).toHaveLength(1)
+      expect(h.audio).toEqual(["AQABAA==", "AQABAA==", "AQABAA=="])
+      expect(h.errors).toEqual([])
+    } finally { await h.controller.stop() }
   })
 
   test("graceful Stop skips reflection while a normal turn is unfinished", async () => {
@@ -6914,17 +7255,26 @@ describe("GeminiLiveController", () => {
     }
   })
 
-  test("GoAway waits for an active turn boundary", async () => {
+  test.each([LIVE, THINKING])("GoAway waits for an active turn boundary (%s)", async model => {
     const h = harness()
-    await start(h)
+    await start(h, "continuous", "", model)
     h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "private-handle"}})
     h.sockets[0].message({serverContent: {inputTranscription: {text: "active turn"}}})
     h.sockets[0].message({goAway: {timeLeft: "50s"}})
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(h.sockets).toHaveLength(1)
     h.sockets[0].message({
-      serverContent: {outputTranscription: {text: "finished"}, modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true},
+      serverContent: {outputTranscription: {text: "finished"},
+        modelTurn: {parts: [{inlineData: {data: model === THINKING ? "AQABAA==" : "AAAAAA=="}}]}, turnComplete: true,
+        ...(model === THINKING ? {interactionStatus: "IN_PROGRESS"} : {})},
     })
+    if (model === THINKING) {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(h.sockets).toHaveLength(1)
+      expect(h.requests.some(request => request.url.endsWith("/token"))).toBe(false)
+      expect(h.events.at(-1)).toBe("toolBoundary")
+      h.sockets[0].message({serverContent: {interactionStatus: "IDLE"}})
+    }
     await waitFor(() => h.sockets.length === 2)
     await h.controller.stop()
   })

@@ -1,5 +1,5 @@
 import type {Rpc} from "@mentra/miniapp/ui"
-import type {FrameIntakeResult, ImageTime, ManualAction, OpenAlmaProfile, PassiveFrame, SessionMode, SessionSnapshot} from "./types"
+import type {FrameIntakeResult, ImageTime, LiveModel, ManualAction, OpenAlmaProfile, PassiveFrame, SessionMode, SessionSnapshot} from "./types"
 
 export type ImageReferenceRequest = {startGeneration: number; time: ImageTime}
 export type FrameRequest = PassiveFrame & {startGeneration: number}
@@ -25,6 +25,7 @@ export interface Channels {
   "openalma:set-closing-thoughts": Rpc<{enabled: boolean}, {ok: true}>
   "openalma:set-soul": Rpc<{soulId: string; useExisting: boolean}, SelectSoulResult>
   "openalma:set-mode": Rpc<{mode: SessionMode}, {ok: true}>
+  "openalma:set-model": Rpc<{model: LiveModel}, {ok: true}>
   "openalma:set-capabilities": Rpc<{
     microphoneEnabled?: boolean
     cameraEnabled?: boolean

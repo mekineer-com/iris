@@ -5,7 +5,7 @@ import type {GeminiCallbacks} from "./GeminiLiveController"
 import {GeminiLiveController, JOURNAL_KEY, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {SessionController} from "./SessionController"
-import type {FrameIntakeResult, MicSource, PassiveFrame, SessionSnapshot as Snapshot} from "../shared/types"
+import type {FrameIntakeResult, LiveModel, MicSource, PassiveFrame, SessionSnapshot as Snapshot} from "../shared/types"
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://127.0.0.1:9999",
@@ -40,6 +40,8 @@ function passiveFrame(imageId = "camera-frame"): PassiveFrame {
 }
 
 class FakeLive {
+  model = ""
+  modelChoices: Array<LiveModel | undefined> = []
   frames: PassiveFrame[] = []
   frameDeliveryOpen = false
   stopDeadlineRefreshes = 0
@@ -68,7 +70,9 @@ class FakeLive {
 
   constructor(readonly callbacks: GeminiCallbacks) {}
 
-  async start(mode = "continuous"): Promise<void> {
+  async start(mode = "continuous", model?: LiveModel): Promise<void> {
+    this.modelChoices.push(model)
+    this.model = model ?? "custom-configured-model"
     this.starts += 1
     this.startModes.push(mode)
     if (this.startGate) await this.startGate
@@ -359,6 +363,37 @@ function sdkSpeaker(session: FakeSession, onClose: (streamId: string) => Promise
 }
 
 describe("SessionController", () => {
+  test("model choice defaults to server configuration and stays fixed while active", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "manual"})
+    expect(h.live.modelChoices).toEqual([undefined])
+    expect(lastSnapshot(h.session)).toMatchObject({modelChoice: null, model: "custom-configured-model"})
+    await expect(h.session.handlers["openalma:set-model"]({model: "gemini-3.8-live"})).rejects.toThrow("Stop")
+    await h.session.handlers["openalma:stop"]({})
+    await h.session.handlers["openalma:set-model"]({model: "gemini-3.8-live-extended-thinking"})
+    expect(h.session.stored.get("openalma.live-model")).toBe("gemini-3.8-live-extended-thinking")
+    await h.session.handlers["openalma:start"]({mode: "manual"})
+    expect(h.live.modelChoices).toEqual(["gemini-3.8-live-extended-thinking"])
+    expect(lastSnapshot(h.session)?.model).toBe("gemini-3.8-live-extended-thinking")
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test("pending model save blocks Start and a failed save retains the confirmed choice", async () => {
+    const h = setup({stored: {"openalma.live-model": "gemini-3.8-live"}})
+    await new Promise(resolve => setTimeout(resolve, 0))
+    let release!: () => void
+    h.session.storage.set = async () => {await new Promise<void>(resolve => {release = resolve}); throw new Error("Model save failed")}
+    const saving = h.session.handlers["openalma:set-model"]({model: "gemini-3.8-live-extended-thinking"})
+    const rejected = (saving as Promise<unknown>).then(() => "unexpected success", error => error.message)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(lastSnapshot(h.session)?.modelSaving).toBe(true)
+    await expect(h.session.handlers["openalma:start"]({mode: "manual"})).rejects.toThrow("model selection")
+    release()
+    expect(await rejected).toBe("Model save failed")
+    expect(lastSnapshot(h.session)).toMatchObject({modelChoice: "gemini-3.8-live", modelSaving: false})
+    await expect(h.session.handlers["openalma:set-model"]({model: "custom"})).rejects.toThrow("Unknown Live model")
+  })
+
   test("Closing thoughts defaults checked, persists across controllers, and does not apply failed writes", async () => {
     const h = setup()
     await h.session.handlers["openalma:start"]({mode: "continuous"})
@@ -2506,6 +2541,10 @@ describe("SessionController", () => {
     const harness = setup()
     harness.session.onOpenCb?.()
     expect(harness.session.snapshots[0]).toEqual({
+      modelChoice: null,
+      model: null,
+      configuredModel: null,
+      modelSaving: false,
       frameDeliveryOpen: false,
       stopDeadlineAt: null,
       startGeneration: 0,

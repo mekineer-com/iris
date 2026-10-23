@@ -19,15 +19,16 @@ The coordinated ordinary-photo contract requires and echoes
 response marker before opening Gemini and releases any acquired lease. Token
 mint/renewal expose six NON_BLOCKING tools, including argument-free
 `nothing_to_add`; Iris handles it through the local photo dispatcher, using
-SILENT for an empty acknowledgment without taking away a pending human answer's
+SILENT on regular Live for an empty acknowledgment without taking away a pending human answer's
 continuation. The deliberate-photo startup instruction and inline-job path are
 implemented. The combined camera/selection prompt is not enabled.
 The delivery/accounting behavior below still describes the current photo sender.
 
 ## Source Contract
 
-- Target model: `gemini-3.8-live`; installed model settings stay unchanged until
-  coordinated acceptance/cutover in Slice 5.
+- Phone choices: `gemini-3.8-live` / `gemini-3.8-live-extended-thinking`.
+  With no explicit phone choice, Start retains the configured server model.
+  Installed model settings stay unchanged until coordinated acceptance/cutover.
 - Socket API: `v1beta`; token minting: `v1alpha/auth_tokens`.
 - Method: `BidiGenerateContentConstrained`
 - Input audio: 16 kHz PCM
@@ -221,6 +222,27 @@ delivery and provider activation remain unfinished; no production frame sender
 is enabled by these adapters.
 
 ### Completion and connection rotation
+
+The scheduling rules below describe regular Live. Thinking uses the same
+dispatcher/tools but omits function-response `scheduling`; constrained setup
+fixes its thinking level to LOW. At Thinking's intermediate `turnComplete`, Iris
+records the output segment and can return pending tool results, without treating
+the whole interaction as finished. `serverContent.interactionStatus: IDLE`
+releases the request/Manual submission. Segment-local photo sibling markers do
+not survive into the next segment; original-photo/native continuation ownership
+does. The human transcription group remains open until final completion so late
+suffixes are not counted as a second turn. All-zero Thinking PCM remains playback
+but is not evidence of spoken words requiring a transcript; actual nonzero
+speech retains the existing transcription integrity checks. No muting or new
+silent-audio prompt is introduced.
+
+Start's returned model is authoritative and must match an explicit phone choice.
+Renewal stays pinned to the lease, not later config edits. The v3 phone journal
+records the actual model; an ordinary no-recovery handle needs matching model
+metadata to resume. Missing/different metadata connects cold while retaining
+photo/transcript ownership. Before-bootstrap dialogue recovery stays cold as
+before. This does not assert context compatibility merely from equal model IDs.
+Offline source checks are not live-provider/phone qualification of Thinking.
 
 - A spoken request is admitted at Continuous native activity start or Manual
   Send, independently of when its transcription arrives. Tool calls retain

@@ -4,8 +4,10 @@ import {useRpc} from "@mentra/miniapp/ui"
 import type {Channels, ImageRequest, SelectSoulResult} from "../../shared/channels"
 import {readImageTime, type ImageTime} from "../imageTime"
 import {
+  LIVE_MODELS,
   PHOTO_RETRY_MESSAGE,
   type ConnectionState,
+  type LiveModel,
   type ManualAction,
   type ManualPhase,
   type OpenAlmaProfile,
@@ -90,6 +92,7 @@ export default function SessionPage() {
   const closingThoughtsRpc = useRpc<Channels, "openalma:set-closing-thoughts">("openalma:set-closing-thoughts")
   const soulRpc = useRpc<Channels, "openalma:set-soul">("openalma:set-soul")
   const modeRpc = useRpc<Channels, "openalma:set-mode">("openalma:set-mode")
+  const modelRpc = useRpc<Channels, "openalma:set-model">("openalma:set-model")
   const capabilitiesRpc = useRpc<Channels, "openalma:set-capabilities">("openalma:set-capabilities")
   const manualRpc = useRpc<Channels, "openalma:manual-action">("openalma:manual-action")
   const imageRpc = useRpc<Channels, "openalma:image">("openalma:image")
@@ -107,6 +110,7 @@ export default function SessionPage() {
   const [showNewSoulInfo, setShowNewSoulInfo] = useState(false)
   const [confirmationSoul, setConfirmationSoul] = useState<string | null>(null)
   const [modePending, setModePending] = useState(false)
+  const [modelPending, setModelPending] = useState(false)
   const [capabilitiesPending, setCapabilitiesPending] = useState(false)
   const [manualPending, setManualPending] = useState(false)
   const [previewImages, setPreviewImages] = useState(false)
@@ -192,6 +196,8 @@ export default function SessionPage() {
   const reconnecting = visible === "reconnecting"
   const active = starting || reconnecting || visible === "listening" || visible === "speaking"
   const modeDisabled = active || stopping || startPending || stopPending || modePending
+  const modelSaving = modelPending || snapshot?.modelSaving === true
+  const modelDisabled = active || stopping || startPending || stopPending || modelSaving
   const soulLocked = snapshot?.soulLocked ?? true
   const connectionLocked = (snapshot?.connectionLocked ?? true) || active || stopping || soulPending
   const soulReady = !soulDirty && snapshot?.soulConfirmed && soulName.trim() === snapshot.soulId
@@ -292,6 +298,18 @@ export default function SessionPage() {
       setRpcError(error instanceof Error ? error.message : String(error))
     } finally {
       setModePending(false)
+    }
+  }
+
+  const onModel = async (model: LiveModel) => {
+    setRpcError(null)
+    setModelPending(true)
+    try {
+      await modelRpc({model})
+    } catch (error) {
+      setRpcError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setModelPending(false)
     }
   }
 
@@ -448,7 +466,7 @@ export default function SessionPage() {
           : "Start"
   const soulSubmitted = soulReady || pendingNewSoul === soulName.trim()
   const sittingDisabled = stopping || stopPending || modePending || soulPending || snapshot?.soulLoading !== false ||
-    (!active && (startPending || !soulSubmitted))
+    (!active && (startPending || modelSaving || !soulSubmitted))
   const showSpinner = starting || reconnecting || stopping
   const manualDisabled = manualPending || visible === "speaking"
   const voiceReady = visible === "listening" || visible === "speaking"
@@ -570,6 +588,24 @@ export default function SessionPage() {
         {soulLocked ? <p>Finish this sitting before changing souls.</p> : null}
       </section>
       <section className="controls" aria-label="Voice controls">
+        <section className="mode-control" aria-label="Live model">
+          <span>Live model</span>
+          <div className="mode-options">
+            {LIVE_MODELS.map((model, index) => (
+              <button key={model} type="button" aria-pressed={snapshot.modelChoice === model}
+                disabled={modelDisabled} onClick={() => void onModel(model)}>
+                {index === 0 ? "Live" : "Live Thinking"}
+              </button>
+            ))}
+          </div>
+          <p>{(active || stopping) && snapshot.model
+            ? `Using model: ${snapshot.model}`
+            : snapshot.modelChoice
+              ? `Selected model: ${snapshot.modelChoice}`
+              : snapshot.configuredModel
+                ? `Using server setting: ${snapshot.configuredModel}`
+                : "Using server setting"}</p>
+        </section>
         <div className="sitting-controls">
           <button
             type="button"

@@ -5,7 +5,7 @@ import type {Channels} from "../shared/channels"
 import type {FrameRequest, ImageReferenceRequest, ImageRequest} from "../shared/channels"
 import type {FrameRetention} from "../shared/types"
 import {formatImageTimestamp, nextImageReference} from "../shared/imageReference"
-import {MIC_SOURCES, STOP_BACKGROUND_MS, STOP_FOREGROUND_MS, type MicSource} from "../shared/types"
+import {LIVE_MODELS, MIC_SOURCES, STOP_BACKGROUND_MS, STOP_FOREGROUND_MS, type LiveModel, type MicSource} from "../shared/types"
 import type {
   ConnectionState,
   EarconName,
@@ -81,6 +81,9 @@ export class SessionController {
   private microphoneEnabled = true
   private cameraEnabled = true
   private closingThoughts = true
+  private modelChoice: LiveModel | null = null
+  private configuredModel: string | null = null
+  private modelSaving = false
   private closingThoughtsAtStop = true
   private preferencesLoaded: Promise<void> = Promise.resolve()
   private photoRetryPending = false
@@ -309,6 +312,23 @@ export class SessionController {
         return {ok: true as const}
       }),
     )
+    this.unsubs.push(ui.handle("openalma:set-model", async payload => {
+      await this.preferencesLoaded
+      const value = (payload as {model?: unknown} | null)?.model
+      const model = LIVE_MODELS.find(model => model === value)
+      if (!model) throw new Error("Unknown Live model")
+      if (this.connectionLocked() || this.startInFlight || this.modelSaving) throw new Error("Stop before changing model")
+      this.modelSaving = true
+      this.pushSnapshot()
+      try {
+        await this.session.storage.set("openalma.live-model", model)
+        this.modelChoice = model
+      } finally {
+        this.modelSaving = false
+        this.pushSnapshot()
+      }
+      return {ok: true as const}
+    }))
     this.unsubs.push(ui.handle("openalma:set-closing-thoughts", async payload => {
       await this.preferencesLoaded
       const enabled = (payload as {enabled?: unknown} | null)?.enabled
@@ -455,6 +475,10 @@ export class SessionController {
 
   private snapshot(): SessionSnapshot {
     return {
+      modelChoice: this.modelChoice,
+      model: this.liveController?.model || null,
+      configuredModel: this.configuredModel,
+      modelSaving: this.modelSaving,
       closingThoughts: this.connection === "stopping" ? this.closingThoughtsAtStop : this.closingThoughts,
       frameDeliveryOpen: this.foreground && this.cameraEnabled &&
         (this.connection === "listening" || this.connection === "speaking") &&
@@ -534,6 +558,7 @@ export class SessionController {
   }
 
   private async startSession(mode: SessionMode): Promise<void> {
+    if (this.modelSaving) throw new Error("Wait for model selection to finish")
     if (this.soulSelecting) throw new Error("Wait for settings to finish")
     if (this.startInFlight || ACTIVE.has(this.connection) || this.connection === "stopping") {
       return
@@ -639,7 +664,7 @@ export class SessionController {
         })
       }
       const controller = this.liveController
-      await controller.start(mode)
+      await controller.start(mode, this.modelChoice ?? undefined)
       trace("session.provider.ready")
       if (generation !== this.startGeneration) {
         await this.stopLiveController(false, controller)
@@ -1096,14 +1121,19 @@ export class SessionController {
   ): Promise<void> {
     let storedSoul: string | null = null
     try {
-      let [storedProfile, microphone, camera, closingThoughts, savedSoul, journal] = await Promise.all([
+      let [storedProfile, microphone, camera, closingThoughts, savedSoul, journal, savedModel] = await Promise.all([
         this.session.storage.get(OPENALMA_PROFILE_KEY),
         this.session.storage.get(MICROPHONE_ENABLED_KEY),
         this.session.storage.get(CAMERA_ENABLED_KEY),
         this.session.storage.get(CLOSING_THOUGHTS_KEY),
         this.session.storage.get(SOUL_ID_KEY),
         readSessionJournal(this.session.storage),
+        this.session.storage.get("openalma.live-model").catch(() => {
+          this.lastError = "Saved model choice unavailable; using server setting"
+          return null
+        }),
       ])
+      this.modelChoice = LIVE_MODELS.find(model => model === savedModel) ?? null
       const host = installationHost(await this.session.storage.get(OPENALMA_HOST_KEY))
       if (!this.config && storedProfile === null && this.installationDefaults !== undefined) {
         const raw = this.installationDefaults as Partial<OpenAlmaConfig> | null
@@ -1246,12 +1276,14 @@ export class SessionController {
         signal: timeoutSignal(10_000),
       })
       if (!response.ok) throw new Error(`Photo recovery status failed (${response.status})`)
-      const result = await response.json() as {failed_photos?: unknown}
+      const result = await response.json() as {failed_photos?: unknown; configured_model?: unknown}
       const photos = result.failed_photos ?? []
       if (!Array.isArray(photos) || photos.some(id => typeof id !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(id))) {
         throw new Error("Invalid photo recovery status")
       }
       if (!current()) return
+      this.configuredModel = typeof result.configured_model === "string" && result.configured_model.trim()
+        ? result.configured_model : null
       this.failedPhotos = photos
       this.photoStatusError = null
       this.pushSnapshot()
