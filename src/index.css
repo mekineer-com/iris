@@ -34,7 +34,7 @@ main {
 
 .settings-toggle {
   display: block;
-  margin: 1rem 0 0 auto;
+  margin: 1.25rem 0 0 auto;
 }
 
 #iris-settings > button {
