@@ -448,66 +448,12 @@ export class GeminiLiveController {
   }
 
   async start(mode: SessionMode = "continuous", model?: LiveModel): Promise<void> {
+    if (this.generation !== 0 || this.stopPromise) throw new Error("Gemini controller is single-use")
     trace("provider.start.begin")
     const generation = ++this.generation
     await this.journalTail
     if (generation !== this.generation) throw new Error("Gemini start cancelled")
-    this.stopping = false
-    this.activityPauseReason = null
-    this.ready = false
-    this.ended = true
-    this.sessionId = ""
-    this.model = ""
-    this.resumptionHandle = ""
-    this.resumptionUpdatedAt = 0
-    this.reconnectAttempted = false
-    this.reconnecting = false
-    this.errorReported = false
-    this.clearTurn()
-    this.interruptionFinalized = false
-    this.turnActive = false
-    this.turnHasToolCall = false
-    this.spokenRequest = null
-    this.toolBatch = {request: null, completed: false, continuationSent: false, background: true, started: false}
-    this.voiceActive = false
-    this.invitationPending = false
-    this.hasCompletedProviderTurn = false
-    this.receivedSpeech = false
-    this.completeUserTurns = 0
-    this.pendingEvents = []
-    this.draftEvents = []
-    this.missingSpeech = false
-    this.pendingImages = []
-    this.candidateFrames = []
-    this.previewRevision = 0
-    this.settledPreviewRevision = -1
-    this.acceptedCaptions.clear()
-    this.spokenPhotos = []
-    this.imageUpload = null
-    this.draining = false
-    this.drainInputFlushed = false
-    this.outputMuted = false
-    this.drainResolve = null
-    this.imageRetrying = false
-    this.appendTail = Promise.resolve()
-    this.imageFinalization = null
-    this.imageFinalizationExplicit = false
-    this.persistenceFatal = false
-    this.journalUnavailable = false
-    this.journalLoaded = false
-    this.loadedJournal = null
-    this.reflecting = false
-    this.reflectionResolve = null
-    this.stopPromise = null
-    this.pendingToolCalls.clear()
-    this.deliveredToolResultIds.clear()
-    this.audioFramesSent = 0
-    this.providerAudioChunks = 0
     this.mode = mode
-    this.latestUsageTotal = null
-    this.clearPhotoJob()
-    this.clearDurationWarning()
-    this.clearGoAway()
     try {
       await this.hydrateJournal(generation)
       if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
@@ -2306,7 +2252,7 @@ export class GeminiLiveController {
   private requestSpokenPhotoDescription(): void {
     if (!this.spokenPhotos.length || this.turnActive || this.toolBatch.started || this.stopPromise || this.stopping || this.reflecting ||
         this.callbacks.canInvite?.() === false || this.voiceActive ||
-        this.photoJob || this.imageFinalization || this.pendingImages.some(image => !image.retryRequested) ||
+        this.photoJob || this.imageUpload || this.imageFinalization || this.pendingImages.some(image => !image.retryRequested) ||
         (this.spokenRequest && !this.spokenRequest.retired) ||
         !this.ready || this.socket?.readyState !== WS_OPEN) return
     const imageId = this.spokenPhotos.shift()!

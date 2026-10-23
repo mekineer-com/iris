@@ -455,6 +455,33 @@ function admitRequest(h: ReturnType<typeof harness>, mode: "continuous" | "manua
 }
 
 describe("GeminiLiveController", () => {
+  test("a controller admits one Start only, including while startup is pending", async () => {
+    const h = harness()
+    const starting = h.controller.start()
+    await expect(h.controller.start()).rejects.toThrow("single-use")
+    await waitFor(() => h.sockets.length === 1)
+    h.sockets[0].open()
+    h.sockets[0].message({setupComplete: {}})
+    await starting
+    await expect(h.controller.start()).rejects.toThrow("single-use")
+    expect(h.requests.filter(request => request.url.endsWith("/session/start"))).toHaveLength(1)
+    await h.controller.stop()
+    await expect(h.controller.start()).rejects.toThrow("single-use")
+  })
+
+  test("failed Start and Stop before Start both consume the controller", async () => {
+    const failed = harness({startStatus: 503})
+    await expect(failed.controller.start()).rejects.toThrow("OpenAlma Start failed (503)")
+    await expect(failed.controller.start()).rejects.toThrow("single-use")
+    const stopped = harness()
+    const stopping = stopped.controller.stop()
+    await expect(stopped.controller.start()).rejects.toThrow("single-use")
+    await stopping
+    await stopped.controller.stop()
+    await expect(stopped.controller.start()).rejects.toThrow("single-use")
+    expect(stopped.requests).toEqual([])
+  })
+
   test.each([LIVE, THINKING])("Start sends the exact %s override on stale-bootstrap retry", async model => {
     const h = harness({startResults: [{status: 409, body: {detail: {code: "mentra_history_changed"}}}]})
     await start(h, "manual", "", model)
@@ -860,16 +887,13 @@ describe("GeminiLiveController", () => {
     expect(h.controller.readFrames([frame(1).imageId])).toEqual([frame(1)])
     await stopping
     expect(() => h.controller.readFrames([frame(1).imageId])).toThrow("Unknown retained frame")
-    const restarting = h.controller.start("manual")
-    await waitFor(() => h.sockets.length === 2)
-    h.sockets[1].open()
-    h.sockets[1].message({setupComplete: {}})
-    await restarting
+    const replacement = harness({frameRetention: {maxFrames: 1, maxEncodedBytes: 8}})
+    await start(replacement, "manual")
     try {
-      expect(() => h.controller.readFrames([frame(1).imageId])).toThrow("Unknown retained frame")
-      expect(h.controller.admitFrame(frame(2))).toEqual({retained: true, delivery: "not-sent"})
-      expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
-    } finally { await h.controller.stop() }
+      expect(() => replacement.controller.readFrames([frame(1).imageId])).toThrow("Unknown retained frame")
+      expect(replacement.controller.admitFrame(frame(2))).toEqual({retained: true, delivery: "not-sent"})
+      expect(replacement.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+    } finally { await replacement.controller.stop() }
   })
 
   test("reconnect pauses new frame admission without losing accepted identity", async () => {
@@ -3561,6 +3585,36 @@ describe("GeminiLiveController", () => {
     }
   })
 
+  test("spoken descriptions wait for an in-flight upload, then resume when it parks", async () => {
+    let canInvite = true
+    const options: NonNullable<Parameters<typeof harness>[0]> = {storage: new FakeStorage(), canInvite: () => canInvite}
+    const h = harness(options)
+    await start(h)
+    let release!: () => void
+    try {
+      await h.controller.sendImage({imageId: "described-photo", mimeType: "image/png", data: "AQID", speakDescription: true})
+      await completePhotoCaption(h.sockets[0], "described-photo", "A fictional blue triangle.")
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "caption-described-photo"))
+      canInvite = false
+      await finishPhotoQueue(h.sockets[0])
+      const descriptions = () => h.sockets[0].sent.filter(value => textTurn(JSON.parse(value)))
+      expect(descriptions()).toEqual([])
+      options.snapshotGate = new Promise<void>(resolve => {release = resolve})
+      options.snapshotResponse = Response.json({detail: "Fictional upload failure"}, {status: 503})
+      const uploading = h.controller.sendImage({imageId: "uploading-photo", mimeType: "image/png", data: "BAUG"})
+      const outcome = uploading.catch(error => error.message)
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot") && request.body.image_id === "uploading-photo"))
+      canInvite = true
+      h.controller.resumeBackgroundWork()
+      expect(descriptions()).toEqual([])
+      release()
+      expect(await outcome).toContain("snapshot failed (503)")
+      await waitFor(() => descriptions().length === 1)
+      expect(textTurn(JSON.parse(descriptions()[0])).turns[0].parts[0].text).toContain("image_id: described-photo")
+      expect(h.controller.pendingPhotoIds).toEqual(["uploading-photo"])
+    } finally { release?.(); await h.controller.stop() }
+  })
+
   test.each([false, true])("an uncached receipt for A leaves pending photo B untouched (conflict=%s)", async conflict => {
     const storage = new FakeStorage()
     const history: NonNullable<Parameters<typeof harness>[0]>["history"] = []
@@ -5294,18 +5348,18 @@ describe("GeminiLiveController", () => {
       else await h.controller.stop()
       if (action === "cancel") expect(h.persistenceErrors.some(message => message?.includes("may have saved"))).toBe(true)
       if (action === "cancel-acknowledged") expect(h.persistenceErrors.some(message => message?.includes("may have saved"))).toBe(false)
-      if (action === "restart") {
-        const starting = h.controller.start()
-        await waitFor(() => h.sockets.length === 2)
-        h.sockets[1].open()
-        h.sockets[1].message({setupComplete: {}})
-        await starting
-      }
+      const replacement = action === "restart" ? harness() : null
+      if (replacement) await start(replacement)
       release()
       await new Promise(resolve => setTimeout(resolve, 0))
       expect(h.sockets.some(socket => socket.sent.some(value => JSON.parse(value).toolResponse))).toBe(false)
       expect(h.requests.filter(request => request.url.endsWith("/working-thought"))).toHaveLength(1)
       expect(h.errors).toEqual([])
+      if (replacement) {
+        expect(replacement.sockets[0].sent.some(value => JSON.parse(value).toolResponse)).toBe(false)
+        expect(replacement.errors).toEqual([])
+        await replacement.controller.stop()
+      }
       await h.controller.stop()
     }
   })
@@ -5426,20 +5480,24 @@ describe("GeminiLiveController", () => {
         {id: "old-recall", name: "recall_memory", args: {query: "beacon"}},
       ]}})
       await waitFor(() => h.requests.some(request => request.url.endsWith("/recall")))
+      let replacement: ReturnType<typeof harness> | null = null
       if (action === "cancel") h.sockets[0].message({toolCallCancellation: {ids: ["old-recall"]}})
       else {
         await h.controller.stop()
-        const starting = h.controller.start()
-        await waitFor(() => h.sockets.length === 2)
-        h.sockets[1].open()
-        h.sockets[1].message({setupComplete: {}})
-        await starting
+        replacement = harness()
+        await start(replacement)
       }
       release()
       await new Promise(resolve => setTimeout(resolve, 0))
       expect(h.controller.activityPauseReason).toBeNull()
       expect(h.persistenceErrors.filter(message => message === "Old sitting pause")).toEqual([])
       expect(h.errors).toEqual([])
+      if (replacement) {
+        expect(replacement.controller.activityPauseReason).toBeNull()
+        expect(replacement.persistenceErrors.filter(message => message === "Old sitting pause")).toEqual([])
+        expect(replacement.errors).toEqual([])
+        await replacement.controller.stop()
+      }
       await h.controller.stop()
     }
   })
@@ -7576,17 +7634,16 @@ describe("GeminiLiveController", () => {
       const pending = Reflect.get(h.controller, "heartbeat").call(h.controller)
       await waitFor(() => h.requests.some(request => request.url.endsWith("/heartbeat")))
       await h.controller.stop()
-      const starting = h.controller.start()
-      await waitFor(() => h.sockets.length === 2)
-      h.sockets[1].open()
-      h.sockets[1].message({setupComplete: {}})
-      await starting
+      const replacement = harness({heartbeatMs: 60_000})
+      await start(replacement)
       release()
       await pending
       expect(h.controller.activityPauseReason).toBeNull()
       expect(h.errors).toEqual([])
-      expect(h.sockets[1].readyState).toBe(1)
-      await h.controller.stop()
+      expect(replacement.controller.activityPauseReason).toBeNull()
+      expect(replacement.errors).toEqual([])
+      expect(replacement.sockets[0].readyState).toBe(1)
+      await replacement.controller.stop()
     }
   })
 

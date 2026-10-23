@@ -53,6 +53,11 @@ fictional-soul call.
 
 ### Setup and resumption
 
+Each controller owns one sitting and accepts Start once. SessionController
+creates a replacement for another sitting; renewals and socket reconnections
+stay inside the existing controller and lease. Recovery uses the phone journal,
+not resetting/restarting an old controller.
+
 New connection:
 
 ```json
