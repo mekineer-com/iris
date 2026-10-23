@@ -1,7 +1,8 @@
 import type {Rpc} from "@mentra/miniapp/ui"
-import type {ImageTime, ManualAction, OpenAlmaProfile, SessionMode, SessionSnapshot} from "./types"
+import type {FrameIntakeResult, ImageTime, ManualAction, OpenAlmaProfile, PassiveFrame, SessionMode, SessionSnapshot} from "./types"
 
 export type ImageReferenceRequest = {startGeneration: number; time: ImageTime}
+export type FrameRequest = PassiveFrame & {startGeneration: number}
 
 export type ImageRequest = {
   imageId: string
@@ -30,6 +31,8 @@ export interface Channels {
   "openalma:manual-action": Rpc<{action: ManualAction}, {ok: true}>
   "openalma:image": Rpc<ImageRequest, {ok: true} | {ok: false; conflict: true}>
   "openalma:reserve-image": Rpc<ImageReferenceRequest, {startGeneration: number; imageId: string}>
+  "openalma:frame": Rpc<FrameRequest, FrameIntakeResult>
+  "openalma:frames": Rpc<{startGeneration: number; imageIds: string[]}, {frames: PassiveFrame[]}>
   "openalma:pending-image": Rpc<{action: "retry" | "discard"; imageId: string}, {ok: true}>
 }
 

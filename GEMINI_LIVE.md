@@ -183,8 +183,27 @@ reconnect, pause or teardown. Parked Retry items alone do not close it, and
 ordinary user/Soul speech does not impose the quiet-invitation gate. Hidden
 or camera-disabled UI also projects closed. Native opportunity changes publish
 through the existing SessionController snapshot path without a polling timer.
-This is not vision activation or permission to bypass cadence/catch-up. No
-passive intake, retention settings, camera wiring or frame sender is enabled.
+This is not vision activation or permission to bypass cadence/catch-up.
+
+The prepared `openalma:frame` RPC accepts a sitting generation, reserved
+reference, receipt time, unmarked JPEG and stamped model copy. Intake requires
+explicit constructor `frameRetention` count/encoded-payload limits; there are
+no production defaults or settings controls. It retains candidates in memory
+without provider sends, uploads, caption jobs or transcript rows. Identical-ID
+retries reconcile accepted ownership before capacity/admission checks; altered
+bytes/time fail. Full buffers reject new candidates without evicting accepted
+ones. `openalma:frames` reads only explicit references for that originating
+sitting, including during its Stop drain, not a replacement/failing sitting.
+
+Stop closes new admission and gives retained candidates the existing shared
+30-second/five-minute window. At expiry, still-unselected candidates are
+discarded, not journaled or carried into a contextless new sitting. Access
+refreshes the absolute deadline even if host timers were delayed. Protected
+originals remain in their existing recovery collection. Terminal teardown also
+releases unselected candidates; reconnect, hide and camera-disable do not
+discard accepted candidates. Camera wiring, selection/promotion, render/catch-up
+delivery and provider activation remain unfinished; no production frame sender
+is enabled by these adapters.
 
 ### Completion and connection rotation
 

@@ -2,6 +2,8 @@ import {approxBase64ByteLength} from "./audioHelpers"
 import {timeoutSignal} from "./timeoutSignal"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import type {ImageRequest} from "../shared/channels"
+import {formatImageTimestamp} from "../shared/imageReference"
+import type {FrameIntakeResult, FrameRetention, PassiveFrame} from "../shared/types"
 import {MIC_SOURCES, PHOTO_RETRY_MESSAGE, STOP_FOREGROUND_MS, type ImageTime, type MicSource, type PhotoCaption, type SessionMode} from "../shared/types"
 
 type StartResponse = {
@@ -148,6 +150,7 @@ type SocketLike = {
 }
 
 export type GeminiLiveControllerOptions = {
+  frameRetention?: FrameRetention
   fetchFn?: typeof fetch
   openSocket?: (url: string) => SocketLike
   setupTimeoutMs?: number
@@ -249,6 +252,8 @@ class TokenRefreshError extends Error {
 }
 
 export class GeminiLiveController {
+  private readonly frameRetention: FrameRetention | undefined
+  private candidateFrames: PassiveFrame[] = []
   private readonly fetchFn: typeof fetch
   private readonly openSocket: (url: string) => SocketLike
   private readonly setupTimeoutMs: number
@@ -303,7 +308,54 @@ export class GeminiLiveController {
   }
 
   get pendingImageIds(): string[] {
-    return this.pendingImages.map(image => image.imageId)
+    return [...this.pendingImages.map(image => image.imageId), ...this.candidateFrames.map(frame => frame.imageId)]
+  }
+
+  admitFrame(frame: PassiveFrame, allowNew = true): FrameIntakeResult {
+    if (this.draining) this.refreshStopDeadline()
+    const limits = this.frameRetention
+    if (!limits) throw new Error("Passive frame intake is not configured")
+    if (!frame || typeof frame.imageId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(frame.imageId) ||
+        frame.mimeType !== "image/jpeg" || ![frame.data, frame.modelData].every(data =>
+          typeof data === "string" && data.length > 0 && data.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(data)) ||
+        !frame.time || frame.time.source !== "receipt" || !Number.isFinite(frame.time.receivedAt) ||
+        typeof frame.time.timestamp !== "string" || frame.time.timestamp !== formatImageTimestamp(frame.time.timestamp)) {
+      throw new Error("Invalid passive frame")
+    }
+    const previous = this.candidateFrames.find(candidate => candidate.imageId === frame.imageId)
+    if (previous) {
+      if (previous.mimeType !== frame.mimeType || previous.data !== frame.data || previous.modelData !== frame.modelData ||
+          previous.time.timestamp !== frame.time.timestamp || previous.time.receivedAt !== frame.time.receivedAt) {
+        throw new Error("Frame reference is already in use")
+      }
+      return {retained: true, delivery: "not-sent"}
+    }
+    if (this.pendingImages.some(image => image.imageId === frame.imageId)) throw new Error("Frame reference is already in use")
+    if (!allowNew || !this.ready || this.reconnecting || this.goAwayPending || this.stopping || this.stopPromise ||
+        this.reflecting || this.outputMuted || this.errorReported || this.activityPauseReason || this.socket?.readyState !== WS_OPEN) {
+      return {retained: false, delivery: "not-sent", reason: "unavailable"}
+    }
+    const size = frame.data.length + frame.modelData.length
+    const retainedSize = this.candidateFrames.reduce((total, candidate) => total + candidate.data.length + candidate.modelData.length, 0)
+    if (this.candidateFrames.length >= limits.maxFrames || retainedSize + size > limits.maxEncodedBytes) {
+      return {retained: false, delivery: "not-sent", reason: "full"}
+    }
+    this.candidateFrames.push({imageId: frame.imageId, mimeType: frame.mimeType, data: frame.data, modelData: frame.modelData,
+      time: {source: "receipt", timestamp: frame.time.timestamp, receivedAt: frame.time.receivedAt}})
+    return {retained: true, delivery: "not-sent"}
+  }
+
+  readFrames(imageIds: readonly string[]): PassiveFrame[] {
+    if (this.draining) this.refreshStopDeadline()
+    if (!Array.isArray(imageIds) || imageIds.length > (this.frameRetention?.maxFrames ?? 0) ||
+        imageIds.some(id => typeof id !== "string" || !id) || new Set(imageIds).size !== imageIds.length) {
+      throw new Error("Invalid frame references")
+    }
+    return imageIds.map(id => {
+      const frame = this.candidateFrames.find(candidate => candidate.imageId === id)
+      if (!frame) throw new Error("Unknown retained frame")
+      return {...frame, time: {...frame.time}}
+    })
   }
 
   // Opportunity only: vision activation, cadence and catch-up ownership remain separate.
@@ -380,6 +432,11 @@ export class GeminiLiveController {
     this.heartbeatMs = options.heartbeatMs
     this.photoDrainTimeoutMs = options.photoDrainTimeoutMs ?? STOP_FOREGROUND_MS
     this.storage = options.storage
+    if (options.frameRetention && (!Number.isSafeInteger(options.frameRetention.maxFrames) || options.frameRetention.maxFrames < 1 ||
+        !Number.isSafeInteger(options.frameRetention.maxEncodedBytes) || options.frameRetention.maxEncodedBytes < 1)) {
+      throw new Error("Invalid frame retention limits")
+    }
+    this.frameRetention = options.frameRetention ? {...options.frameRetention} : undefined
   }
 
   async start(mode: SessionMode = "continuous"): Promise<void> {
@@ -411,6 +468,7 @@ export class GeminiLiveController {
     this.draftEvents = []
     this.missingSpeech = false
     this.pendingImages = []
+    this.candidateFrames = []
     this.previewRevision = 0
     this.settledPreviewRevision = -1
     this.acceptedCaptions.clear()
@@ -518,6 +576,7 @@ export class GeminiLiveController {
     else if (!this.draining) return
     this.clearStopDeadlineTimer()
     const finish = () => {
+      this.candidateFrames = []
       if (this.draining) this.drainResolve?.()
       if (this.reflecting) this.finishReflection(null)
     }
@@ -943,6 +1002,7 @@ export class GeminiLiveController {
     try {
       this.flushToolResponses()
       const drainAttempted = graceful && Boolean(
+        this.candidateFrames.length ||
         this.imageUpload || this.pendingImages.some(image => !image.retryRequested) ||
         this.photoJob || (this.toolBatch.started && this.toolBatch.background))
       const stoppedMidTurn = this.turnActive && (!this.toolBatch.invitation || this.turnAudioDelivered ||
@@ -985,6 +1045,8 @@ export class GeminiLiveController {
         : "Transcript sync failed; pending turns remain saved on this device")
       this.reportError(error instanceof Error ? error : new Error(String(error)))
     } finally {
+      // Candidates have not become memories. They cannot outlive their sitting's context.
+      this.candidateFrames = []
       if (this.pendingImages.some(image => image.mediaRef === "")) {
         this.callbacks.onPhotoRetryChange(true)
         this.callbacks.onPersistenceError(PHOTO_UPLOAD_UNCONFIRMED_MESSAGE)
@@ -1065,7 +1127,7 @@ export class GeminiLiveController {
   }
 
   private finishPhotoDrainIfAcknowledged(): void {
-    if (!this.pendingImages.some(image => !image.retryRequested) && !this.imageFinalization &&
+    if (!this.candidateFrames.length && !this.pendingImages.some(image => !image.retryRequested) && !this.imageFinalization &&
         !this.toolBatch.started && !this.turnActive && !this.photoJob && !this.imageUpload &&
         ![...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption")) {
       this.drainResolve?.()

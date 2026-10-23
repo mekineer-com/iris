@@ -2,7 +2,8 @@ import type {AudioChunkData, MiniappSession, UnsubscribeFn} from "@mentra/miniap
 import {makeRequestId} from "@mentra/miniapp"
 
 import type {Channels} from "../shared/channels"
-import type {ImageReferenceRequest, ImageRequest} from "../shared/channels"
+import type {FrameRequest, ImageReferenceRequest, ImageRequest} from "../shared/channels"
+import type {FrameRetention} from "../shared/types"
 import {formatImageTimestamp, nextImageReference} from "../shared/imageReference"
 import {MIC_SOURCES, STOP_BACKGROUND_MS, STOP_FOREGROUND_MS, type MicSource} from "../shared/types"
 import type {
@@ -35,6 +36,7 @@ type SpeakerWriter = {
 }
 
 export type SessionControllerOptions = {
+  frameRetention?: FrameRetention
   watchdogMs?: number
   earconTimeoutMs?: number
   responseWatchdogMs?: number
@@ -125,7 +127,9 @@ export class SessionController {
     this.fetchFn = options.fetchFn ?? fetch
     this.createLiveController =
       options.createLiveController ??
-      ((config, callbacks) => new GeminiLiveController(config, callbacks, {storage: this.session.storage}))
+      ((config, callbacks) => new GeminiLiveController(config, callbacks, {
+        storage: this.session.storage, frameRetention: options.frameRetention,
+      }))
     this.liveController = null
   }
 
@@ -356,6 +360,18 @@ export class SessionController {
         return this.reserveImageReference(payload as ImageReferenceRequest)
       }),
     )
+    this.unsubs.push(ui.handle("openalma:frame", async payload => {
+      await this.preferencesLoaded
+      const frame = payload as FrameRequest
+      const controller = this.frameController(frame?.startGeneration)
+      return controller.admitFrame(frame, this.foreground && this.cameraEnabled &&
+        (this.connection === "listening" || this.connection === "speaking"))
+    }))
+    this.unsubs.push(ui.handle("openalma:frames", async payload => {
+      await this.preferencesLoaded
+      const request = payload as {startGeneration: number; imageIds: string[]}
+      return {frames: this.frameController(request?.startGeneration).readFrames(request?.imageIds)}
+    }))
     this.unsubs.push(
       ui.handle("openalma:image", async (payload) => {
         await this.preferencesLoaded
@@ -452,6 +468,14 @@ export class SessionController {
       usageTotalTokens: this.usageTotalTokens,
       durationWarning: this.durationWarning,
     }
+  }
+
+  private frameController(generation: number): GeminiLiveController {
+    if (!Number.isSafeInteger(generation) || !this.liveController || this.teardownKind === "fail" ||
+        (this.teardownKind ? generation + 1 !== this.startGeneration : generation !== this.startGeneration)) {
+      throw new Error("Frame belongs to an inactive sitting")
+    }
+    return this.liveController
   }
 
   private reserveImageReference(payload: ImageReferenceRequest): Promise<{startGeneration: number; imageId: string}> {

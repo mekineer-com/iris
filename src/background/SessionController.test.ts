@@ -5,7 +5,7 @@ import type {GeminiCallbacks} from "./GeminiLiveController"
 import {GeminiLiveController, JOURNAL_KEY, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {SessionController} from "./SessionController"
-import type {MicSource, SessionSnapshot as Snapshot} from "../shared/types"
+import type {FrameIntakeResult, MicSource, PassiveFrame, SessionSnapshot as Snapshot} from "../shared/types"
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://127.0.0.1:9999",
@@ -34,7 +34,13 @@ function testPcm(value: number): string {
   return Buffer.alloc(8, value).toString("base64")
 }
 
+function passiveFrame(imageId = "camera-frame"): PassiveFrame {
+  return {imageId, mimeType: "image/jpeg", data: "AQID", modelData: "BAUG",
+    time: {source: "receipt", timestamp: "2026-01-02T03-04-05", receivedAt: 1_767_323_045_000}}
+}
+
 class FakeLive {
+  frames: PassiveFrame[] = []
   frameDeliveryOpen = false
   stopDeadlineRefreshes = 0
   resumptions = 0
@@ -84,6 +90,22 @@ class FakeLive {
 
   async sendImage(image: unknown): Promise<void> {
     this.images.push(image)
+  }
+
+  admitFrame(frame: PassiveFrame, allowNew = true): FrameIntakeResult {
+    if (this.frames.some(previous => previous.imageId === frame.imageId)) return {retained: true, delivery: "not-sent"}
+    if (!allowNew) return {retained: false, delivery: "not-sent", reason: "unavailable"}
+    const {imageId, mimeType, data, modelData, time} = frame
+    this.frames.push({imageId, mimeType, data, modelData, time: {...time}})
+    return {retained: true, delivery: "not-sent"}
+  }
+
+  readFrames(imageIds: readonly string[]): PassiveFrame[] {
+    return imageIds.map(id => {
+      const frame = this.frames.find(frame => frame.imageId === id)
+      if (!frame) throw new Error("Unknown retained frame")
+      return {...frame, time: {...frame.time}}
+    })
   }
 
   async retryImage(imageId?: string): Promise<void> {
@@ -322,6 +344,176 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
 }
 
 describe("SessionController", () => {
+  test("frame RPC routes originals and model copies without sending a deliberate photo", async () => {
+    const h = setup()
+    const frame = passiveFrame()
+    await expect(h.session.handlers["openalma:frame"]({...frame, startGeneration: 0})).rejects.toThrow("inactive sitting")
+    await expect(h.session.handlers["openalma:frames"]({startGeneration: 0, imageIds: []})).rejects.toThrow("inactive sitting")
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const admit = spyOn(h.live, "admitFrame")
+    const read = spyOn(h.live, "readFrames")
+    try {
+      const startGeneration = lastSnapshot(h.session)!.startGeneration
+      for (const generation of [startGeneration - 1, startGeneration + 1, 1.5, undefined]) {
+        await expect(h.session.handlers["openalma:frame"]({...frame, startGeneration: generation})).rejects.toThrow("inactive sitting")
+        await expect(h.session.handlers["openalma:frames"]({startGeneration: generation, imageIds: [frame.imageId]})).rejects.toThrow("inactive sitting")
+      }
+      expect(admit).not.toHaveBeenCalled()
+      expect(read).not.toHaveBeenCalled()
+      const request = {...frame, startGeneration}
+      expect(await h.session.handlers["openalma:frame"](request)).toEqual({retained: true, delivery: "not-sent"})
+      expect(admit).toHaveBeenLastCalledWith(request, true)
+      h.live.audio()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(lastSnapshot(h.session)!.connection).toBe("speaking")
+      const speaking = passiveFrame("speaking-frame")
+      expect(await h.session.handlers["openalma:frame"]({...speaking, startGeneration})).toEqual({retained: true, delivery: "not-sent"})
+      expect(admit).toHaveBeenLastCalledWith({...speaking, startGeneration}, true)
+      expect(await h.session.handlers["openalma:frames"]({startGeneration, imageIds: [speaking.imageId, frame.imageId]}))
+        .toEqual({frames: [speaking, frame]})
+      expect(read).toHaveBeenLastCalledWith([speaking.imageId, frame.imageId])
+      expect(h.live.images).toEqual([])
+    } finally {
+      await h.session.handlers["openalma:stop"]({})
+    }
+  })
+
+  for (const gate of ["hidden", "camera-disabled", "reconnecting"] as const) {
+    test(`frame RPC closes new admission while ${gate}, preserving accepted replay and reads`, async () => {
+      const h = setup()
+      await h.session.handlers["openalma:start"]({mode: "continuous"})
+      const startGeneration = lastSnapshot(h.session)!.startGeneration
+      const frame = passiveFrame()
+      const request = {...frame, startGeneration}
+      const admit = spyOn(h.live, "admitFrame")
+      try {
+        expect(await h.session.handlers["openalma:frame"](request)).toEqual({retained: true, delivery: "not-sent"})
+        if (gate === "hidden") h.session.handlers["openalma:visibility"]({visible: false})
+        else if (gate === "camera-disabled") await h.session.handlers["openalma:set-capabilities"]({cameraEnabled: false})
+        else h.live.reconnecting(true)
+        const fresh = {...passiveFrame("new-frame"), startGeneration}
+        expect(await h.session.handlers["openalma:frame"](fresh)).toEqual({retained: false, delivery: "not-sent", reason: "unavailable"})
+        expect(admit).toHaveBeenLastCalledWith(fresh, false)
+        expect(await h.session.handlers["openalma:frame"](request)).toEqual({retained: true, delivery: "not-sent"})
+        expect(admit).toHaveBeenLastCalledWith(request, false)
+        expect(await h.session.handlers["openalma:frames"]({startGeneration, imageIds: [frame.imageId]})).toEqual({frames: [frame]})
+        expect(h.live.frames).toEqual([frame])
+
+        if (gate === "hidden") h.session.onOpenCb!()
+        else if (gate === "camera-disabled") await h.session.handlers["openalma:set-capabilities"]({cameraEnabled: true})
+        else {
+          h.live.reconnecting(false)
+          await new Promise(resolve => setTimeout(resolve, 0))
+        }
+        expect(await h.session.handlers["openalma:frame"](fresh)).toEqual({retained: true, delivery: "not-sent"})
+        expect(admit).toHaveBeenLastCalledWith(fresh, true)
+        expect(h.live.images).toEqual([])
+      } finally {
+        await h.session.handlers["openalma:stop"]({})
+      }
+    })
+  }
+
+  for (const changeSoul of [false, true]) {
+    test(`frame RPC cannot cross owners after ${changeSoul ? "a Soul change" : "a same-Soul restart"}`, async () => {
+      const h = setup()
+      await h.session.handlers["openalma:start"]({mode: "continuous"})
+      const original = h.live
+      const oldGeneration = lastSnapshot(h.session)!.startGeneration
+      const frame = passiveFrame()
+      await h.session.handlers["openalma:frame"]({...frame, startGeneration: oldGeneration})
+      await h.session.handlers["openalma:stop"]({})
+      if (changeSoul) await h.session.handlers["openalma:set-soul"]({soulId: "Other Test Soul", useExisting: false})
+      await h.session.handlers["openalma:start"]({mode: "continuous"})
+      const startGeneration = lastSnapshot(h.session)!.startGeneration
+      const admit = spyOn(h.live, "admitFrame")
+      const read = spyOn(h.live, "readFrames")
+      try {
+        expect(h.live).not.toBe(original)
+        expect(h.configs.at(-1)!.soulId).toBe(changeSoul ? "Other Test Soul" : CONFIG.soulId)
+        expect(startGeneration).toBeGreaterThan(oldGeneration)
+        await expect(h.session.handlers["openalma:frame"]({...frame, startGeneration: oldGeneration})).rejects.toThrow("inactive sitting")
+        await expect(h.session.handlers["openalma:frames"]({startGeneration: oldGeneration, imageIds: [frame.imageId]})).rejects.toThrow("inactive sitting")
+        expect(admit).not.toHaveBeenCalled()
+        expect(read).not.toHaveBeenCalled()
+        await expect(h.session.handlers["openalma:frames"]({startGeneration, imageIds: [frame.imageId]})).rejects.toThrow("Unknown retained frame")
+        const replacement = {...frame, data: "BwgJ", modelData: "CgsM"}
+        expect(await h.session.handlers["openalma:frame"]({...replacement, startGeneration})).toEqual({retained: true, delivery: "not-sent"})
+        expect(await h.session.handlers["openalma:frames"]({startGeneration, imageIds: [frame.imageId]})).toEqual({frames: [replacement]})
+        await expect(h.session.handlers["openalma:frames"]({startGeneration: oldGeneration, imageIds: [frame.imageId]})).rejects.toThrow("inactive sitting")
+        expect(original.frames).toEqual([frame])
+        expect(h.live.frames).toEqual([replacement])
+      } finally {
+        await h.session.handlers["openalma:stop"]({})
+      }
+    })
+  }
+
+  test("frame RPC keeps the original generation readable during Stop drain without new admission", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const original = h.live
+    const startGeneration = lastSnapshot(h.session)!.startGeneration
+    const frame = passiveFrame()
+    const request = {...frame, startGeneration}
+    await h.session.handlers["openalma:frame"](request)
+    const admit = spyOn(original, "admitFrame")
+    const read = spyOn(original, "readFrames")
+    let release!: () => void
+    original.stopGate = new Promise<void>(resolve => {release = resolve})
+    const stopping = h.session.handlers["openalma:stop"]({})
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(original.stops).toBe(1)
+      expect(lastSnapshot(h.session)).toMatchObject({connection: "stopping", startGeneration: startGeneration + 1})
+      await expect(h.session.handlers["openalma:frame"]({...request, startGeneration: startGeneration + 1})).rejects.toThrow("inactive sitting")
+      await expect(h.session.handlers["openalma:frames"]({startGeneration: startGeneration + 1, imageIds: [frame.imageId]})).rejects.toThrow("inactive sitting")
+      expect(admit).not.toHaveBeenCalled()
+      expect(read).not.toHaveBeenCalled()
+      expect(await h.session.handlers["openalma:frames"]({startGeneration, imageIds: [frame.imageId]})).toEqual({frames: [frame]})
+      expect(await h.session.handlers["openalma:frame"]({...passiveFrame("too-late"), startGeneration}))
+        .toEqual({retained: false, delivery: "not-sent", reason: "unavailable"})
+      expect(admit).toHaveBeenLastCalledWith({...passiveFrame("too-late"), startGeneration}, false)
+      expect(await h.session.handlers["openalma:frame"](request)).toEqual({retained: true, delivery: "not-sent"})
+      expect(admit).toHaveBeenLastCalledWith(request, false)
+      expect(original.frames).toEqual([frame])
+      release()
+      await stopping
+      admit.mockClear()
+      read.mockClear()
+      for (const generation of [startGeneration, startGeneration + 1]) {
+        await expect(h.session.handlers["openalma:frame"]({...frame, startGeneration: generation})).rejects.toThrow("inactive sitting")
+        await expect(h.session.handlers["openalma:frames"]({startGeneration: generation, imageIds: [frame.imageId]})).rejects.toThrow("inactive sitting")
+      }
+      expect(admit).not.toHaveBeenCalled()
+      expect(read).not.toHaveBeenCalled()
+    } finally {
+      release()
+      await stopping
+    }
+  })
+
+  test("failed sitting teardown grants neither the old nor incremented generation frame access", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const generation = lastSnapshot(h.session)!.startGeneration
+    const frame = passiveFrame()
+    await h.session.handlers["openalma:frame"]({...frame, startGeneration: generation})
+    let release!: () => void
+    h.live.stopGate = new Promise<void>(resolve => {release = resolve})
+    const read = spyOn(h.live, "readFrames")
+    const admit = spyOn(h.live, "admitFrame")
+    h.live.fail("Fictional provider failure")
+    try {
+      for (const startGeneration of [generation, generation + 1]) {
+        await expect(h.session.handlers["openalma:frame"]({...frame, startGeneration})).rejects.toThrow("inactive sitting")
+        await expect(h.session.handlers["openalma:frames"]({startGeneration, imageIds: [frame.imageId]})).rejects.toThrow("inactive sitting")
+      }
+      expect(admit).not.toHaveBeenCalled()
+      expect(read).not.toHaveBeenCalled()
+    } finally { release(); await h.session.handlers["openalma:stop"]({}) }
+  })
+
   test("frame delivery snapshots project the current sitting's native opportunity", async () => {
     const h = setup()
     await h.session.handlers["openalma:start"]({mode: "continuous"})

@@ -27,6 +27,20 @@ export interface ImageTime {
   offset?: string
 }
 
+export type FrameRetention = {maxFrames: number; maxEncodedBytes: number}
+
+export type PassiveFrame = {
+  imageId: string
+  mimeType: "image/jpeg"
+  data: string
+  modelData: string
+  time: Pick<ImageTime, "timestamp" | "receivedAt"> & {source: "receipt"}
+}
+
+export type FrameIntakeResult =
+  | {retained: true; delivery: "not-sent"}
+  | {retained: false; delivery: "not-sent"; reason: "unavailable" | "full"}
+
 export interface SessionSnapshot {
   frameDeliveryOpen: boolean
   stopDeadlineAt: number | null

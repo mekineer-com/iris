@@ -2,7 +2,7 @@ import {describe, expect, spyOn, test} from "bun:test"
 
 import {GeminiLiveController, PhotoUploadConflict, journalSoulId, JOURNAL_KEY, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
-import {PHOTO_RETRY_MESSAGE, type PhotoCaption} from "../shared/types"
+import {PHOTO_RETRY_MESSAGE, type FrameRetention, type PassiveFrame, type PhotoCaption} from "../shared/types"
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://127.0.0.1:9999",
@@ -106,6 +106,7 @@ class FakeStorage {
 
 function harness(
   options: {
+    frameRetention?: FrameRetention
     getStopDeadline?: () => number | null
     canInvite?: () => boolean
     config?: OpenAlmaConfig
@@ -313,6 +314,7 @@ function harness(
       setupTimeoutMs: options.setupTimeoutMs,
       photoDrainTimeoutMs: options.photoDrainTimeoutMs ?? 25,
       storage: options.storage,
+      frameRetention: options.frameRetention,
     },
   )
   return {
@@ -426,6 +428,129 @@ function admitRequest(h: ReturnType<typeof harness>, mode: "continuous" | "manua
 }
 
 describe("GeminiLiveController", () => {
+  const frame = (second: number): PassiveFrame => ({imageId: `2026-01-08T10-17-${String(second).padStart(2, "0")}`,
+    mimeType: "image/jpeg", data: "AQID", modelData: "BAUG",
+    time: {timestamp: `2026-01-08T10-17-${String(second).padStart(2, "0")}`, source: "receipt", receivedAt: second * 1000}})
+
+  test("passive intake needs explicit valid limits, not a hidden vision default", async () => {
+    expect(() => harness({frameRetention: {maxFrames: 0, maxEncodedBytes: 8}})).toThrow("retention limits")
+    expect(() => harness({frameRetention: {maxFrames: 1, maxEncodedBytes: NaN}})).toThrow("retention limits")
+    const h = harness()
+    await start(h)
+    try { expect(() => h.controller.admitFrame(frame(1))).toThrow("not configured") }
+    finally { await h.controller.stop() }
+  })
+
+  test.each(["count", "bytes"] as const)("frame intake is bounded by %s, idempotent and never sends or uploads candidates", async bound => {
+    const storage = new FakeStorage()
+    const h = harness({storage, frameRetention: {maxFrames: bound === "count" ? 1 : 3, maxEncodedBytes: bound === "bytes" ? 8 : 64}})
+    await start(h)
+    try {
+      const sent = [...h.sockets[0].sent]
+      const requests = h.requests.length
+      const first = frame(1)
+      expect(h.controller.admitFrame({...first, ignored: "not retained",
+        time: {...first.time, ignored: "not retained"}} as PassiveFrame)).toEqual({retained: true, delivery: "not-sent"})
+      expect(h.controller.admitFrame(first, false)).toEqual({retained: true, delivery: "not-sent"})
+      expect(h.controller.admitFrame(frame(2))).toEqual({retained: false, delivery: "not-sent", reason: "full"})
+      expect(() => h.controller.admitFrame({...first, modelData: "CAkK"})).toThrow("already in use")
+      expect(() => h.controller.admitFrame({...first, time: {...first.time, receivedAt: 999}})).toThrow("already in use")
+      const copy = h.controller.readFrames([first.imageId])
+      first.time.receivedAt = 999
+      copy[0].time.timestamp = "changed-read-copy"
+      expect(h.controller.readFrames([frame(1).imageId])).toEqual([frame(1)])
+      expect(() => h.controller.readFrames([frame(2).imageId])).toThrow("Unknown retained frame")
+      expect(() => h.controller.readFrames([frame(1).imageId, frame(1).imageId])).toThrow("Invalid frame references")
+      expect(h.controller.pendingImageIds).toEqual([frame(1).imageId])
+      expect(h.controller.pendingPhotoIds).toEqual([])
+      expect(h.sockets[0].sent).toEqual(sent)
+      expect(h.requests).toHaveLength(requests)
+      expect([...storage.values.values()].some(value => value.includes(frame(1).imageId))).toBe(false)
+    } finally { await h.controller.stop() }
+  })
+
+  test("photo work may hold delivery without rejecting a distinct retained frame", async () => {
+    const h = harness({storage: new FakeStorage(), frameRetention: {maxFrames: 2, maxEncodedBytes: 16}})
+    await start(h)
+    try {
+      expect(h.controller.admitFrame(frame(1), false)).toEqual({retained: false, delivery: "not-sent", reason: "unavailable"})
+      await h.controller.sendImage({imageId: "deliberate-original", mimeType: "image/png", data: "AQID"})
+      expect(h.controller.frameDeliveryOpen).toBe(false)
+      const sent = [...h.sockets[0].sent]
+      expect(h.controller.admitFrame(frame(1))).toEqual({retained: true, delivery: "not-sent"})
+      expect(h.sockets[0].sent).toEqual(sent)
+      expect(h.controller.readFrames([frame(1).imageId])).toEqual([frame(1)])
+    } finally { await h.controller.stop() }
+  })
+
+  test.each(["read", "retry"] as const)("Stop expiry checked by %s discards candidates but protects deliberate originals", async entry => {
+    let deadline = Date.now() + 1_000
+    const storage = new FakeStorage()
+    const h = harness({storage, frameRetention: {maxFrames: 2, maxEncodedBytes: 16}, getStopDeadline: () => deadline})
+    await start(h, "manual")
+    h.controller.admitFrame(frame(1))
+    await h.controller.sendImage({imageId: "protected-original", mimeType: "image/png", data: "AQID"})
+    const stopping = h.controller.stop(true)
+    try {
+      expect(h.controller.readFrames([frame(1).imageId])).toEqual([frame(1)])
+      expect(h.controller.admitFrame(frame(2))).toEqual({retained: false, delivery: "not-sent", reason: "unavailable"})
+      expect(h.controller.admitFrame(frame(1))).toEqual({retained: true, delivery: "not-sent"})
+      deadline = Date.now() + 2_000
+      h.controller.refreshStopDeadline()
+      await new Promise(resolve => setTimeout(resolve, 5))
+      expect(h.controller.readFrames([frame(1).imageId])).toEqual([frame(1)])
+      expect(h.sockets[0].readyState).toBe(1)
+      deadline = Date.now() - 1
+      // A resumed host checks absolute elapsed time before reading stale bytes,
+      // even if the timer callback has not run yet.
+      if (entry === "retry") expect(h.controller.admitFrame(frame(1)))
+        .toEqual({retained: false, delivery: "not-sent", reason: "unavailable"})
+      expect(() => h.controller.readFrames([frame(1).imageId])).toThrow("Unknown retained frame")
+      await stopping
+      expect(h.controller.pendingImageIds).toEqual(["protected-original"])
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0])
+        .toMatchObject({imageId: "protected-original", retryRequested: true})
+      expect(h.controller.admitFrame(frame(2))).toEqual({retained: false, delivery: "not-sent", reason: "unavailable"})
+    } finally { deadline = Date.now() - 1; h.controller.refreshStopDeadline(); await stopping }
+  })
+
+  test("unselected frames expire without a provider reply and cannot return in the next sitting", async () => {
+    const h = harness({frameRetention: {maxFrames: 1, maxEncodedBytes: 8}, photoDrainTimeoutMs: 30})
+    await start(h, "manual")
+    h.controller.admitFrame(frame(1))
+    const stopping = h.controller.stop(true)
+    expect(h.controller.readFrames([frame(1).imageId])).toEqual([frame(1)])
+    await stopping
+    expect(() => h.controller.readFrames([frame(1).imageId])).toThrow("Unknown retained frame")
+    const restarting = h.controller.start("manual")
+    await waitFor(() => h.sockets.length === 2)
+    h.sockets[1].open()
+    h.sockets[1].message({setupComplete: {}})
+    await restarting
+    try {
+      expect(() => h.controller.readFrames([frame(1).imageId])).toThrow("Unknown retained frame")
+      expect(h.controller.admitFrame(frame(2))).toEqual({retained: true, delivery: "not-sent"})
+      expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+    } finally { await h.controller.stop() }
+  })
+
+  test("reconnect pauses new frame admission without losing accepted identity", async () => {
+    const h = harness({frameRetention: {maxFrames: 2, maxEncodedBytes: 16}})
+    await start(h)
+    try {
+      h.controller.admitFrame(frame(1))
+      h.sockets[0].close()
+      expect(h.controller.admitFrame(frame(1))).toEqual({retained: true, delivery: "not-sent"})
+      expect(h.controller.admitFrame(frame(2))).toEqual({retained: false, delivery: "not-sent", reason: "unavailable"})
+      await waitFor(() => h.sockets.length === 2)
+      h.sockets[1].open()
+      h.sockets[1].message({setupComplete: {}})
+      await waitFor(() => h.reconnecting.at(-1) === false)
+      expect(h.controller.readFrames([frame(1).imageId])).toEqual([frame(1)])
+      expect(h.controller.admitFrame(frame(2))).toEqual({retained: true, delivery: "not-sent"})
+    } finally { await h.controller.stop() }
+  })
+
   test.each([false, true])("frame delivery waits for filing and native receipt completion (caption turn already complete=%s)", async completed => {
     let release!: () => void
     const h = harness({storage: new FakeStorage(), finalizeGates: [new Promise<void>(resolve => {release = resolve})]})
