@@ -24,6 +24,11 @@ test("preserves an original date with no supplied timezone", async () => {
     source: "DateTimeOriginal", receivedAt: receipt, originalTime: "2000:02:29 01:02:03"})
 })
 
+test("the existing parser normalizes padded and NUL-terminated metadata at its boundary", async () => {
+  expect(await readImageTime(fixture("padded.jpg"), receipt)).toEqual({timestamp: "2026-01-08T10-17-23",
+    source: "DateTimeOriginal", receivedAt: receipt, originalTime: "2026:01:08 10:17:23", offset: "-05:00"})
+})
+
 test("uses valid creation metadata if original capture metadata is unusable", async () => {
   expect(await readImageTime(fixture("creation.jpg"), receipt)).toEqual({timestamp: "2019-06-02T12-00-00",
     source: "CreateDate", receivedAt: receipt, originalTime: "2019:06:02 12:00:00", offset: "+09:00"})

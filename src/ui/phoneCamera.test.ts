@@ -1,5 +1,6 @@
 import {expect, mock, test} from "bun:test"
-import {PhoneCamera, cameraShouldRun, type PhoneCameraState} from "./phoneCamera"
+import {PhoneCamera, cameraShouldRun, type PhoneCameraState, type PhoneCameraStopReason} from "./phoneCamera"
+import {compareSamples} from "../shared/frameComparison"
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -24,20 +25,22 @@ function harness(acquire?: () => Promise<MediaStream>) {
   const video = {srcObject: null as unknown, videoWidth: 480, videoHeight: 640,
     readyState: 2, muted: false, playsInline: false, play: mock(async () => {})}
   const contexts = [0, 1].map(() => ({
+    imageSmoothingQuality: "low",
     drawImage: mock(() => {}),
     getImageData: mock(() => ({data: new Uint8ClampedArray([1, 2, 3, 0, 4, 5, 6, 255])})),
   }))
   const canvases = contexts.map(context => ({width: 0, height: 0,
-    getContext: () => context,
+    getContext: mock(() => context),
     toDataURL: mock(() => "data:image/jpeg;base64,/9j/fixture"),
   }))
   const page = Object.assign(new EventTarget(), {hidden: false,
     createElement: mock(() => canvases[page.createElement.mock.calls.length - 1])})
   const browser = new EventTarget()
   const getUserMedia = mock(acquire ?? (async () => active.stream))
-  const camera = new PhoneCamera(video as unknown as HTMLVideoElement, {getUserMedia},
+  const onStopped = mock((_reason: PhoneCameraStopReason) => {})
+  const camera = new PhoneCamera(video as unknown as HTMLVideoElement, onStopped, {getUserMedia},
     page as unknown as Document, browser as unknown as Window)
-  return {camera, active, video, page, browser, getUserMedia, canvases, contexts}
+  return {camera, active, video, page, browser, getUserMedia, canvases, contexts, onStopped}
 }
 
 const options = {maxWidth: 320, jpegQuality: 0.7, comparisonWidth: 2, comparisonHeight: 1}
@@ -61,6 +64,8 @@ test("samples one portrait frame, strips the data URL and separates RGB from alp
   expect(sample.receivedAt).toBeGreaterThanOrEqual(before)
   expect(h.contexts[1].drawImage.mock.calls[0][0]).toBe(h.canvases[0])
   expect(h.canvases[0].toDataURL).toHaveBeenCalledWith("image/jpeg", 0.7)
+  expect(h.canvases[1].getContext).toHaveBeenCalledWith("2d", {willReadFrequently: true})
+  expect(h.contexts[1].imageSmoothingQuality).toBe("high")
   h.camera.dispose()
 })
 
@@ -78,10 +83,36 @@ test("does not upscale the original or sample before decoded pixels exist", asyn
   expect(h.camera.sample(options)).toBeNull()
 })
 
+test("rotation resets comparison even when the normalized thumbnail is unchanged", async () => {
+  const h = harness()
+  await h.camera.start()
+  const portrait = h.camera.sample(options)!
+  h.video.videoWidth = 640
+  h.video.videoHeight = 480
+  const landscape = h.camera.sample(options)!
+  expect(portrait.comparison).toEqual(landscape.comparison)
+  expect(compareSamples(portrait, landscape)).toBeNull()
+  h.camera.dispose()
+})
+
+test("stopped notification follows resource release and is emitted only once", async () => {
+  const h = harness()
+  h.onStopped.mockImplementation(() => {
+    expect(h.video.srcObject).toBeNull()
+    expect(h.active.track.readyState).toBe("ended")
+  })
+  await h.camera.start()
+  h.camera.stop()
+  h.camera.stop()
+  h.camera.dispose()
+  expect(h.onStopped).toHaveBeenCalledTimes(1)
+  expect(h.onStopped).toHaveBeenCalledWith("stopped")
+})
+
 test("permission refusal leaves no active camera and reports the error", async () => {
   const h = harness(async () => {throw new Error("Permission denied")})
   await expect(h.camera.start()).rejects.toThrow("Permission denied")
-  expect(h.camera.running).toBe(false)
+  expect(h.onStopped).toHaveBeenCalledWith("error")
   h.camera.dispose()
 })
 
@@ -97,7 +128,8 @@ test.each(["stop", "hide", "pagehide", "dispose"])("%s during permission wait cl
   expect(await starting).toBe(false)
   expect(h.active.track.stop).toHaveBeenCalledTimes(1)
   expect(h.video.srcObject).toBeNull()
-  expect(h.camera.running).toBe(false)
+  expect(h.onStopped).toHaveBeenCalledTimes(1)
+  expect(h.onStopped).toHaveBeenCalledWith(action === "hide" || action === "pagehide" ? "hidden" : "stopped")
   h.camera.dispose()
 })
 
@@ -114,6 +146,7 @@ test("overlapping starts close the late original without stopping its replacemen
   expect(h.active.track.stop).toHaveBeenCalledTimes(1)
   expect(next.track.stop).not.toHaveBeenCalled()
   expect(h.video.srcObject).toBe(next.stream)
+  expect(h.onStopped).not.toHaveBeenCalled()
   h.camera.dispose()
 })
 
@@ -153,7 +186,7 @@ test("an unexpected audio track is rejected and all acquired tracks are released
   await expect(h.camera.start()).rejects.toThrow("Unexpected microphone")
   expect(video.stop).toHaveBeenCalledTimes(1)
   expect(audio.stop).toHaveBeenCalledTimes(1)
-  expect(h.camera.running).toBe(false)
+  expect(h.onStopped).toHaveBeenCalledWith("error")
   h.camera.dispose()
 })
 
@@ -162,17 +195,19 @@ test.each(["hide", "ended"])("%s releases a running stream", async action => {
   await h.camera.start()
   if (action === "hide") {h.page.hidden = true; h.page.dispatchEvent(new Event("visibilitychange"))}
   else h.active.track.dispatchEvent(new Event("ended"))
-  expect(h.camera.running).toBe(false)
+  expect(h.onStopped).toHaveBeenCalledWith(action === "hide" ? "hidden" : "ended")
   expect(h.video.srcObject).toBeNull()
   expect(h.active.track.stop).toHaveBeenCalledTimes(1)
   h.camera.dispose()
+  expect(h.onStopped).toHaveBeenCalledTimes(1)
 })
 
 test("a visible-page event does not stop a live camera", async () => {
   const h = harness()
   await h.camera.start()
   h.page.dispatchEvent(new Event("visibilitychange"))
-  expect(h.camera.running).toBe(true)
+  expect(h.video.srcObject).toBe(h.active.stream)
+  expect(h.onStopped).not.toHaveBeenCalled()
   h.camera.dispose()
 })
 
@@ -181,7 +216,7 @@ test("playback failure releases acquired tracks", async () => {
   h.video.play.mockImplementation(async () => {throw new Error("Cannot play")})
   await expect(h.camera.start()).rejects.toThrow("Cannot play")
   expect(h.active.track.stop).toHaveBeenCalledTimes(1)
-  expect(h.camera.running).toBe(false)
+  expect(h.onStopped).toHaveBeenCalledWith("error")
   h.camera.dispose()
 })
 
@@ -190,7 +225,7 @@ test("capture/encoding failure releases the camera instead of returning empty da
   await h.camera.start()
   h.canvases[0].toDataURL.mockImplementation(() => "data:,")
   expect(() => h.camera.sample(options)).toThrow("no JPEG")
-  expect(h.camera.running).toBe(false)
+  expect(h.onStopped).toHaveBeenCalledWith("error")
   expect(h.active.track.stop).toHaveBeenCalledTimes(1)
   h.camera.dispose()
 })
@@ -198,14 +233,21 @@ test("capture/encoding failure releases the camera instead of returning empty da
 const running: PhoneCameraState = {enabled: true, cameraEnabled: true, visible: true,
   pickerOpen: false, connection: "listening", generation: 4, startGeneration: 4}
 
-test("camera-run condition allows listening and speaking without requiring the mic", () => {
+test("camera-run condition keeps the camera through reconnect without requiring the mic", async () => {
   expect(cameraShouldRun(running)).toBe(true)
   expect(cameraShouldRun({...running, connection: "speaking"})).toBe(true)
+  const h = harness()
+  await h.camera.start()
+  if (!cameraShouldRun({...running, connection: "reconnecting"})) h.camera.stop()
+  expect(h.active.track.stop).not.toHaveBeenCalled()
+  expect(h.getUserMedia).toHaveBeenCalledTimes(1)
+  expect(h.onStopped).not.toHaveBeenCalled()
+  h.camera.dispose()
 })
 
 test.each([
   {enabled: false}, {cameraEnabled: false}, {visible: false}, {pickerOpen: true}, {startGeneration: 5},
-  ...(["idle", "starting", "reconnecting", "stopping", "error"] as const).map(connection => ({connection})),
+  ...(["idle", "starting", "stopping", "error"] as const).map(connection => ({connection})),
 ])("camera-run condition releases on ownership, capability or state loss: %j", change => {
   expect(cameraShouldRun({...running, ...change})).toBe(false)
 })

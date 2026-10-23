@@ -1,5 +1,5 @@
 import {expect, test} from "bun:test"
-import {compareFrames, type RgbFrame} from "./frameComparison"
+import {compareFrames, compareSamples, type RgbFrame} from "./frameComparison"
 
 const solid = (width: number, height: number, color = 0): RgbFrame =>
   ({width, height, data: new Uint8Array(width * height * 3).fill(color)})
@@ -57,6 +57,19 @@ test.each([[3, 11], [11, 3], [1, 1]])("odd %ix%i geometry compares all channels"
 test("portrait/landscape and size changes report incomparable geometry", () => {
   expect(compareFrames(solid(3, 11), solid(11, 3))).toBeNull()
   expect(compareFrames(solid(8, 8), solid(16, 8))).toBeNull()
+})
+
+test("normalized comparison pixels cannot hide a rotated original frame", () => {
+  const comparison = solid(8, 8, 20)
+  expect(compareFrames(comparison, comparison)).toEqual({wholeMean: 0, peakBlockMean: 0})
+  expect(compareSamples({width: 320, height: 427, comparison},
+    {width: 320, height: 240, comparison})).toBeNull()
+})
+
+test("matching original geometry compares its normalized pixels normally", () => {
+  expect(compareSamples({width: 320, height: 427, comparison: solid(8, 8, 20)},
+    {width: 320, height: 427, comparison: solid(8, 8, 90)}))
+    .toEqual({wholeMean: 70, peakBlockMean: 70})
 })
 
 test("gradual changes remain visible against a retained reference", () => {

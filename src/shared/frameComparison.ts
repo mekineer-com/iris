@@ -9,6 +9,17 @@ export interface FrameDifference {
   peakBlockMean: number
 }
 
+export interface FrameSample {
+  width: number
+  height: number
+  comparison: RgbFrame
+}
+
+export function compareSamples(previous: FrameSample, current: FrameSample): FrameDifference | null {
+  if (previous.width !== current.width || previous.height !== current.height) return null
+  return compareFrames(previous.comparison, current.comparison)
+}
+
 // Port of _tools/iris/stream_frame_compare.py:scores; edge blocks use their actual area.
 export function compareFrames(previous: RgbFrame, current: RgbFrame): FrameDifference | null {
   for (const frame of [previous, current]) {

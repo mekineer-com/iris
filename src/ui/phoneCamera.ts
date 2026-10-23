@@ -1,5 +1,5 @@
 import type {ConnectionState} from "../shared/types"
-import type {RgbFrame} from "../shared/frameComparison"
+import type {FrameSample} from "../shared/frameComparison"
 
 export interface PhoneCameraState {
   enabled: boolean
@@ -14,17 +14,16 @@ export interface PhoneCameraState {
 export function cameraShouldRun(state: PhoneCameraState): boolean {
   return state.enabled && state.cameraEnabled && state.visible && !state.pickerOpen &&
     state.generation === state.startGeneration &&
-    (state.connection === "listening" || state.connection === "speaking")
+    (state.connection === "listening" || state.connection === "speaking" || state.connection === "reconnecting")
 }
 
-export interface CameraSample {
+export interface CameraSample extends FrameSample {
   mimeType: "image/jpeg"
   data: string
-  width: number
-  height: number
   receivedAt: number
-  comparison: RgbFrame
 }
+
+export type PhoneCameraStopReason = "stopped" | "hidden" | "ended" | "error"
 
 export interface CameraSampleOptions {
   maxWidth: number
@@ -36,15 +35,17 @@ export interface CameraSampleOptions {
 // Adapted from the tested phone-camera-probe. The caller owns cadence, naming and delivery.
 export class PhoneCamera {
   private generation = 0
+  private starting = false
   private stream: MediaStream | null = null
   private ended: (() => void) | null = null
   private readonly canvas: HTMLCanvasElement
   private readonly comparisonCanvas: HTMLCanvasElement
-  private readonly hide = () => {if (this.page.hidden) this.stop()}
-  private readonly pagehide = () => this.stop()
+  private readonly hide = () => {if (this.page.hidden) this.stop("hidden")}
+  private readonly pagehide = () => this.stop("hidden")
 
   constructor(
     private readonly video: HTMLVideoElement,
+    private readonly onStopped: (reason: PhoneCameraStopReason) => void,
     private readonly mediaDevices: Pick<MediaDevices, "getUserMedia"> = navigator.mediaDevices,
     private readonly page: Document = document,
     private readonly browser: Window = window,
@@ -57,10 +58,10 @@ export class PhoneCamera {
     browser.addEventListener("pagehide", this.pagehide)
   }
 
-  get running(): boolean {return this.stream !== null}
-
+  // False means this attempt was canceled/superseded; actual startup failures reject.
   async start(): Promise<boolean> {
-    this.stop()
+    this.release()
+    this.starting = true
     const owner = this.generation
     try {
       const stream = await this.mediaDevices.getUserMedia({audio: false,
@@ -71,15 +72,17 @@ export class PhoneCamera {
       }
       this.stream = stream
       if (stream.getAudioTracks().length) throw new Error("Unexpected microphone track")
-      this.ended = () => {if (this.stream === stream) this.stop()}
+      this.ended = () => {if (this.stream === stream) this.stop("ended")}
       stream.getVideoTracks().forEach(track => track.addEventListener("ended", this.ended!))
       this.video.srcObject = stream
       await this.video.play()
       return owner === this.generation
     } catch (error) {
       if (owner !== this.generation) return false
-      this.stop()
+      this.stop("error")
       throw error
+    } finally {
+      if (owner === this.generation) this.starting = false
     }
   }
 
@@ -94,7 +97,8 @@ export class PhoneCamera {
 
       this.comparisonCanvas.width = options.comparisonWidth
       this.comparisonCanvas.height = options.comparisonHeight
-      const comparisonContext = this.comparisonCanvas.getContext("2d")!
+      const comparisonContext = this.comparisonCanvas.getContext("2d", {willReadFrequently: true})!
+      comparisonContext.imageSmoothingQuality = "high"
       comparisonContext.drawImage(this.canvas, 0, 0, options.comparisonWidth, options.comparisonHeight)
       const rgba = comparisonContext.getImageData(0, 0, options.comparisonWidth, options.comparisonHeight).data
       const rgb = new Uint8Array(options.comparisonWidth * options.comparisonHeight * 3)
@@ -110,12 +114,14 @@ export class PhoneCamera {
         width: this.canvas.width, height: this.canvas.height, receivedAt,
         comparison: {width: options.comparisonWidth, height: options.comparisonHeight, data: rgb}}
     } catch (error) {
-      this.stop()
+      this.stop("error")
       throw error
     }
   }
 
-  stop(): void {
+  private release(): boolean {
+    const active = this.starting || this.stream !== null
+    this.starting = false
     this.generation++
     const stream = this.stream
     const ended = this.ended
@@ -126,11 +132,16 @@ export class PhoneCamera {
       stream.getTracks().forEach(track => track.stop())
     }
     this.video.srcObject = null
+    return active
+  }
+
+  stop(reason: PhoneCameraStopReason = "stopped"): void {
+    if (this.release()) this.onStopped(reason)
   }
 
   dispose(): void {
-    this.stop()
     this.page.removeEventListener("visibilitychange", this.hide)
     this.browser.removeEventListener("pagehide", this.pagehide)
+    this.stop()
   }
 }
