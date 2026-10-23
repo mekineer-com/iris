@@ -66,7 +66,7 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
 }
 
 describe("SessionPage state projection", () => {
-  const modelButtons = (tree: any) => nodes(nodes(tree).find(node => node.props?.["aria-label"] === "Live model"))
+  const modelButtons = (tree: any) => nodes(nodes(tree).find(node => node.props?.["aria-label"] === "Model"))
     .filter(node => node.type === "button")
 
   test("no saved override implies neither model, including custom or offered server settings", () => {
@@ -77,7 +77,8 @@ describe("SessionPage state projection", () => {
       snapshot.configuredModel = model
       const tree = render()
       expect(modelButtons(tree).map(button => button.props["aria-pressed"])).toEqual([false, false])
-      const selector = nodes(tree).find(node => node.props?.["aria-label"] === "Live model")
+      expect(modelButtons(tree).map(button => button.props.children)).toEqual(["Live", "Thinking"])
+      const selector = nodes(tree).find(node => node.props?.["aria-label"] === "Model")
       expect(nodes(selector).find(node => node.type === "p").props.children)
         .toBe(model ? `Using server setting: ${model}` : "Using server setting")
       const controls = nodes(tree).find(node => node.props?.["aria-label"] === "Voice controls")

@@ -588,13 +588,13 @@ export default function SessionPage() {
         {soulLocked ? <p>Finish this sitting before changing souls.</p> : null}
       </section>
       <section className="controls" aria-label="Voice controls">
-        <section className="mode-control" aria-label="Live model">
-          <span>Live model</span>
+        <section className="mode-control" aria-label="Model">
+          <span>Model</span>
           <div className="mode-options">
             {LIVE_MODELS.map((model, index) => (
               <button key={model} type="button" aria-pressed={snapshot.modelChoice === model}
                 disabled={modelDisabled} onClick={() => void onModel(model)}>
-                {index === 0 ? "Live" : "Live Thinking"}
+                {index === 0 ? "Live" : "Thinking"}
               </button>
             ))}
           </div>
