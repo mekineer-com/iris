@@ -7,6 +7,7 @@ import type {FrameIntakeResult, FrameRetention, PassiveFrame} from "../shared/ty
 import {MIC_SOURCES, PHOTO_RETRY_MESSAGE, STOP_FOREGROUND_MS, type ImageTime, type MicSource, type PhotoCaption, type SessionMode} from "../shared/types"
 
 type StartResponse = {
+  recovery?: {sitting_id: string; ack_sequence: number} | null
   photo_work_protocol: typeof PHOTO_WORK_PROTOCOL
   session_id: string
   next_transcript_sequence: number
@@ -79,6 +80,7 @@ type StorageLike = {
 }
 
 type SessionJournal = {
+  sessionId?: string
   version: 1 | 2 | 3
   scope: {userId: string; soulId: string; deviceSessionId: string}
   resumption: {handle: string; updatedAt: number} | null
@@ -88,6 +90,8 @@ type SessionJournal = {
   pendingImage?: PendingImage | null
   pendingImages?: PendingImage[]
 }
+
+type TranscriptRecovery = {sitting_id: string; events: TranscriptEvent[]}
 
 type SpokenRequest = {
   settled: boolean
@@ -448,6 +452,7 @@ export class GeminiLiveController {
     this.activityPauseReason = null
     this.ready = false
     this.ended = true
+    this.sessionId = ""
     this.resumptionHandle = ""
     this.resumptionUpdatedAt = 0
     this.reconnectAttempted = false
@@ -501,12 +506,14 @@ export class GeminiLiveController {
     try {
       await this.hydrateJournal(generation)
       if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
-      const response = await this.requestStart(mode)
+      const recovery = await this.prepareRecovery(generation)
+      if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
+      const response = await this.requestStart(mode, recovery, generation)
       if (this.stopping || generation !== this.generation) {
         await this.endLease()
         throw new Error("Gemini start cancelled")
       }
-      await this.reconcileJournal()
+      await this.reconcileJournal(Boolean(response.recovery))
       trace("provider.bootstrap.ready")
       this.token = response.ephemeral_token
       this.leaseDurationMs = response.lease_seconds * 1000
@@ -1134,22 +1141,31 @@ export class GeminiLiveController {
     }
   }
 
-  private async requestStart(mode: SessionMode): Promise<StartResponse> {
+  private async requestStart(mode: SessionMode, recovery: TranscriptRecovery | null, generation: number): Promise<StartResponse> {
     let response: Response
-    for (let attempt = 0; ; attempt += 1) {
+    let historyRetried = false
+    for (;;) {
+      if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
       response = await this.request("/integration/mentra/session/start", {
         user_id: this.config.userId,
         soul_id: this.config.soulId,
         device_session_id: this.config.deviceSessionId,
         photo_work_protocol: PHOTO_WORK_PROTOCOL,
         mode,
+        ...(recovery ? {recovery} : {}),
       })
       if (response.ok) break
       const errorBody = response.status === 409 ? await response.clone().json().catch(() => null) : null
       if (
-        attempt === 0 &&
+        !historyRetried &&
         errorBody?.detail?.code === "mentra_history_changed"
       ) {
+        historyRetried = true
+        continue
+      }
+      if (recovery && (errorBody?.detail?.code === "mentra_recovery_conflict" || response.status === 422)) {
+        await this.preserveRecovery(generation)
+        recovery = null
         continue
       }
       if (errorBody?.detail?.code === "soul_paused") throw new Error(errorBody.detail.message)
@@ -1159,6 +1175,10 @@ export class GeminiLiveController {
     if (typeof body.session_id === "string" && body.session_id.trim()) {
       this.sessionId = body.session_id
       this.ended = false
+    }
+    if (this.stopping || generation !== this.generation) {
+      await this.endLease()
+      throw new Error("Gemini start cancelled")
     }
     const ws = body.websocket
     if (
@@ -1183,6 +1203,12 @@ export class GeminiLiveController {
     ) {
       throw new Error("OpenAlma Start returned an invalid session contract")
     }
+    const expectedAck = recovery ? recovery.events[recovery.events.length - 1].sequence : 0
+    if (recovery && (body.recovery?.sitting_id !== recovery.sitting_id ||
+        body.recovery.ack_sequence !== expectedAck || Number(body.next_transcript_sequence) <= expectedAck)) {
+      throw new Error("OpenAlma did not acknowledge recovered conversation; backup kept on this device")
+    }
+    if (!recovery) body.recovery = null
     this.nextTranscriptSequence = Number(body.next_transcript_sequence)
     return body as StartResponse
   }
@@ -2126,7 +2152,7 @@ export class GeminiLiveController {
   }
 
   private async flushPendingEvents(): Promise<void> {
-    if (!this.journalLoaded) return
+    if (!this.journalLoaded || this.ended) return
     while (this.pendingEvents.length && !this.persistenceFatal) {
       const batch = this.pendingEvents.slice(0, 16)
       await this.persistJournal()
@@ -2432,42 +2458,61 @@ export class GeminiLiveController {
       (image.speakDescription === undefined || typeof image.speakDescription === "boolean")
   }
 
-  private async reconcileJournal(): Promise<void> {
-    const generation = this.generation
-    const pendingEvents = this.pendingEvents.filter((event) => event.sequence >= this.nextTranscriptSequence)
-    let keep = pendingEvents.length
-    for (let index = 0; index < pendingEvents.length; index += 1) {
-      if (pendingEvents[index].sequence !== this.nextTranscriptSequence + index) {
-        keep = index
-        break
-      }
+  private async preserveRecovery(generation: number): Promise<void> {
+    await this.preserveJournal(this.loadedJournal ?? this.journalSnapshot(), generation)
+    this.pendingEvents = []
+    this.draftEvents = []
+    this.resumptionHandle = ""
+    this.resumptionUpdatedAt = 0
+    this.callbacks.onPersistenceError("Original conversation backup kept on this device")
+  }
+
+  private async prepareRecovery(generation: number): Promise<TranscriptRecovery | null> {
+    if (!this.pendingEvents.length && !this.draftEvents.length) return null
+    const saved = this.loadedJournal ? JSON.parse(this.loadedJournal) as SessionJournal : null
+    const first = this.pendingEvents[0]
+    const suffix = first ? `:${first.sequence}` : ""
+    const original = saved?.sessionId ?? (first?.event_id.endsWith(suffix) ? first.event_id.slice(0, -suffix.length) : "")
+    const lastSequence = this.pendingEvents[this.pendingEvents.length - 1]?.sequence
+    const next = saved?.nextTranscriptSequence ?? (lastSequence === undefined ? 1 : lastSequence + 1)
+    if (typeof original !== "string" || !original.trim() || original !== original.trim() || original.length > 256 ||
+        !Number.isSafeInteger(next) || next < 1 ||
+        (lastSequence !== undefined && next !== lastSequence + 1) ||
+        this.pendingEvents.some((event, index) => event.event_id !== `${original}:${event.sequence}` ||
+          (index > 0 && event.sequence !== this.pendingEvents[index - 1].sequence + 1))) {
+      await this.preserveRecovery(generation)
+      return null
     }
+    this.sessionId = original
+    this.nextTranscriptSequence = next
+    this.journalLoaded = true
+    this.sealSpeechDrafts()
+    if (!this.pendingEvents.length) return null
+    // Recovery is already in the newly minted entry context; do not resume its old copy too.
+    this.resumptionHandle = ""
+    this.resumptionUpdatedAt = 0
+    await this.persistJournal()
+    this.journalLoaded = false
+    if (this.journalUnavailable) this.journalKey = selectJournalKey([this.journalKey!], true)
+    if (this.stopping || generation !== this.generation) throw new Error("Gemini start cancelled")
+    return {sitting_id: original, events: this.pendingEvents}
+  }
+
+  private async reconcileJournal(recovered: boolean): Promise<void> {
+    const generation = this.generation
+    if (recovered) this.pendingEvents = []
     const photoOutsideHistory = this.pendingImages.flatMap(image => [image.imageSequence, image.assistantSequence])
-      .some(sequence => sequence !== undefined && sequence >= this.nextTranscriptSequence + keep)
-    const draftBoundaryChanged = Boolean(this.draftEvents.length && this.loadedJournal &&
-      JSON.parse(this.loadedJournal).nextTranscriptSequence !== this.nextTranscriptSequence + keep)
-    if (this.loadedJournal !== null && (keep !== this.pendingEvents.length || photoOutsideHistory || draftBoundaryChanged)) {
+      .some(sequence => sequence !== undefined && sequence >= this.nextTranscriptSequence)
+    if (this.loadedJournal !== null && photoOutsideHistory) {
       await this.preserveJournal(this.loadedJournal, generation)
     }
-    if (keep !== pendingEvents.length || photoOutsideHistory || draftBoundaryChanged) {
+    if (photoOutsideHistory) {
       this.resumptionHandle = ""
       this.resumptionUpdatedAt = 0
       this.draftEvents = []
       this.publishPhotoRetry()
     }
-    this.pendingEvents = pendingEvents.slice(0, keep)
     this.journalLoaded = true
-    for (const image of this.pendingImages) {
-      if (image.caption && this.pendingEvents.some(event => event.event_id === `${image.sessionId}:${image.assistantSequence}`)) {
-        image.sessionId = this.sessionId
-      }
-    }
-    this.pendingEvents = this.pendingEvents.map((event) => ({
-      ...event,
-      event_id: `${this.sessionId}:${event.sequence}`,
-    }))
-    this.nextTranscriptSequence += this.pendingEvents.length
-    this.sealSpeechDrafts()
     for (const image of this.pendingImages) {
       if (!image.caption) {
         image.providerSent = false
@@ -2477,6 +2522,9 @@ export class GeminiLiveController {
     }
     this.publishPhotoRetry()
     await this.persistJournal()
+    if (recovered && this.journalUnavailable) {
+      this.journalKey = selectJournalKey([this.journalKey!], true)
+    }
   }
 
   private persistJournal(): Promise<void> {
@@ -2499,6 +2547,7 @@ export class GeminiLiveController {
   private journalSnapshot(): string {
     const journal: SessionJournal = {
       version: 3,
+      ...(this.sessionId ? {sessionId: this.sessionId} : {}),
       scope: {
         userId: this.config.userId,
         soulId: this.config.soulId,

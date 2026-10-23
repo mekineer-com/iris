@@ -271,12 +271,29 @@ is enabled by these adapters.
   close it. Stop/recovery seals any remaining group. No new timeout or
   reconstructed split is used.
 - Only a ready prefix receives server sequences, after Unicode-safe splitting.
-  Sequenced rows remain immutable, including after a lost acknowledgment. Cold
-  recovery closes old drafts before new-input admission; provider resumption
-  does not close them. Drafts retain the expected sequence boundary, so a reset
-  position archives them instead of mixing old speech into replacement history.
-  Fresh cold-bootstrap context is still Slice 4 work.
-- The journal writes payload version 3 with arrival-ordered `pendingImages` under
+  Sequenced rows remain immutable, including after a lost acknowledgment.
+  Before Start, identifiable saved drafts seal against their original sitting
+  ID and saved boundary. Start carries the whole original-ID tail in `recovery`,
+  so publication precedes entry-context construction/token minting. Exact
+  `sitting_id`/`ack_sequence` acknowledgment is required before retirement and
+  provider connection; rows are never reassigned to the replacement lease.
+  Missing acknowledgment keeps the backup and refuses that Start, including
+  on an older server which silently ignores recovery.
+- Recovery starts cold: its newly minted context already contains the recovered
+  dialogue. No synthetic client-content history turns are sent. No-recovery
+  resumption and ordinary same-sitting renewal retain their existing path.
+  Legacy identity-less drafts, mixed-origin rows and inconsistent boundaries
+  are preserved through Recovered Chats rather than guessing or regrouping.
+  `mentra_recovery_conflict` or422 on a recovery Start preserves/warns and
+  retries once without recovery; another422 fails normally. Photo originals,
+  stable filing receipts and original times retain independent recovery.
+- Phone-storage failure warns but never disables server transcript saving or
+  imposes a new Start blockade. Freeze/retirement writes use the existing
+  journal tail; a failed write moves subsequent writes to a fresh key, retaining
+  a replay-safe older snapshot. Unavailable storage cannot promise durability
+  for new, not-yet-server-acknowledged speech if the process dies. Cancellation
+  blocks retry Start calls and releases late returned leases even with bad acks.
+- The journal writes payload version 3 with its owning `sessionId` and arrival-ordered `pendingImages` under
   the existing storage key; version 1/2 singleton records normalize at the read
   boundary. Filing/replay completions remove only their owned original, not a
   newly selected queue head. Parked photos retain ID-specific Retry/Discard and

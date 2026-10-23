@@ -104,6 +104,36 @@ class FakeStorage {
   }
 }
 
+function fakeStart(body: any = {}, nextSequence = 41) {
+  const recovery = body.recovery
+  const ack = recovery?.events.at(-1)?.sequence
+  return {
+    photo_work_protocol: "iris-photo-work-v2",
+    session_id: "sitting-1",
+    next_transcript_sequence: Math.max(nextSequence, (ack ?? 0) + 1),
+    recovery: recovery ? {sitting_id: recovery.sitting_id, ack_sequence: ack} : null,
+    ephemeral_token: "ephemeral/test",
+    websocket: {
+      api_version: "v1beta", method: "BidiGenerateContentConstrained",
+      input_audio_rate_hz: 16000, output_audio_rate_hz: 24000,
+    },
+    lease_seconds: 90,
+    session_warning_seconds: 0,
+  }
+}
+
+function recoveryBackup(overrides: Record<string, unknown> = {}) {
+  const storage = new FakeStorage()
+  const journal = {version: 3, sessionId: "original-sitting",
+    scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+    resumption: {handle: "original-handle", updatedAt: Date.now()},
+    pendingTranscripts: [{event_id: "original-sitting:41", sequence: 41, event_kind: "transcript",
+      role: "user", content: "Original fictional words.", status: "complete", mic_source: "phone"}],
+    draftTranscripts: [], nextTranscriptSequence: 42, pendingImages: [], ...overrides}
+  storage.values.set(JOURNAL_KEY, JSON.stringify(journal))
+  return {storage, journal}
+}
+
 function harness(
   options: {
     frameRetention?: FrameRetention
@@ -195,16 +225,7 @@ function harness(
       const result = startResults.shift()
       return Response.json(
         result?.body ?? options.startBody ?? {
-          photo_work_protocol: "iris-photo-work-v2",
-          session_id: "sitting-1",
-          next_transcript_sequence: options.startSequence ?? 41,
-          ephemeral_token: "ephemeral/test",
-          websocket: {
-            api_version: "v1beta",
-            method: "BidiGenerateContentConstrained",
-            input_audio_rate_hz: 16000,
-            output_audio_rate_hz: 24000,
-          },
+          ...fakeStart(body, options.startSequence),
           lease_seconds: options.leaseSeconds ?? 90,
           session_warning_seconds: options.warningSeconds ?? 0,
         },
@@ -2668,11 +2689,16 @@ describe("GeminiLiveController", () => {
     await old.controller.stop()
     const next = harness({storage: restored})
     await start(next)
+    const recovery = next.requests.find(request => request.url.endsWith("/session/start"))!.body.recovery
+    expect(recovery.sitting_id).toBe("sitting-1")
+    expect(recovery.events.map((row: any) => row.event_id)).toEqual(
+      crash === "partial-text" ? ["sitting-1:41"] : ["sitting-1:41", "sitting-1:42"])
+    expect(next.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
     next.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
     next.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
     completeTurn(next, "Entirely new speech.", "A new answer.", true)
     await next.controller.stop()
-    const rows = next.requests.flatMap(request => request.body.events ?? [])
+    const rows = [...recovery.events, ...next.requests.flatMap(request => request.body.events ?? [])]
     expect(rows.filter(row => row.role === "user" && row.event_kind === "transcript").map(row => row.content))
       .toEqual(crash === "partial-text" ? ["Retained unfinished words.", "Entirely new speech."] : ["Entirely new speech."])
     if (crash === "reservation") {
@@ -2683,7 +2709,7 @@ describe("GeminiLiveController", () => {
     expect(next.errors).toEqual([])
   })
 
-  test.each([false, true])("a v2 draft-only backup preserves words unless history resets (reset=%s)", async reset => {
+  test.each([false, true])("a legacy draft-only backup without a sitting identity is archived (reset=%s)", async reset => {
     const storage = new FakeStorage()
     const old = harness({storage})
     await start(old)
@@ -2692,8 +2718,12 @@ describe("GeminiLiveController", () => {
     old.sockets[0].message({serverContent: {inputTranscription: {text: "Words from replaced history."}}})
     await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").draftTranscripts?.[0]?.content ===
       "Words from replaced history.")
-    const raw = storage.values.get(JOURNAL_KEY)!
-    expect(JSON.parse(raw).version).toBe(3)
+    const legacy = JSON.parse(storage.values.get(JOURNAL_KEY)!)
+    delete legacy.sessionId
+    legacy.version = 2
+    delete legacy.pendingImages
+    const raw = JSON.stringify(legacy)
+    expect(JSON.parse(raw).version).toBe(2)
     expect(journalSoulId(raw, CONFIG)).toBe(CONFIG.soulId)
     expect(JSON.parse(raw).pendingTranscripts).toEqual([])
     expect(JSON.parse(raw).nextTranscriptSequence).toBe(41)
@@ -2703,19 +2733,14 @@ describe("GeminiLiveController", () => {
     const next = harness({storage: restored, startSequence: reset ? 39 : 41})
     await start(next)
     expect(JSON.parse(next.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
-    if (reset) {
-      expect(JSON.parse(restored.values.get(RECOVERED_CHATS_KEY)!)).toEqual([raw])
-      expect(next.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
-    } else {
-      await waitFor(() => next.requests.some(request => request.body.events?.some(
-        (row: any) => row.content === "Words from replaced history.")))
-      expect(restored.values.has(RECOVERED_CHATS_KEY)).toBe(false)
-    }
+    expect(JSON.parse(restored.values.get(RECOVERED_CHATS_KEY)!)).toEqual([raw])
+    expect(next.requests.find(request => request.url.endsWith("/session/start"))!.body).not.toHaveProperty("recovery")
+    expect(next.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
     completeTurn(next, "New history question.", "New history answer.")
     await next.controller.stop()
     expect(next.requests.flatMap(request => request.body.events ?? []).map(row => [row.sequence, row.content]))
       .toEqual(reset ? [[39, "New history question."], [40, "New history answer."]] :
-        [[41, "Words from replaced history."], [42, "New history question."], [43, "New history answer."]])
+        [[41, "New history question."], [42, "New history answer."]])
     expect(next.errors).toEqual([])
   })
 
@@ -3024,7 +3049,7 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
-  test.each(["lost-ack", "rekey", "advanced"] as const)("durable photo receipt survives %s transcript recovery without refiling", async recovery => {
+  test.each(["lost-ack", "at-head", "advanced"] as const)("durable photo receipt survives %s transcript recovery without refiling", async recovery => {
     const storage = new FakeStorage()
     const history: NonNullable<Parameters<typeof harness>[0]>["history"] = []
     const h = harness({storage, history,
@@ -3041,18 +3066,18 @@ describe("GeminiLiveController", () => {
       .toBe("sitting-1:42")
     expect(h.finalizations).toEqual([{ok: true, durable: true, queued: true}])
     const recovered = harness({storage, history, startBody: {
-      photo_work_protocol: "iris-photo-work-v2", session_id: "replacement-sitting", next_transcript_sequence: recovery === "rekey" ? 41 : 45,
-      ephemeral_token: "ephemeral/test", websocket: {api_version: "v1beta",
-        method: "BidiGenerateContentConstrained", input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
-      lease_seconds: 90, session_warning_seconds: 0,
+      ...fakeStart({recovery: {sitting_id: "sitting-1", events: journal.pendingTranscripts}}, recovery === "at-head" ? 43 : 45),
+      session_id: "replacement-sitting",
     }})
     await start(recovered)
+    expect(recovered.requests.find(request => request.url.endsWith("/session/start"))!.body.recovery)
+      .toEqual({sitting_id: "sitting-1", events: journal.pendingTranscripts})
     await recovered.controller.stop()
     expect(recovered.requests.some(request => request.url.endsWith("/snapshot/finalize") ||
       request.url.endsWith("/snapshot/replay"))).toBe(false)
     const captions = recovered.requests.flatMap(request => request.body.events ?? [])
       .filter(event => event.event_kind === "photo_caption")
-    expect(captions.map(event => event.event_id)).toEqual(recovery === "rekey" ? ["replacement-sitting:42"] : [])
+    expect(captions).toEqual([])
     expect(recovered.errors).toEqual([])
   })
 
@@ -4295,7 +4320,10 @@ describe("GeminiLiveController", () => {
       .flatMap((request) => request.body.events)
       .filter((event) => event.event_kind === "image")
 
-    expect(new Set(imageEvents.map((event) => event.event_id))).toEqual(new Set(["sitting-1:41"]))
+    expect(h.requests.find(request => request.url.endsWith("/session/start"))!.body.recovery.events)
+      .toEqual([{event_id: "old-sitting:41", sequence: 41, event_kind: "image", role: "user",
+        content: "Shared a photo.", media_ref: "mentra_media/test-phone/image-1.png"}])
+    expect(imageEvents).toEqual([])
     expect(h.errors).toEqual([])
     await h.controller.stop()
   })
@@ -5551,8 +5579,10 @@ describe("GeminiLiveController", () => {
     const h = harness({storage, history})
     await start(h)
     await h.controller.stop()
-    expect(history.map((event: any) => event.sequence)).toEqual(rows.map(row => row.sequence))
-    expect(history.map(event => event.content)).toEqual(rows.map(row => row.content))
+    expect(h.requests.find(request => request.url.endsWith("/session/start"))!.body.recovery)
+      .toEqual({sitting_id: "old", events: rows})
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    expect(history).toEqual([])
     expect(storage.values.has(RECOVERED_CHATS_KEY)).toBe(false)
   })
 
@@ -5661,6 +5691,9 @@ describe("GeminiLiveController", () => {
     const h = harness({storage, startSequence: 42, appendStatuses: [503, 503], appendGates: [Promise.resolve(), gate]})
     try {
       await start(h)
+      expect(h.requests.find(request => request.url.endsWith("/session/start"))!.body.recovery.events.map((row: any) => row.event_id))
+        .toEqual(["old:42", "old:43"])
+      completeTurn(h, "Fresh fictional question.", "Fresh fictional answer.")
       await waitFor(() => h.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
       await waitPhotoTask(h.sockets[0], "retained-photo")
       expect(h.sockets[0].sent.some(value => photoInput(JSON.parse(value)))).toBe(false)
@@ -5672,7 +5705,7 @@ describe("GeminiLiveController", () => {
     }
   })
 
-  test("hydrates and rebases only the unacknowledged transcript suffix", async () => {
+  test("Start publishes the entire saved tail under its original IDs before cold setup", async () => {
     const storage = new FakeStorage()
     storage.values.set(
       "openalma:gemini-session-v1",
@@ -5715,7 +5748,8 @@ describe("GeminiLiveController", () => {
       storage,
       startBody: {
         photo_work_protocol: "iris-photo-work-v2", session_id: "replacement-sitting",
-        next_transcript_sequence: 41,
+        next_transcript_sequence: 43,
+        recovery: {sitting_id: "old-sitting", ack_sequence: 42},
         ephemeral_token: "ephemeral/test",
         websocket: {
           api_version: "v1beta",
@@ -5729,31 +5763,20 @@ describe("GeminiLiveController", () => {
     })
     const starting = h.controller.start()
     await waitFor(() => h.sockets.length === 1)
+    expect(h.requests.find(request => request.url.endsWith("/session/start"))!.body.recovery).toEqual({
+      sitting_id: "old-sitting", events: JSON.parse(savedJournal).pendingTranscripts,
+    })
+    expect(storage.values.get(JOURNAL_KEY)).toBe("")
     h.sockets[0].open()
     expect(JSON.parse(h.sockets[0].sent[0])).toEqual({
-      setup: {sessionResumption: {handle: "private-handle"}},
+      setup: {sessionResumption: {}},
     })
     h.sockets[0].message({setupComplete: {}})
     await starting
-    await waitFor(() => h.requests.some((request) => request.url.endsWith("/transcripts/append")))
-    const append = h.requests.find((request) => request.url.endsWith("/transcripts/append"))!
-    expect(append.body.events).toEqual([
-      expect.objectContaining({
-        event_id: "replacement-sitting:41",
-        sequence: 41,
-        content: "unacknowledged suffix",
-      }),
-      expect.objectContaining({
-        event_id: "replacement-sitting:42",
-        sequence: 42,
-        content: "unacknowledged speech",
-        mic_source: "bluetooth",
-      }),
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    expect(h.sockets[0].sent.map(value => JSON.parse(value))).toEqual([
+      {setup: {sessionResumption: {}}},
     ])
-    await waitFor(() => {
-      const raw = storage.values.get("openalma:gemini-session-v1")
-      return Boolean(raw && JSON.parse(raw).pendingTranscripts.length === 0)
-    })
     await h.controller.stop(true)
     expect(storage.values.get("openalma:gemini-session-v1")).toBe("")
 
@@ -5761,19 +5784,238 @@ describe("GeminiLiveController", () => {
     recovery.pendingImage = {imageId: "pending-photo", mediaRef: "mentra_media/TestSoul/photo.png",
       providerSent: false, captureAfterCurrent: false, generation: 1, sessionId: "old-sitting"}
     storage.values.set("openalma:gemini-session-v1", JSON.stringify(recovery))
-    const gap = harness({storage, startBody: {
-      photo_work_protocol: "iris-photo-work-v2", session_id: "different-history", next_transcript_sequence: 39, ephemeral_token: "ephemeral/test",
-      websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained",
-        input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
-      lease_seconds: 90, session_warning_seconds: 0,
-    }})
+    const gap = harness({storage, startSequence: 39, startResults: [
+      {status: 409, body: {detail: {code: "mentra_recovery_conflict", expected_sequence: 39}}},
+    ], startBody: {...fakeStart({}, 39), session_id: "different-history"}})
     await start(gap)
-    expect(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)).toContain(JSON.stringify(recovery))
+    const archived = JSON.parse(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)[0])
+    expect(archived.pendingTranscripts).toEqual(recovery.pendingTranscripts)
+    expect(gap.requests.filter(request => request.url.endsWith("/session/start")).map(request => request.body.recovery))
+      .toEqual([{sitting_id: "old-sitting", events: recovery.pendingTranscripts}, undefined])
+    expect(gap.persistenceErrors).toContain("Original conversation backup kept on this device")
     expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].imageId).toBe("pending-photo")
     expect(JSON.parse(gap.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
     expect(gap.requests.some((request) => request.url.endsWith("/transcripts/append"))).toBe(false)
     await gap.controller.stop()
     expect(gap.requests.some((request) => request.url.endsWith("/different-history/end"))).toBe(true)
+  })
+
+  test.each([false, true])("freezes original IDs and seals drafts durably before Start (draft-only=%s)", async draftOnly => {
+    const {storage, journal} = recoveryBackup({...(draftOnly ? {pendingTranscripts: [], nextTranscriptSequence: 41} : {}),
+      draftTranscripts: [{event_kind: "transcript", role: "user", content: "Unfinished fictional words.",
+        status: "complete", mic_source: "glasses",
+        speech: {waiting: true, late: true, uncertain: false, ended: false, admitted: true}}]})
+    let release!: () => void
+    storage.setGate = new Promise<void>(resolve => {release = resolve})
+    let acknowledge!: () => void
+    const startGate = new Promise<void>(resolve => {acknowledge = resolve})
+    const h = harness({storage, startGate})
+    const starting = h.controller.start()
+    try {
+      await waitFor(() => storage.setCalls === 1)
+      expect(h.requests).toEqual([])
+      expect(h.sockets).toEqual([])
+    } finally {storage.setGate = null; release()}
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/session/start")))
+    const recovery = h.requests.find(request => request.url.endsWith("/session/start"))!.body.recovery
+    expect(recovery).toEqual({sitting_id: "original-sitting", events: [
+      ...(draftOnly ? [] : journal.pendingTranscripts),
+      {event_id: `original-sitting:${draftOnly ? 41 : 42}`, sequence: draftOnly ? 41 : 42,
+        event_kind: "transcript", role: "user", content: "Unfinished fictional words.", status: "interrupted", mic_source: "glasses"},
+    ]})
+    const frozen = JSON.parse(storage.values.get(JOURNAL_KEY)!)
+    expect(frozen.sessionId).toBe("original-sitting")
+    expect(frozen.pendingTranscripts).toEqual(recovery.events)
+    expect(frozen.draftTranscripts).toEqual([])
+    expect(h.sockets).toEqual([])
+    let retire!: () => void
+    storage.setGate = new Promise<void>(resolve => {retire = resolve})
+    acknowledge()
+    try {
+      await waitFor(() => storage.setCalls === 2)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingTranscripts).toEqual(recovery.events)
+      expect(h.sockets).toEqual([])
+    } finally {storage.setGate = null; retire()}
+    await waitFor(() => h.sockets.length === 1)
+    expect(storage.values.get(JOURNAL_KEY)).toBe("")
+    h.sockets[0].open()
+    h.sockets[0].message({setupComplete: {}})
+    await starting
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    await h.controller.stop()
+  })
+
+  test.each([
+    {name: "missing", ack: undefined}, {name: "null", ack: null},
+    {name: "wrong sitting", ack: {sitting_id: "replacement-sitting", ack_sequence: 41}},
+    {name: "short", ack: {sitting_id: "original-sitting", ack_sequence: 40}},
+    {name: "global head", ack: {sitting_id: "original-sitting", ack_sequence: 45}},
+    {name: "string sequence", ack: {sitting_id: "original-sitting", ack_sequence: "41"}},
+    {name: "next behind ack", ack: {sitting_id: "original-sitting", ack_sequence: 41}, next: 41},
+  ])("rejects $name recovery acknowledgment before provider setup or journal retirement", async ({ack, next}) => {
+    const {storage, journal} = recoveryBackup()
+    const h = harness({storage, startBody: {...fakeStart({}, next ?? 46), recovery: ack}})
+    await expect(h.controller.start()).rejects.toThrow("did not acknowledge recovered conversation")
+    expect(h.sockets).toEqual([])
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    const frozen = JSON.parse(storage.values.get(JOURNAL_KEY)!)
+    expect(frozen.pendingTranscripts).toEqual(journal.pendingTranscripts)
+    expect(frozen.sessionId).toBe("original-sitting")
+    expect(frozen.resumption).toBeNull()
+    const retry = harness({storage})
+    await start(retry)
+    expect(retry.requests.find(request => request.url.endsWith("/session/start"))!.body.recovery)
+      .toEqual({sitting_id: "original-sitting", events: journal.pendingTranscripts})
+    await retry.controller.stop()
+  })
+
+  test.each([
+    {name: "Start", options: {startStatus: 503}},
+    {name: "mint", options: {startStatus: 502}},
+    {name: "lost response", options: {stalledBodyPath: "/session/start", bodyTransportFailure: true}},
+  ])("failed $name retains the original recovery for exact retry", async ({options}) => {
+    const {storage, journal} = recoveryBackup()
+    const h = harness({storage, ...options})
+    await expect(h.controller.start()).rejects.toThrow()
+    expect(h.sockets).toEqual([])
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    const frozen = JSON.parse(storage.values.get(JOURNAL_KEY)!)
+    expect(frozen.pendingTranscripts).toEqual(journal.pendingTranscripts)
+    expect(frozen.sessionId).toBe("original-sitting")
+    expect(frozen.resumption).toBeNull()
+    const retry = harness({storage})
+    await start(retry)
+    expect(retry.requests.find(request => request.url.endsWith("/session/start"))!.body.recovery)
+      .toEqual({sitting_id: "original-sitting", events: journal.pendingTranscripts})
+    await retry.controller.stop()
+  })
+
+  test("a stale-history retry resends identical frozen original IDs", async () => {
+    const {storage, journal} = recoveryBackup()
+    const h = harness({storage, startResults: [{status: 409, body: {detail: {code: "mentra_history_changed"}}}]})
+    await start(h)
+    expect(h.requests.filter(request => request.url.endsWith("/session/start")).map(request => request.body.recovery))
+      .toEqual(Array(2).fill({sitting_id: "original-sitting", events: journal.pendingTranscripts}))
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    await h.controller.stop()
+  })
+
+  test.each([200, 422])("recovery 422 preserves the original and retries only once without it (fresh=%s)", async freshStatus => {
+    const photo = {imageId: "rejected-recovery-photo", mediaRef: "mentra_media/test-phone/rejected-recovery-photo.png",
+      providerSent: false, generation: 1, sessionId: "original-sitting",
+      time: {timestamp: "2026-01-08T10-17-23", source: "DateTimeOriginal", receivedAt: 0,
+        originalTime: "2026:01:08 10:17:23", offset: "+05:45"}}
+    const {storage, journal} = recoveryBackup({pendingImages: [photo]})
+    const h = harness({storage, startResults: [
+      {status: 422, body: {detail: "Invalid session start"}},
+      {status: freshStatus, body: freshStatus === 200 ? fakeStart() : {detail: "Invalid session start"}},
+    ]})
+    if (freshStatus === 200) await start(h)
+    else await expect(h.controller.start()).rejects.toThrow("OpenAlma Start failed (422)")
+    expect(h.requests.filter(request => request.url.endsWith("/session/start")).map(request => request.body.recovery))
+      .toEqual([{sitting_id: "original-sitting", events: journal.pendingTranscripts}, undefined])
+    const archived = JSON.parse(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)[0])
+    expect(archived.sessionId).toBe("original-sitting")
+    expect(archived.pendingTranscripts).toEqual(journal.pendingTranscripts)
+    expect(archived.pendingImages).toEqual([photo])
+    expect(h.persistenceErrors).toContain("Original conversation backup kept on this device")
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    if (freshStatus === 200) {
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0]).toMatchObject({
+        imageId: photo.imageId, mediaRef: photo.mediaRef, time: photo.time,
+      })
+      expect(h.sockets[0].sent.map(value => JSON.parse(value)))
+        .toEqual([{setup: {sessionResumption: {}}}, {realtimeInput: {text: "nokoru"}}])
+    } else expect(h.sockets).toEqual([])
+    await h.controller.stop()
+  })
+
+  test("Start 422 without recovery fails normally without archiving or retrying", async () => {
+    const {storage} = recoveryBackup({pendingTranscripts: []})
+    const raw = storage.values.get(JOURNAL_KEY)
+    const h = harness({storage, startStatus: 422})
+    await expect(h.controller.start()).rejects.toThrow("OpenAlma Start failed (422)")
+    expect(h.requests.filter(request => request.url.endsWith("/session/start"))).toHaveLength(1)
+    expect(h.requests[0].body).not.toHaveProperty("recovery")
+    expect(storage.values.get(JOURNAL_KEY)).toBe(raw)
+    expect(storage.values.has(RECOVERED_CHATS_KEY)).toBe(false)
+    expect(h.sockets).toEqual([])
+  })
+
+  test("Start without recovered rows still resumes its saved provider handle setup-only", async () => {
+    const {storage} = recoveryBackup({pendingTranscripts: []})
+    const h = harness({storage})
+    await start(h, "continuous", "original-handle")
+    expect(h.requests[0].body).not.toHaveProperty("recovery")
+    expect(h.sockets[0].sent.map(value => JSON.parse(value)))
+      .toEqual([{setup: {sessionResumption: {handle: "original-handle"}}}])
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    await h.controller.stop()
+  })
+
+  test.each([1, 2])("local recovery write failure %s protects the old copy without blocking Start or new speech", async failedWrite => {
+    const {storage, journal} = recoveryBackup()
+    const save = storage.set.bind(storage)
+    let writes = 0
+    storage.set = async (key, value) => {
+      if (key === JOURNAL_KEY && ++writes === failedWrite) throw new Error("Fictional journal write failure")
+      await save(key, value)
+    }
+    const h = harness({storage})
+    await start(h)
+    const original = JSON.parse(storage.values.get(JOURNAL_KEY)!)
+    expect(original.sessionId).toBe("original-sitting")
+    expect(original.pendingTranscripts).toEqual(journal.pendingTranscripts)
+    expect(original.resumption).toEqual(failedWrite === 1 ? journal.resumption : null)
+    expect(h.persistenceErrors).toContain("Local transcript backup unavailable")
+    expect(h.requests.filter(request => request.url.endsWith("/session/start")).map(request => request.body.recovery))
+      .toEqual([{sitting_id: "original-sitting", events: journal.pendingTranscripts}])
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    completeTurn(h, "Fresh words after storage trouble.", "A fresh fictional reply.")
+    await waitFor(() => h.requests.some(request => request.url.endsWith("/transcripts/append")))
+    await h.controller.stop()
+    expect(h.requests.flatMap(request => request.body.events ?? []).map(row => [row.event_id, row.content]))
+      .toEqual([["sitting-1:42", "Fresh words after storage trouble."], ["sitting-1:43", "A fresh fictional reply."]])
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingTranscripts).toEqual(journal.pendingTranscripts)
+    expect(storage.values.has(`${JOURNAL_KEY}:1`)).toBe(true)
+    expect(h.errors).toEqual([])
+  })
+
+  test.each(["mixed origin", "sequence hole", "draft boundary"] as const)("preserves %s recovery without guessing IDs", async malformed => {
+    const {storage, journal} = recoveryBackup()
+    const raw = JSON.stringify({...journal,
+      ...(malformed === "draft boundary" ? {nextTranscriptSequence: 43, draftTranscripts: [
+        {event_kind: "transcript", role: "assistant", content: "Unnumbered fictional answer.", status: "complete"},
+      ]} : {pendingTranscripts: [...journal.pendingTranscripts, {...journal.pendingTranscripts[0],
+        event_id: malformed === "mixed origin" ? "another-sitting:42" : "original-sitting:43",
+        sequence: malformed === "mixed origin" ? 42 : 43}], nextTranscriptSequence: malformed === "mixed origin" ? 43 : 44})})
+    storage.values.set(JOURNAL_KEY, raw)
+    const h = harness({storage})
+    await start(h)
+    expect(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)).toEqual([raw])
+    expect(h.requests.find(request => request.url.endsWith("/session/start"))!.body).not.toHaveProperty("recovery")
+    expect(JSON.parse(h.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
+    expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    await h.controller.stop()
+  })
+
+  test("acknowledged recovery ignores the old handle and starts cold without duplicate append", async () => {
+    const {storage, journal} = recoveryBackup()
+    const h = harness({storage})
+    const starting = h.controller.start()
+    await waitFor(() => h.sockets.length === 1)
+    h.sockets[0].open()
+    expect(JSON.parse(h.sockets[0].sent[0])).toEqual({setup: {sessionResumption: {}}})
+    h.sockets[0].message({setupComplete: {}})
+    await starting
+    expect(h.sockets).toHaveLength(1)
+    expect(h.sockets[0].sent.map(value => JSON.parse(value))).toEqual([{setup: {sessionResumption: {}}}])
+    expect(h.requests.filter(request => request.url.endsWith("/session/start")).map(request => request.body.recovery))
+      .toEqual([{sitting_id: "original-sitting", events: journal.pendingTranscripts}])
+    completeTurn(h, "Fresh question.", "Fresh answer.")
+    await h.controller.stop()
+    expect(h.requests.flatMap(request => request.body.events ?? []).map(row => row.event_id))
+      .toEqual(["sitting-1:42", "sitting-1:43"])
   })
 
   test("ignores a resumption handle older than the measured token window", async () => {
@@ -5823,7 +6065,7 @@ describe("GeminiLiveController", () => {
     await h.controller.stop(true)
   })
 
-  test("failed recovery preserves the hydrated handle for Retry", async () => {
+  test("failed no-recovery setup preserves the hydrated handle for Retry", async () => {
     const storage = new FakeStorage()
     storage.values.set(
       "openalma:gemini-session-v1",
@@ -6929,19 +7171,33 @@ describe("GeminiLiveController", () => {
     expect(h.requests.filter((request) => request.url.endsWith("/end"))).toHaveLength(0)
   })
 
-  test("Stop during Start does not open a stale socket and ends the late lease", async () => {
+  test.each(["success", "missing ack", "history changed", "recovery conflict"] as const)("Stop during Start handles late %s without a stale socket or retry", async outcome => {
     let release!: () => void
     const gate = new Promise<void>((resolve) => {
       release = resolve
     })
-    const h = harness({startGate: gate})
+    const {storage, journal} = recoveryBackup()
+    const h = harness({startGate: gate,
+      ...(["missing ack", "recovery conflict"].includes(outcome) ? {storage} : {}),
+      ...(outcome === "missing ack" ? {startBody: {...fakeStart({}, 42), session_id: "late-lease", recovery: undefined}} : {}),
+      ...(["history changed", "recovery conflict"].includes(outcome) ? {startResults: [{status: 409, body: {detail: {
+        code: outcome === "history changed" ? "mentra_history_changed" : "mentra_recovery_conflict",
+        expected_sequence: 41,
+      }}}]} : {}),
+    })
     const starting = h.controller.start()
     await waitFor(() => h.requests.length === 1)
     await h.controller.stop()
     release()
     await expect(starting).rejects.toThrow("Gemini start cancelled")
     expect(h.sockets).toHaveLength(0)
-    expect(h.requests.filter((request) => request.url.endsWith("/end"))).toHaveLength(1)
+    expect(h.requests.filter(request => request.url.endsWith("/session/start"))).toHaveLength(1)
+    expect(h.requests.filter((request) => request.url.endsWith("/end"))).toHaveLength(["success", "missing ack"].includes(outcome) ? 1 : 0)
+    if (outcome === "missing ack") {
+      expect(h.requests.filter(request => request.url.endsWith("/end"))[0].url).toEndWith("/late-lease/end")
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingTranscripts).toEqual(journal.pendingTranscripts)
+      expect(h.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    }
   })
 
   test("heartbeat failure becomes observable", async () => {
