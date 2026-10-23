@@ -5,14 +5,13 @@ export interface PhoneCameraState {
   enabled: boolean
   cameraEnabled: boolean
   visible: boolean
-  pickerOpen: boolean
   connection: ConnectionState
   generation: number
   startGeneration: number
 }
 
 export function cameraShouldRun(state: PhoneCameraState): boolean {
-  return state.enabled && state.cameraEnabled && state.visible && !state.pickerOpen &&
+  return state.enabled && state.cameraEnabled && state.visible &&
     state.generation === state.startGeneration &&
     (state.connection === "listening" || state.connection === "speaking" || state.connection === "reconnecting")
 }
@@ -23,7 +22,7 @@ export interface CameraSample extends FrameSample {
   receivedAt: number
 }
 
-export type PhoneCameraStopReason = "stopped" | "hidden" | "ended" | "error"
+export type PhoneCameraStopReason = "stopped" | "ended" | "error"
 
 export interface CameraSampleOptions {
   maxWidth: number
@@ -40,22 +39,17 @@ export class PhoneCamera {
   private ended: (() => void) | null = null
   private readonly canvas: HTMLCanvasElement
   private readonly comparisonCanvas: HTMLCanvasElement
-  private readonly hide = () => {if (this.page.hidden) this.stop("hidden")}
-  private readonly pagehide = () => this.stop("hidden")
 
   constructor(
     private readonly video: HTMLVideoElement,
     private readonly onStopped: (reason: PhoneCameraStopReason) => void,
     private readonly mediaDevices: Pick<MediaDevices, "getUserMedia"> = navigator.mediaDevices,
-    private readonly page: Document = document,
-    private readonly browser: Window = window,
+    page: Pick<Document, "createElement"> = document,
   ) {
     this.canvas = page.createElement("canvas")
     this.comparisonCanvas = page.createElement("canvas")
     video.muted = true
     video.playsInline = true
-    page.addEventListener("visibilitychange", this.hide)
-    browser.addEventListener("pagehide", this.pagehide)
   }
 
   // False means this attempt was canceled/superseded; actual startup failures reject.
@@ -71,7 +65,6 @@ export class PhoneCamera {
         return false
       }
       this.stream = stream
-      if (stream.getAudioTracks().length) throw new Error("Unexpected microphone track")
       this.ended = () => {if (this.stream === stream) this.stop("ended")}
       stream.getVideoTracks().forEach(track => track.addEventListener("ended", this.ended!))
       this.video.srcObject = stream
@@ -140,8 +133,6 @@ export class PhoneCamera {
   }
 
   dispose(): void {
-    this.page.removeEventListener("visibilitychange", this.hide)
-    this.browser.removeEventListener("pagehide", this.pagehide)
     this.stop()
   }
 }

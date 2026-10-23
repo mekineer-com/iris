@@ -16,7 +16,7 @@ class Track extends EventTarget {
 
 function media() {
   const track = new Track()
-  const stream = {getTracks: () => [track], getVideoTracks: () => [track], getAudioTracks: () => []}
+  const stream = {getTracks: () => [track], getVideoTracks: () => [track]}
   return {track, stream: stream as unknown as MediaStream}
 }
 
@@ -33,14 +33,12 @@ function harness(acquire?: () => Promise<MediaStream>) {
     getContext: mock(() => context),
     toDataURL: mock(() => "data:image/jpeg;base64,/9j/fixture"),
   }))
-  const page = Object.assign(new EventTarget(), {hidden: false,
-    createElement: mock(() => canvases[page.createElement.mock.calls.length - 1])})
-  const browser = new EventTarget()
+  const page = {createElement: mock(() => canvases[page.createElement.mock.calls.length - 1])}
   const getUserMedia = mock(acquire ?? (async () => active.stream))
   const onStopped = mock((_reason: PhoneCameraStopReason) => {})
   const camera = new PhoneCamera(video as unknown as HTMLVideoElement, onStopped, {getUserMedia},
-    page as unknown as Document, browser as unknown as Window)
-  return {camera, active, video, page, browser, getUserMedia, canvases, contexts, onStopped}
+    page as unknown as Pick<Document, "createElement">)
+  return {camera, active, video, getUserMedia, canvases, contexts, onStopped}
 }
 
 const options = {maxWidth: 320, jpegQuality: 0.7, comparisonWidth: 2, comparisonHeight: 1}
@@ -116,20 +114,18 @@ test("permission refusal leaves no active camera and reports the error", async (
   h.camera.dispose()
 })
 
-test.each(["stop", "hide", "pagehide", "dispose"])("%s during permission wait closes the late stream", async action => {
+test.each(["stop", "dispose"])("%s during permission wait closes the late stream", async action => {
   const pending = deferred<MediaStream>()
   const h = harness(() => pending.promise)
   const starting = h.camera.start()
-  if (action === "hide") {h.page.hidden = true; h.page.dispatchEvent(new Event("visibilitychange"))}
-  else if (action === "pagehide") h.browser.dispatchEvent(new Event("pagehide"))
-  else if (action === "dispose") h.camera.dispose()
+  if (action === "dispose") h.camera.dispose()
   else h.camera.stop()
   pending.resolve(h.active.stream)
   expect(await starting).toBe(false)
   expect(h.active.track.stop).toHaveBeenCalledTimes(1)
   expect(h.video.srcObject).toBeNull()
   expect(h.onStopped).toHaveBeenCalledTimes(1)
-  expect(h.onStopped).toHaveBeenCalledWith(action === "hide" || action === "pagehide" ? "hidden" : "stopped")
+  expect(h.onStopped).toHaveBeenCalledWith("stopped")
   h.camera.dispose()
 })
 
@@ -179,36 +175,15 @@ test("a stale playback rejection does not close the replacement stream", async (
   h.camera.dispose()
 })
 
-test("an unexpected audio track is rejected and all acquired tracks are released", async () => {
-  const video = new Track(), audio = new Track()
-  const stream = {getTracks: () => [video, audio], getVideoTracks: () => [video], getAudioTracks: () => [audio]}
-  const h = harness(async () => stream as unknown as MediaStream)
-  await expect(h.camera.start()).rejects.toThrow("Unexpected microphone")
-  expect(video.stop).toHaveBeenCalledTimes(1)
-  expect(audio.stop).toHaveBeenCalledTimes(1)
-  expect(h.onStopped).toHaveBeenCalledWith("error")
-  h.camera.dispose()
-})
-
-test.each(["hide", "ended"])("%s releases a running stream", async action => {
+test("an ended track releases a running stream", async () => {
   const h = harness()
   await h.camera.start()
-  if (action === "hide") {h.page.hidden = true; h.page.dispatchEvent(new Event("visibilitychange"))}
-  else h.active.track.dispatchEvent(new Event("ended"))
-  expect(h.onStopped).toHaveBeenCalledWith(action === "hide" ? "hidden" : "ended")
+  h.active.track.dispatchEvent(new Event("ended"))
+  expect(h.onStopped).toHaveBeenCalledWith("ended")
   expect(h.video.srcObject).toBeNull()
   expect(h.active.track.stop).toHaveBeenCalledTimes(1)
   h.camera.dispose()
   expect(h.onStopped).toHaveBeenCalledTimes(1)
-})
-
-test("a visible-page event does not stop a live camera", async () => {
-  const h = harness()
-  await h.camera.start()
-  h.page.dispatchEvent(new Event("visibilitychange"))
-  expect(h.video.srcObject).toBe(h.active.stream)
-  expect(h.onStopped).not.toHaveBeenCalled()
-  h.camera.dispose()
 })
 
 test("playback failure releases acquired tracks", async () => {
@@ -231,7 +206,7 @@ test("capture/encoding failure releases the camera instead of returning empty da
 })
 
 const running: PhoneCameraState = {enabled: true, cameraEnabled: true, visible: true,
-  pickerOpen: false, connection: "listening", generation: 4, startGeneration: 4}
+  connection: "listening", generation: 4, startGeneration: 4}
 
 test("camera-run condition includes reconnect without requiring the mic", () => {
   expect(cameraShouldRun(running)).toBe(true)
@@ -240,7 +215,7 @@ test("camera-run condition includes reconnect without requiring the mic", () => 
 })
 
 test.each([
-  {enabled: false}, {cameraEnabled: false}, {visible: false}, {pickerOpen: true}, {startGeneration: 5},
+  {enabled: false}, {cameraEnabled: false}, {visible: false}, {startGeneration: 5},
   ...(["idle", "starting", "stopping", "error"] as const).map(connection => ({connection})),
 ])("camera-run condition releases on ownership, capability or state loss: %j", change => {
   expect(cameraShouldRun({...running, ...change})).toBe(false)
