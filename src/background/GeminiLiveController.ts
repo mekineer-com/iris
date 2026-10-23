@@ -587,7 +587,7 @@ export class GeminiLiveController {
       throw new Error("Photo send cancelled")
     }
     pending.retryRequested = false
-    if (!this.pendingImages.includes(pending) || this.photoAttempt || this.imageFinalization || this.photoDeliveryFenced()) {
+    if (this.pendingImage !== pending || this.photoAttempt || this.imageFinalization || this.imageRetrying || this.photoDeliveryFenced()) {
       pending.captureAfterCurrent = true
       await this.persistJournal()
       return
