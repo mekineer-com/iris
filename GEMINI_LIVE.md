@@ -201,7 +201,7 @@ closure, interruption and the existing deadlines still retain received text.
 Its text can settle at
 `generationComplete` rather than waiting for delayed playback completion.
 
-### Passive-frame preparation
+### Live frames and selected photos
 
 `SessionSnapshot.frameDeliveryOpen`, paired with `startGeneration`, projects
 the current sitting's delivery opportunity. It closes during original upload,
@@ -212,15 +212,37 @@ or camera-disabled UI also projects closed. Native opportunity changes publish
 through the existing SessionController snapshot path without a polling timer.
 This is not vision activation or permission to bypass cadence/catch-up.
 
-The prepared `openalma:frame` RPC accepts a sitting generation, reserved
-reference, receipt time, unmarked JPEG and stamped model copy. Intake requires
-explicit constructor `frameRetention` count/encoded-payload limits; there are
-no production defaults or settings controls. It retains candidates in memory
-without provider sends, uploads, caption jobs or transcript rows. Identical-ID
-retries reconcile accepted ownership before capacity/admission checks; altered
-bytes/time fail. Full buffers reject new candidates without evicting accepted
-ones. `openalma:frames` reads only explicit references for that originating
-sitting, including during its Stop drain, not a replacement/failing sitting.
+An explicit Video Start opts into the approved combined starter; Audio retains
+its existing instructions. `openalma:frame` carries the sitting generation,
+reserved reference/sequence, receipt time, unmarked JPEG and stamped model copy.
+The sequence rejects late arrivals. One bounded collection retains recent
+candidates while protecting offered/chosen originals; full retention does not
+block current-view delivery. Shared `VISION_SETTINGS` provides qualification
+inputs (2s cadence, 12 entries, 8MiB encoded payload), not phone-proven settings.
+`openalma:frames` reads exact originating-sitting references, including Stop drain.
+
+The background projects one `catchUpRender` descriptor; the visible UI renders
+those originals and returns JPEG data through `openalma:catch-up-rendered`.
+Attempt, foreground/camera, socket, cadence and age are rechecked before send.
+One chronological collage has priority for one capture period, then the current
+view resumes; a missing renderer cannot hold voice or live delivery indefinitely.
+Camera/UI wiring and physical-phone qualification remain separate work.
+
+Selection uses the same readiness/settling dispatcher, not another queue.
+Deliberate photos have priority. Every offer needs remaining allowance; keep-none
+is valid only on actual native completion. One per-sitting chosen-ID set counts
+admission once, preserving uncertainty without a second upload charge. Normal
+capture refreshes the current view between selection batches; Stop does not
+wait for a new view after capture has closed. Maximum-photo preference is pinned
+at Start and allowance time freezes at Stop.
+
+Chosen originals are cached before their metadata commit is acknowledged.
+Upload returns the original-byte receipt; acknowledged media-reference metadata
+precedes cache deletion and finalization. Retry reuses the same bytes, caption
+and original receipt, without recaptioning or renaming. Caption rows belong only
+to the originating sitting; a later sitting can finish filing without claiming
+the old caption as its own dialogue. Discard commits metadata removal before
+cache cleanup; an unacknowledged removal warns rather than pretending durability.
 
 Stop closes new admission and gives retained candidates the existing shared
 30-second/five-minute window. At expiry, still-unselected candidates are
@@ -228,15 +250,23 @@ discarded, not journaled or carried into a contextless new sitting. Access
 refreshes the absolute deadline even if host timers were delayed. Protected
 originals remain in their existing recovery collection. Terminal teardown also
 releases unselected candidates; reconnect, hide and camera-disable do not
-discard accepted candidates. Camera wiring, selection/promotion, render/catch-up
-delivery and provider activation remain unfinished; no production frame sender
-is enabled by these adapters.
+discard accepted candidates. Source wiring and offline checks do not establish
+provider perception, camera/UI integration or phone acceptance.
 
 Stored candidates alone are not active Stop work: an actual review/caption job
 or filing owns the drain. Idle retained bytes must not force the full allowance
 or prevent closing thoughts. They remain available during active work/reflection
-and clear at expiry or terminal context teardown. Selection integration must
-create actual review work, not restore a candidate-count wait.
+and clear at expiry or terminal context teardown. Selection demand enters actual
+review work, not a candidate-count wait.
+
+One session-owned journal serializes immutable submitted snapshots across live
+controllers. At Stop expiry only durability waits detach; retired producers
+cannot overwrite successors. Warm reads use latest logical state. Uncertain
+native writes rotate the next journal key, since timeout does not cancel physical
+execution. An uncertain Recovered Chats write quarantines subsequent archive
+rewrites; fresh-key preservation retains raw dialogue instead of risking an
+older physical write erasing a newer archive. Specific chosen-photo commits
+still require real acknowledgments; ordinary backup waits are not globally removed.
 
 ### Completion and connection rotation
 
@@ -256,7 +286,8 @@ silent-audio prompt is introduced.
 Start's returned model is authoritative and must match an explicit phone choice.
 Renewal stays pinned to the lease, not later config edits. The v3 phone journal
 records the actual model; an ordinary no-recovery handle needs matching model
-metadata to resume. Missing/different metadata connects cold while retaining
+metadata to resume. Call mode is also pinned with the handle: Audio/Video changes
+connect cold, since the startup instructions differ. Missing/different model metadata connects cold while retaining
 photo/transcript ownership. Before-bootstrap dialogue recovery stays cold as
 before. This does not assert context compatibility merely from equal model IDs.
 Offline source checks are not live-provider/phone qualification of Thinking.

@@ -3,9 +3,9 @@ import {makeRequestId} from "@mentra/miniapp"
 
 import type {Channels} from "../shared/channels"
 import type {FrameRequest, ImageReferenceRequest, ImageRequest} from "../shared/channels"
-import type {FrameRetention} from "../shared/types"
+import type {CallMode, CatchUpResult, FrameRetention} from "../shared/types"
 import {formatImageTimestamp, nextImageReference} from "../shared/imageReference"
-import {LIVE_MODELS, MIC_SOURCES, STOP_BACKGROUND_MS, STOP_FOREGROUND_MS, type LiveModel, type MicSource} from "../shared/types"
+import {LIVE_MODELS, MIC_SOURCES, STOP_BACKGROUND_MS, STOP_FOREGROUND_MS, VISION_SETTINGS, type LiveModel, type MicSource} from "../shared/types"
 import type {
   ConnectionState,
   EarconName,
@@ -15,7 +15,7 @@ import type {
   SessionSnapshot,
 } from "../shared/types"
 import {approxBase64ByteLength, normalizePcm16Audio} from "./audioHelpers"
-import {GeminiLiveController, PhotoUploadConflict, journalImageIds, journalSoulId, readSessionJournal, readStoredValue, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
+import {GeminiLiveController, PhotoUploadConflict, SessionJournalOwner, journalImageIds, journalSoulId, readStoredValue, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
 import type {GeminiCallbacks} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {
@@ -43,7 +43,7 @@ export type SessionControllerOptions = {
   config?: OpenAlmaConfig
   installationDefaults?: unknown
   fetchFn?: typeof fetch
-  createLiveController?: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
+  createLiveController?: (config: OpenAlmaConfig, callbacks: GeminiCallbacks, journalOwner: SessionJournalOwner) => GeminiLiveController
 }
 
 const ACTIVE: ReadonlySet<ConnectionState> = new Set(["starting", "reconnecting", "listening", "speaking"])
@@ -54,10 +54,15 @@ const CAMERA_ENABLED_KEY = "openalma.camera-enabled"
 const CLOSING_THOUGHTS_KEY = "openalma.closing-thoughts"
 const SOUL_ID_KEY = "openalma.soul-id"
 const LIVE_MODEL_KEY = "openalma.live-model"
+const MAX_MEMORIZED_PHOTOS_KEY = "openalma.max-memorized-photos"
 
 function trace(event: string, detail: Record<string, unknown> = {}): void {
   if (process.env.NODE_ENV === "test") return
   console.info(`[OpenAlma] ${new Date().toISOString()} ${event}`, detail)
+}
+
+function checkCancellation(signal: AbortSignal): void {
+  if (signal.aborted) throw Object.assign(new Error("Iris request cancelled"), {name: "AbortError"})
 }
 
 export class SessionController {
@@ -70,6 +75,8 @@ export class SessionController {
   private send: Send | null = null
 
   private mode: SessionMode = "continuous"
+  private callMode: CallMode = "audio"
+  private maxMemorizedPhotos = 1
   private connection: ConnectionState = "idle"
   private soulId = ""
   private souls: string[] = []
@@ -102,6 +109,9 @@ export class SessionController {
   private startInFlight = false
   private startGeneration = 0
   private imageReferenceTail: Promise<void> = Promise.resolve()
+  private reservationSequence = 0
+  private archivedImageIds: Promise<string[]> | null = null
+  private recoveryRaw: string | null = null
   private speakerEpoch = 0
   private speakerWriter: SpeakerWriter | null = null
   private speakerOpenPromise: Promise<SpeakerWriter | null> | null = null
@@ -119,7 +129,8 @@ export class SessionController {
   private config?: OpenAlmaConfig
   private readonly installationDefaults?: unknown
   private readonly fetchFn: typeof fetch
-  private readonly createLiveController: (config: OpenAlmaConfig, callbacks: GeminiCallbacks) => GeminiLiveController
+  private readonly journalOwner: SessionJournalOwner
+  private readonly createLiveController: (config: OpenAlmaConfig, callbacks: GeminiCallbacks, journalOwner: SessionJournalOwner) => GeminiLiveController
   private liveController: GeminiLiveController | null
 
   constructor(
@@ -134,10 +145,12 @@ export class SessionController {
     this.config = options.config
     this.soulId = options.config?.soulId ?? ""
     this.fetchFn = options.fetchFn ?? fetch
+    this.journalOwner = new SessionJournalOwner(this.session.storage)
     this.createLiveController =
       options.createLiveController ??
       ((config, callbacks) => new GeminiLiveController(config, callbacks, {
-        storage: this.session.storage, frameRetention: options.frameRetention,
+        storage: this.session.storage, journalOwner: this.journalOwner,
+        frameRetention: options.frameRetention ?? VISION_SETTINGS,
       }))
     this.liveController = null
   }
@@ -153,7 +166,7 @@ export class SessionController {
       on: (channel: "openalma:visibility", cb: (payload: unknown) => void) => () => void
       handle: <C extends keyof Channels & string>(
         channel: C,
-        handler: (payload: unknown) => Promise<unknown> | unknown,
+        handler: (payload: unknown, ctx: {signal: AbortSignal}) => Promise<unknown> | unknown,
       ) => () => void
     }
 
@@ -207,7 +220,9 @@ export class SessionController {
     this.unsubs.push(
       ui.handle("openalma:start", async (payload) => {
         const mode = (payload as {mode?: SessionMode} | null)?.mode ?? this.mode
-        await this.startSession(mode)
+        const callMode = (payload as {callMode?: unknown} | null)?.callMode ?? "audio"
+        if (callMode !== "audio" && callMode !== "video") throw new Error("Invalid call mode")
+        await this.startSession(mode, callMode)
         if (this.connection === "error") {
           throw new Error(this.lastError || "start failed")
         }
@@ -340,6 +355,17 @@ export class SessionController {
       this.pushSnapshot()
       return {ok: true as const}
     }))
+    this.unsubs.push(ui.handle("openalma:set-max-memorized-photos", async payload => {
+      await this.preferencesLoaded
+      const value = (payload as {value?: unknown} | null)?.value
+      if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 5) {
+        throw new Error("Invalid Maximum memorized photos setting")
+      }
+      await this.session.storage.set(MAX_MEMORIZED_PHOTOS_KEY, String(value))
+      this.maxMemorizedPhotos = value
+      this.pushSnapshot()
+      return {ok: true as const}
+    }))
     this.unsubs.push(
       ui.handle("openalma:set-capabilities", async (payload) => {
         await this.preferencesLoaded
@@ -353,6 +379,12 @@ export class SessionController {
           (next.cameraEnabled !== undefined && typeof next.cameraEnabled !== "boolean")
         ) {
           throw new Error("Invalid capability setting")
+        }
+        if (next.cameraEnabled === false) {
+          // Close capture even if saving this preference stalls or fails.
+          this.cameraEnabled = false
+          this.updateVisionAvailability()
+          this.pushSnapshot()
         }
         if (next.microphoneEnabled !== undefined) {
           await this.session.storage.set(
@@ -374,6 +406,7 @@ export class SessionController {
         if (next.cameraEnabled !== undefined) {
           await this.session.storage.set(CAMERA_ENABLED_KEY, next.cameraEnabled ? "1" : "0")
           this.cameraEnabled = next.cameraEnabled
+          this.updateVisionAvailability()
         }
         this.pushSnapshot()
         this.liveController?.resumeBackgroundWork()
@@ -391,17 +424,28 @@ export class SessionController {
       }),
     )
     this.unsubs.push(
-      ui.handle("openalma:reserve-image", async payload => {
+      ui.handle("openalma:reserve-image", async (payload, ctx) => {
+        checkCancellation(ctx.signal)
         await this.preferencesLoaded
-        return this.reserveImageReference(payload as ImageReferenceRequest)
+        checkCancellation(ctx.signal)
+        return this.reserveImageReference(payload as ImageReferenceRequest, ctx.signal)
       }),
     )
-    this.unsubs.push(ui.handle("openalma:frame", async payload => {
+    this.unsubs.push(ui.handle("openalma:frame", async (payload, ctx) => {
+      checkCancellation(ctx.signal)
       await this.preferencesLoaded
+      checkCancellation(ctx.signal)
       const frame = payload as FrameRequest
       const controller = this.frameController(frame?.startGeneration)
       return controller.admitFrame(frame, this.foreground && this.cameraEnabled &&
         (this.connection === "listening" || this.connection === "speaking"))
+    }))
+    this.unsubs.push(ui.handle("openalma:catch-up-rendered", async payload => {
+      await this.preferencesLoaded
+      const result = payload as CatchUpResult
+      if (!this.foreground || !this.cameraEnabled || result?.startGeneration !== this.startGeneration ||
+          (this.connection !== "listening" && this.connection !== "speaking")) return
+      this.liveController?.submitCatchUp(result)
     }))
     this.unsubs.push(ui.handle("openalma:frames", async payload => {
       await this.preferencesLoaded
@@ -476,6 +520,9 @@ export class SessionController {
 
   private snapshot(): SessionSnapshot {
     return {
+      callMode: this.callMode,
+      maxMemorizedPhotos: this.maxMemorizedPhotos,
+      catchUpRender: this.liveController?.catchUpRender ?? null,
       modelChoice: this.modelChoice,
       model: this.liveController?.model || null,
       configuredModel: this.configuredModel,
@@ -519,46 +566,57 @@ export class SessionController {
     return this.liveController
   }
 
-  private reserveImageReference(payload: ImageReferenceRequest): Promise<{startGeneration: number; imageId: string}> {
+  private reserveImageReference(payload: ImageReferenceRequest, signal: AbortSignal): Promise<{
+    startGeneration: number; imageId: string; reservationSequence: number
+  }> {
     const config = this.currentConfig()
     const soulId = this.soulId
     const generation = payload?.startGeneration
     const current = () => this.config === config && this.soulId === soulId && generation === this.startGeneration &&
       this.cameraEnabled && (this.connection === "listening" || this.connection === "speaking")
     const reservation = this.imageReferenceTail.then(async () => {
+      checkCancellation(signal)
       if (!current()) throw new Error("Photo reservation belongs to an inactive sitting")
       const timestamp = payload?.time?.timestamp
       if (typeof timestamp !== "string" || timestamp !== formatImageTimestamp(timestamp)) throw new Error("Invalid image timestamp")
       const key = `openalma:image-references:${JSON.stringify([config.userId, soulId, timestamp.slice(0, 10)])}`
       const [raw, recovered] = await Promise.all([
-        readStoredValue(this.session.storage, key), readStoredValue(this.session.storage, RECOVERED_CHATS_KEY),
+        readStoredValue(this.session.storage, key), this.readArchivedImageIds(config.userId, soulId),
       ])
+      checkCancellation(signal)
       if (!current()) throw new Error("Photo reservation belongs to an inactive sitting")
       const counters = raw === null ? {} : JSON.parse(raw)
       if (!counters || typeof counters !== "object" || Array.isArray(counters)) throw new Error("Invalid image naming state")
-      const knownIds = [...(this.liveController?.pendingImageIds ?? [])]
-      let archives: unknown
-      try {archives = JSON.parse(recovered ?? "[]")} catch {archives = null}
-      const entries = Array.isArray(archives) ? archives : recovered === null ? [] : [recovered]
-      for (const entry of entries) {
-        if (typeof entry === "string") knownIds.push(...journalImageIds(entry, {userId: config.userId, soulId}))
-      }
+      const knownIds = [...(this.liveController?.pendingImageIds ?? []), ...recovered]
       const second = timestamp.slice(11)
       const next = nextImageReference(timestamp, counters[second] === undefined ? 0 : counters[second], knownIds)
       counters[second] = next.suffix
       await this.session.storage.set(key, JSON.stringify(counters))
+      checkCancellation(signal)
       if (!current()) throw new Error("Photo reservation belongs to an inactive sitting")
-      return {startGeneration: generation, imageId: next.imageId}
+      return {startGeneration: generation, imageId: next.imageId, reservationSequence: ++this.reservationSequence}
     })
     this.imageReferenceTail = reservation.then(() => {}, () => {})
     return reservation
+  }
+
+  private readArchivedImageIds(userId: string, soulId: string): Promise<string[]> {
+    if (!this.archivedImageIds) {
+      this.archivedImageIds = readStoredValue(this.session.storage, RECOVERED_CHATS_KEY).then(recovered => {
+        let archives: unknown
+        try {archives = JSON.parse(recovered ?? "[]")} catch {archives = null}
+        const entries = Array.isArray(archives) ? archives : recovered === null ? [] : [recovered]
+        return entries.flatMap(entry => typeof entry === "string" ? journalImageIds(entry, {userId, soulId}) : [])
+      })
+    }
+    return this.archivedImageIds
   }
 
   private pushSnapshot(): void {
     this.send?.("openalma:update", this.snapshot())
   }
 
-  private async startSession(mode: SessionMode): Promise<void> {
+  private async startSession(mode: SessionMode, callMode: CallMode): Promise<void> {
     if (this.modelSaving) throw new Error("Wait for model selection to finish")
     if (this.soulSelecting) throw new Error("Wait for settings to finish")
     if (this.startInFlight || ACTIVE.has(this.connection) || this.connection === "stopping") {
@@ -567,6 +625,8 @@ export class SessionController {
     this.startInFlight = true
     const generation = ++this.startGeneration
     this.mode = mode
+    this.callMode = callMode
+    this.archivedImageIds = null
     this.photoRetryPending = false
     this.lastError = null
     this.usageTotalTokens = null
@@ -662,10 +722,11 @@ export class SessionController {
             this.pushSnapshot()
           },
           onError: (error) => void this.fail(error),
-        })
+        }, this.journalOwner)
       }
       const controller = this.liveController
-      await controller.start(mode, this.modelChoice ?? undefined)
+      this.updateVisionAvailability()
+      await controller.start(mode, this.modelChoice ?? undefined, {callMode, maxMemorizedPhotos: this.maxMemorizedPhotos})
       trace("session.provider.ready")
       if (generation !== this.startGeneration) {
         await this.stopLiveController(false, controller)
@@ -705,6 +766,7 @@ export class SessionController {
   }
 
   private beginTeardown(kind: "stop" | "fail"): number {
+    this.liveController?.setVisionAvailability(false)
     this.liveController?.muteForStop()
     this.connection = "stopping"
     this.stopStartedAt = kind === "stop" ? Date.now() : null
@@ -834,9 +896,15 @@ export class SessionController {
   private setForeground(visible: boolean): void {
     if (this.stopPlayback && this.stopDeadline()! <= Date.now()) this.stopPlayback.expire()
     this.foreground = visible
+    this.updateVisionAvailability()
     this.liveController?.refreshStopDeadline()
     this.refreshStopPlaybackDeadline()
     this.pushSnapshot()
+  }
+
+  private updateVisionAvailability(): void {
+    this.liveController?.setVisionAvailability(this.foreground && this.cameraEnabled && !this.teardownKind &&
+      this.connection !== "stopping")
   }
 
   private armStopPlaybackDeadline(): Promise<void> {
@@ -1123,19 +1191,24 @@ export class SessionController {
   ): Promise<void> {
     let storedSoul: string | null = null
     try {
-      let [storedProfile, microphone, camera, closingThoughts, savedSoul, journal, savedModel] = await Promise.all([
+      let [storedProfile, microphone, camera, closingThoughts, savedSoul, journal, savedModel, savedMaximum] = await Promise.all([
         this.session.storage.get(OPENALMA_PROFILE_KEY),
         this.session.storage.get(MICROPHONE_ENABLED_KEY),
         this.session.storage.get(CAMERA_ENABLED_KEY),
         this.session.storage.get(CLOSING_THOUGHTS_KEY),
         this.session.storage.get(SOUL_ID_KEY),
-        readSessionJournal(this.session.storage),
+        this.journalOwner.read(),
         this.session.storage.get(LIVE_MODEL_KEY).catch(() => {
           this.lastError = "Saved model choice unavailable; using server setting"
           return null
         }),
+        this.session.storage.get(MAX_MEMORIZED_PHOTOS_KEY).catch(() => {
+          this.lastError = "Saved Maximum memorized photos unavailable; using 1"
+          return null
+        }),
       ])
       this.modelChoice = LIVE_MODELS.find(model => model === savedModel) ?? null
+      this.maxMemorizedPhotos = savedMaximum !== null && /^[1-5]$/.test(savedMaximum) ? Number(savedMaximum) : 1
       const host = installationHost(await this.session.storage.get(OPENALMA_HOST_KEY))
       if (!this.config && storedProfile === null && this.installationDefaults !== undefined) {
         const raw = this.installationDefaults as Partial<OpenAlmaConfig> | null
@@ -1262,7 +1335,11 @@ export class SessionController {
 
   private async refreshRecoveryLock(): Promise<void> {
     if (!this.config || this.installationPending()) return
-    const journal = await readSessionJournal(this.session.storage)
+    const journal = await this.journalOwner.read()
+    if (!journal.unreadable && journal.raw !== this.recoveryRaw) {
+      this.recoveryRaw = journal.raw
+      this.archivedImageIds = null
+    }
     if (!journal.unreadable) this.recoverySoulId = journalSoulId(journal.raw, this.currentConfig())
   }
 

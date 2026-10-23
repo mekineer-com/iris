@@ -1,8 +1,8 @@
 import {describe, expect, spyOn, test} from "bun:test"
 
-import {GeminiLiveController, PhotoUploadConflict, journalSoulId, JOURNAL_KEY, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
+import {GeminiLiveController, PhotoUploadConflict, SessionJournalOwner, journalSoulId, JOURNAL_KEY, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
-import {PHOTO_RETRY_MESSAGE, type FrameRetention, type LiveModel, type PassiveFrame, type PhotoCaption} from "../shared/types"
+import {PHOTO_RETRY_MESSAGE, type FrameRetention, type LiveModel, type PassiveFrame, type PhotoCaption, type VisionStart} from "../shared/types"
 
 const LIVE: LiveModel = "gemini-3.8-live"
 const THINKING: LiveModel = "gemini-3.8-live-extended-thinking"
@@ -140,6 +140,8 @@ function recoveryBackup(overrides: Record<string, unknown> = {}) {
 
 function harness(
   options: {
+    journalOwner?: SessionJournalOwner
+    onFrameDeliveryChange?: () => void
     frameRetention?: FrameRetention
     getStopDeadline?: () => number | null
     canInvite?: () => boolean
@@ -311,7 +313,7 @@ function harness(
   const controller = new GeminiLiveController(
     options.config ?? CONFIG,
     {
-      onFrameDeliveryChange: open => frameDeliveryChanges.push(open),
+      onFrameDeliveryChange: open => { frameDeliveryChanges.push(open); options.onFrameDeliveryChange?.() },
       getStopDeadline: options.getStopDeadline,
       canInvite: options.canInvite,
       onAudio: (data) => audio.push(data),
@@ -339,6 +341,7 @@ function harness(
       setupTimeoutMs: options.setupTimeoutMs,
       photoDrainTimeoutMs: options.photoDrainTimeoutMs ?? 25,
       storage: options.storage,
+      journalOwner: options.journalOwner,
       frameRetention: options.frameRetention,
     },
   )
@@ -416,8 +419,8 @@ async function completePhotoCaption(socket: FakeSocket, imageId: string, caption
   socket.message({serverContent: {turnComplete: true}})
 }
 
-async function start(h: ReturnType<typeof harness>, mode: "continuous" | "manual" = "continuous", handle = "", model?: LiveModel): Promise<void> {
-  const starting = h.controller.start(mode, model)
+async function start(h: ReturnType<typeof harness>, mode: "continuous" | "manual" = "continuous", handle = "", model?: LiveModel, vision?: VisionStart): Promise<void> {
+  const starting = h.controller.start(mode, model, vision)
   await waitFor(() => h.sockets.length === 1)
   h.sockets[0].open()
   expect(JSON.parse(h.sockets[0].sent[0])).toEqual({setup: {sessionResumption: handle ? {handle} : {}}})
@@ -791,8 +794,708 @@ describe("GeminiLiveController", () => {
   })
 
   const frame = (second: number): PassiveFrame => ({imageId: `2026-01-08T10-17-${String(second).padStart(2, "0")}`,
-    mimeType: "image/jpeg", data: "AQID", modelData: "BAUG",
+    reservationSequence: second + 1, mimeType: "image/jpeg", data: "AQID", modelData: "BAUG",
     time: {timestamp: `2026-01-08T10-17-${String(second).padStart(2, "0")}`, source: "receipt", receivedAt: second * 1000}})
+
+  const selectionOptions = {frameRetention: {maxFrames: 12, maxEncodedBytes: 256}}
+
+  test.each([
+    ["audio", "audio", true], ["video", "video", true], ["audio", "video", false], ["video", "audio", false],
+    [undefined, "audio", true], [undefined, "video", false], ["unknown", "audio", false], ["unknown", "video", false], [null, "audio", false],
+  ] as const)("resumption pins startup mode (%s to %s, resumable=%s)", async (savedMode, nextMode, resumable) => {
+    const photo = {imageId: "parked-mode-photo", mediaRef: "mentra_media/test-phone/parked-mode-photo.png",
+      providerSent: false, retryRequested: true, generation: 1, sessionId: "original-sitting"}
+    const {storage} = recoveryBackup({pendingTranscripts: [], draftTranscripts: [], pendingImages: [photo],
+      ...(savedMode === undefined ? {} : {callMode: savedMode})})
+    const h = harness({storage})
+    await start(h, "continuous", resumable ? "original-handle" : "", LIVE, {callMode: nextMode, maxMemorizedPhotos: 1})
+    try {
+      expect(h.controller.pendingPhotoIds).toEqual([photo.imageId])
+      expect(h.requests.find(request => request.url.endsWith("/session/start"))?.body.vision).toBe(nextMode === "video" ? true : undefined)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).callMode).toBe(nextMode)
+    } finally { await h.controller.stop() }
+  })
+
+  async function selectionOffer(h: ReturnType<typeof harness>, count = 3): Promise<any> {
+    for (let i = 1; i <= count; i++) h.controller.admitFrame(frame(i))
+    let reply = await providerReady(h.sockets[0], undefined, true, h.controller.model === THINKING ? "IDLE" : undefined)
+    if (reply.response.next) reply = await providerReady(h.sockets[0], undefined, true, h.controller.model === THINKING ? "IDLE" : undefined)
+    expect(reply.parts).toHaveLength(count)
+    return reply
+  }
+
+  test.each([LIVE, THINKING])("selection binds exact originals through the shared dispatcher (%s)", async model => {
+    for (const mode of ["continuous", "manual"] as const) {
+      const storage = new FakeStorage()
+      const history: any[] = []
+      const h = harness({...selectionOptions, storage, history})
+      await start(h, mode, "", model, {callMode: "video", maxMemorizedPhotos: 1})
+      try {
+        const offer = await selectionOffer(h)
+        expect(offer.response).toEqual({task: "Keep at most 1 photo."})
+        expect(offer.parts.map((part: any) => part.inlineData.data)).toEqual(["BAUG", "BAUG", "BAUG"])
+        provisionalCaption(h.sockets[0], frame(2).imageId, "A fictional courtyard.", "choose-second")
+        provisionalCaption(h.sockets[0], frame(2).imageId, "A fictional courtyard.", "same-choice")
+        provisionalCaption(h.sockets[0], frame(2).imageId, "Conflicting perception.", "conflict-choice")
+        provisionalCaption(h.sockets[0], frame(1).imageId, "An over-limit choice.", "over-limit")
+        h.sockets[0].message({toolCall: {functionCalls: [{id: "selection-done", name: "nothing_to_add", args: {}}]},
+          serverContent: {turnComplete: true, ...(model === THINKING ? {interactionStatus: "IDLE"} : {})}})
+        await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "selection-done"))
+        await waitFor(() => history.filter(row => row.event_kind === "photo_caption").length === 1)
+        expect(h.requests.filter(request => request.url.endsWith("/snapshot")).map(request => request.body))
+          .toMatchObject([{image_id: frame(2).imageId, data: "AQID", mime_type: "image/jpeg"}])
+        expect(h.requests.filter(request => request.url.endsWith("/snapshot/replay"))).toHaveLength(0)
+        expect(history.some(row => row.event_kind === "image")).toBe(false)
+        expect([...storage.values.keys()].some(key => key.startsWith("openalma:chosen-original:"))).toBe(false)
+        expect(Reflect.get(h.controller, "chosenIds").size).toBe(1)
+        for (const id of ["choose-second", "same-choice"]) expect(functionResponses(h.sockets[0]).find(response => response.id === id)?.response).toMatchObject({ok: true, durable: true})
+        for (const id of ["conflict-choice", "over-limit"]) expect(functionResponses(h.sockets[0]).find(response => response.id === id)?.response.ok).toBe(false)
+        expect(h.errors).toEqual([])
+      } finally { await h.controller.stop() }
+    }
+  })
+
+  test.each([LIVE, THINKING])("completed selection accepts an identical caption receipt but rejects conflicts (%s)", async model => {
+    const history: any[] = []
+    const h = harness({...selectionOptions, storage: new FakeStorage(), history})
+    await start(h, "continuous", "", model, {callMode: "video", maxMemorizedPhotos: 1})
+    try {
+      await selectionOffer(h)
+      const imageId = frame(2).imageId
+      const caption = "A fictional courtyard after selection."
+      provisionalCaption(h.sockets[0], imageId, caption, "original-receipt")
+      await providerReady(h.sockets[0], "completed-selection", true, model === THINKING ? "IDLE" : undefined)
+      await waitFor(() => history.filter(row => row.event_kind === "photo_caption").length === 1)
+      expect(Reflect.get(h.controller, "photoJob")).toBeNull()
+      expect(Reflect.get(h.controller, "pendingImages")).toEqual([])
+      const requests = h.requests.length
+      provisionalCaption(h.sockets[0], imageId, caption, "repeated-receipt")
+      provisionalCaption(h.sockets[0], imageId, "A conflicting caption.", "conflicting-receipt")
+      provisionalCaption(h.sockets[0], frame(1).imageId, "An unselected offered original.", "unaccepted-receipt")
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "unaccepted-receipt"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "repeated-receipt")?.response)
+        .toEqual({ok: true, durable: true})
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "conflicting-receipt")?.response)
+        .toEqual({ok: false, durable: false, status: "conflict"})
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "unaccepted-receipt")?.response)
+        .toEqual({ok: false, status: "invalid"})
+      expect(h.requests).toHaveLength(requests)
+      expect(history.filter(row => row.event_kind === "photo_caption")).toHaveLength(1)
+      expect(Reflect.get(h.controller, "chosenIds").size).toBe(1)
+    } finally { await h.controller.stop() }
+  })
+
+  test("selection requires native completion and new readiness; keep-none never recaptions or chains batches", async () => {
+    const h = harness({...selectionOptions, storage: new FakeStorage()})
+    await start(h, "continuous", "", LIVE, {callMode: "video", maxMemorizedPhotos: 1})
+    try {
+      await selectionOffer(h)
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(Reflect.get(h.controller, "photoJob")).not.toBeNull()
+      await providerReady(h.sockets[0])
+      expect(Reflect.get(h.controller, "photoJob")).toBeNull()
+      expect(Reflect.get(h.controller, "chosenIds").size).toBe(0)
+      expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+      for (let i = 4; i < 12; i++) h.controller.admitFrame(frame(i))
+      const reply = await providerReady(h.sockets[0])
+      expect(reply.parts).toBeUndefined()
+      expect(functionResponses(h.sockets[0]).filter(response => response.parts)).toHaveLength(1)
+    } finally { await h.controller.stop() }
+  })
+
+  test.each(["continuous", "manual"] as const)("Thinking selection holds intermediate readiness until separate IDLE (%s)", async mode => {
+    const h = harness({...selectionOptions, storage: new FakeStorage()})
+    await start(h, mode, "", THINKING, {callMode: "video", maxMemorizedPhotos: 1})
+    try {
+      await selectionOffer(h)
+      const job = Reflect.get(h.controller, "photoJob")
+      h.sockets[0].message({serverContent: {turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "intermediate-selection-ready", name: "nothing_to_add", args: {}}]},
+        serverContent: {turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(Reflect.get(h.controller, "photoJob")).toBe(job)
+      expect(functionResponses(h.sockets[0]).some(response => response.id === "intermediate-selection-ready")).toBe(false)
+      expect(h.controller.frameDeliveryOpen).toBe(false)
+      h.sockets[0].message({serverContent: {turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(Reflect.get(h.controller, "photoJob")).toBe(job)
+      h.sockets[0].message({serverContent: {interactionStatus: "IDLE"}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "intermediate-selection-ready"))
+      expect(Reflect.get(h.controller, "photoJob")).toBeNull()
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "intermediate-selection-ready")?.response).toEqual({ok: true})
+      expect(Reflect.get(h.controller, "chosenIds").size).toBe(0)
+      expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+    } finally { await h.controller.stop() }
+  })
+
+  test("multiple selection choices share the upload lane and keep one caption row per original", async () => {
+    const history: any[] = []
+    const h = harness({...selectionOptions, storage: new FakeStorage(), history})
+    await start(h, "continuous", "", LIVE, {callMode: "video", maxMemorizedPhotos: 2})
+    try {
+      expect((await selectionOffer(h)).response).toEqual({task: "Keep at most 2 photos."})
+      provisionalCaption(h.sockets[0], frame(1).imageId, "A fictional first scene.", "first-choice")
+      provisionalCaption(h.sockets[0], frame(2).imageId, "A fictional second scene.", "second-choice")
+      const ready = providerReady(h.sockets[0], "multiple-done")
+      await ready
+      await waitFor(() => history.filter(row => row.event_kind === "photo_caption").length === 2)
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot")).map(request => request.body.image_id))
+        .toEqual([frame(1).imageId, frame(2).imageId])
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot/finalize"))).toHaveLength(2)
+      expect(Reflect.get(h.controller, "chosenIds").size).toBe(2)
+    } finally { await h.controller.stop() }
+  })
+
+  test("a fresh current view precedes the next selection batch", async () => {
+    const h = harness({...selectionOptions, storage: new FakeStorage()})
+    await start(h, "continuous", "", LIVE, {callMode: "video", maxMemorizedPhotos: 1})
+    let now = Date.now()
+    const clock = spyOn(Date, "now").mockImplementation(() => now)
+    try {
+      h.controller.setVisionAvailability(true)
+      await selectionOffer(h)
+      await providerReady(h.sockets[0])
+      expect(Reflect.get(h.controller, "selectionNeedsCurrentView")).toBe(true)
+      now += 2_000
+      expect(h.controller.admitFrame(frame(4)).delivery).toBe("sent")
+      expect(Reflect.get(h.controller, "selectionNeedsCurrentView")).toBe(false)
+      expect((await providerReady(h.sockets[0])).response).toEqual(PHOTO_NEXT)
+      expect((await providerReady(h.sockets[0])).parts).toHaveLength(1)
+      await providerReady(h.sockets[0])
+    } finally { clock.mockRestore(); await h.controller.stop() }
+  })
+
+  test("Stop offers a partial candidate pool and accepts keep-none without waiting for capture", async () => {
+    const h = harness({...selectionOptions, storage: new FakeStorage(), photoDrainTimeoutMs: 1_000})
+    await start(h, "continuous", "", LIVE, {callMode: "video", maxMemorizedPhotos: 1})
+    for (let i = 1; i <= 3; i++) h.controller.admitFrame(frame(i))
+    const stopping = h.controller.stop(true)
+    try {
+      await waitFor(() => Reflect.get(h.controller, "drainInputFlushed"))
+      expect((await providerReady(h.sockets[0])).response).toEqual(PHOTO_NEXT)
+      expect((await providerReady(h.sockets[0])).parts).toHaveLength(3)
+      await providerReady(h.sockets[0])
+      await stopping
+      expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+      expect(h.controller.pendingImageIds).toEqual([])
+      expect(h.sockets[0].readyState).toBe(3)
+    } finally { await stopping }
+  })
+
+  test("allowance is pinned, cumulative, and freezes whole-call elapsed time at Stop", async () => {
+    const h = harness({...selectionOptions, storage: new FakeStorage()})
+    const settings: VisionStart = {callMode: "video", maxMemorizedPhotos: 1}
+    await start(h, "continuous", "", LIVE, settings)
+    const initial = Date.now()
+    let now = initial
+    const clock = spyOn(Date, "now").mockImplementation(() => now)
+    try {
+      const allowance = () => Reflect.get(h.controller, "selectionAllowance").call(h.controller)
+      settings.maxMemorizedPhotos = 5
+      expect(allowance()).toBe(1)
+      now = initial + 15 * 60_000
+      expect(allowance()).toBe(2)
+      Reflect.get(h.controller, "chosenIds").add("already-chosen")
+      expect(allowance()).toBe(1)
+      h.controller.muteForStop()
+      now = initial + 45 * 60_000
+      expect(allowance()).toBe(1)
+    } finally { clock.mockRestore(); await h.controller.stop() }
+  })
+
+  test.each(["lost upload", "metadata commit", "media commit"] as const)("selected recovery retries same bytes and receipt after %s", async failure => {
+    const storage = new FakeStorage()
+    const history: any[] = []
+    const options = {...selectionOptions, storage, history, snapshotThrows: failure === "lost upload"}
+    const h = harness(options)
+    await start(h, "continuous", "", LIVE, {callMode: "video", maxMemorizedPhotos: 1})
+    const originalSet = storage.set.bind(storage)
+    let fail = true
+    storage.set = async (key, raw) => {
+      if (fail && key.startsWith(JOURNAL_KEY) && raw) {
+        const photo = JSON.parse(raw).pendingImages?.[0]
+        if (photo?.selected && (failure === "metadata commit" || (failure === "media commit" && photo.mediaRef))) {
+          throw new Error("Fictional native timeout")
+        }
+      }
+      await originalSet(key, raw)
+    }
+    try {
+      await selectionOffer(h)
+      provisionalCaption(h.sockets[0], frame(1).imageId, "A recoverable fictional garden.", "recover-choice")
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "recover-done", name: "nothing_to_add", args: {}}]}, serverContent: {turnComplete: true}})
+      await waitFor(() => h.controller.pendingPhotoIds.includes(frame(1).imageId))
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "recover-choice"))
+      const pending = Reflect.get(h.controller, "pendingImages")[0]
+      const cacheKey = pending.selected.cacheKey
+      expect(storage.values.get(cacheKey)).toBe("AQID")
+      if (failure !== "media commit") expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+      if (failure === "metadata commit") expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+      expect(pending.captionEventId).toBe(`sitting-1:photo:${frame(1).imageId}`)
+      if (failure === "media commit") {
+        completeTurn(h)
+        await waitFor(() => history.some(row => row.event_kind === "photo_caption"))
+      }
+      fail = false
+      options.snapshotThrows = false
+      await h.controller.retryImage(frame(1).imageId)
+      await waitFor(() => history.filter(row => row.event_kind === "photo_caption").length === 1)
+      expect(storage.values.has(cacheKey)).toBe(false)
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot/finalize")))
+        .toHaveLength(1)
+      expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id).toBe(pending.captionEventId)
+      expect(Reflect.get(h.controller, "chosenIds").size).toBe(1)
+      expect(h.sockets[0].sent.filter(value => JSON.parse(value).toolResponse?.functionResponses?.some((reply: any) => reply.parts))).toHaveLength(1)
+    } finally { fail = false; storage.set = originalSet; await h.controller.stop() }
+  })
+
+  function cachedSelection(storage: FakeStorage, mediaRef = "") {
+    const imageId = frame(1).imageId
+    const cacheKey = `openalma:chosen-original:${[CONFIG.userId, CONFIG.soulId, CONFIG.deviceSessionId, imageId].map(encodeURIComponent).join(":")}`
+    storage.values.set(cacheKey, "AQID")
+    return {imageId, mediaRef, providerSent: false, generation: 1, sessionId: "original-sitting",
+      caption: "An older fictional garden.", captionEventId: `original-sitting:photo:${imageId}`, time: frame(1).time,
+      selected: {cacheKey, mimeType: "image/jpeg", rowEnqueued: !!mediaRef, uploadIssued: false}}
+  }
+
+  test.each(["uploaded", "missing original"] as const)("selected recovery handles %s without recaptioning or renaming", async state => {
+    const {storage, journal} = recoveryBackup({pendingTranscripts: [], draftTranscripts: [], resumption: null})
+    const image = {...cachedSelection(storage, state === "uploaded" ? `mentra_media/test-phone/${frame(1).imageId}.jpg` : ""), retryRequested: true}
+    storage.values.delete(image.selected.cacheKey)
+    storage.values.set(JOURNAL_KEY, JSON.stringify({...journal, pendingImages: [image]}))
+    const h = harness({storage, ...(state === "missing original" ? {replayStatuses: [404]} : {})})
+    await start(h)
+    try {
+      await h.controller.retryImage(image.imageId)
+      expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+      expect(h.sockets[0].sent.some(value => photoTask(JSON.parse(value)))).toBe(false)
+      if (state === "uploaded") {
+        expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id).toBe(image.captionEventId)
+        expect(h.controller.pendingImageIds).toEqual([])
+      } else {
+        expect(h.controller.pendingPhotoIds).toEqual([image.imageId])
+        expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+        expect(Reflect.get(h.controller, "pendingImages")[0].caption).toBe(image.caption)
+      }
+    } finally { await h.controller.stop() }
+  })
+
+  test("salvaged uploaded selection is visibly retryable after dialogue rejection", async () => {
+    const {storage, journal} = recoveryBackup()
+    const image = cachedSelection(storage, `mentra_media/test-phone/${frame(1).imageId}.jpg`)
+    storage.values.set(JOURNAL_KEY, JSON.stringify({...journal, pendingImages: [image], pendingTranscripts: [{invalid: true}]}))
+    const h = harness({storage})
+    await start(h)
+    try {
+      expect(h.controller.pendingPhotoIds).toEqual([image.imageId])
+      await h.controller.retryImage(image.imageId)
+      expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body.caption_event_id).toBe(image.captionEventId)
+      expect(h.controller.pendingPhotoIds).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
+  test.each(["invalid dialogue", "rejected recovery", "archive timeout", "missing cache"])("salvages selected metadata with %s without moving its caption to a new sitting", async failure => {
+    const {storage, journal} = recoveryBackup()
+    const image = cachedSelection(storage)
+    const raw = JSON.stringify({...journal, pendingImages: [image],
+      ...(failure === "missing cache" ? {pendingTranscripts: [], draftTranscripts: [], resumption: null} : {}),
+      ...(failure === "invalid dialogue" || failure === "archive timeout" ? {pendingTranscripts: [{broken: "raw words"}]} : {})})
+    storage.values.set(JOURNAL_KEY, raw)
+    if (failure === "missing cache") storage.values.delete(image.selected.cacheKey)
+    const originalSet = storage.set.bind(storage)
+    storage.set = async (key, value) => {
+      if (failure === "archive timeout" && key === RECOVERED_CHATS_KEY) throw new Error("Native archive timeout")
+      await originalSet(key, value)
+    }
+    const history: any[] = []
+    const h = harness({storage, history,
+      startBody: {...fakeStart(), session_id: "replacement-sitting"},
+      ...(failure === "rejected recovery" ? {startResults: [{status: 409, body: {detail: {code: "mentra_recovery_conflict"}}}]} : {})})
+    await start(h)
+    try {
+      expect(h.controller.pendingPhotoIds).toContain(image.imageId)
+      await h.controller.retryImage(image.imageId)
+      expect(h.requests.find(request => request.url.endsWith("/snapshot/finalize"))?.body)
+        .toMatchObject({image_id: image.imageId, caption_event_id: image.captionEventId, caption: image.caption})
+      expect(history.some(row => row.event_kind === "photo_caption")).toBe(false)
+      expect(Reflect.get(h.controller, "chosenIds").size).toBe(0)
+      if (failure === "archive timeout") expect(storage.values.get(JOURNAL_KEY)).toBe(raw)
+      else if (failure !== "missing cache") expect(JSON.parse(storage.values.get(RECOVERED_CHATS_KEY)!)).toContain(raw)
+      expect(h.errors).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
+  test.each([false, true])("Discard commits before cache deletion (commit fails=%s)", async fail => {
+    const {storage, journal} = recoveryBackup({pendingTranscripts: [], draftTranscripts: [], resumption: null})
+    const image = cachedSelection(storage)
+    storage.values.set(JOURNAL_KEY, JSON.stringify({...journal, pendingImages: [image]}))
+    const h = harness({storage})
+    await start(h)
+    try {
+      if (fail) storage.setGate = Promise.reject(new Error("Native timeout"))
+      await h.controller.discardImage(image.imageId)
+      expect(h.controller.pendingImageIds).toEqual([])
+      expect(storage.values.has(image.selected.cacheKey)).toBe(fail)
+      if (fail) expect(h.persistenceErrors.at(-1)).toContain("may return")
+    } finally { storage.setGate = null; await h.controller.stop() }
+  })
+
+  test("archive quarantine prevents a late native write from erasing a later archive", async () => {
+    const storage = new FakeStorage()
+    const owner = new SessionJournalOwner(storage)
+    await owner.read()
+    const a = owner.acquire()
+    let reject!: (reason: Error) => void
+    storage.setGate = new Promise<void>((_resolve, fail) => { reject = fail })
+    const archiveA = owner.archive("raw A", a)
+    await waitFor(() => storage.setCalls === 1)
+    reject(new Error("Native timeout; physical write still running"))
+    await expect(archiveA).rejects.toThrow("Native timeout")
+    storage.setGate = null
+    owner.retire(a)
+    const b = owner.acquire()
+    await expect(owner.archive("raw B", b)).rejects.toThrow("uncertain")
+    owner.fresh()
+    expect(await owner.write("preserved B", b)).toBe(true)
+    storage.values.set(RECOVERED_CHATS_KEY, JSON.stringify(["raw A"]))
+    expect(storage.values.get(`${JOURNAL_KEY}:1`)).toBe("preserved B")
+    expect(storage.setCalls).toBe(2)
+  })
+
+  test("selection upload cannot finalize without mediaRef and a late reply cannot alter the replacement owner", async () => {
+    const storage = new FakeStorage()
+    const owner = new SessionJournalOwner(storage)
+    let release!: () => void
+    let deadline = Date.now() + 30_000
+    const a = harness({...selectionOptions, storage, journalOwner: owner, getStopDeadline: () => deadline,
+      snapshotGate: new Promise<void>(resolve => { release = resolve })})
+    await start(a, "continuous", "", LIVE, {callMode: "video", maxMemorizedPhotos: 1})
+    await selectionOffer(a)
+    provisionalCaption(a.sockets[0], frame(1).imageId, "A delayed fictional garden.")
+    await waitFor(() => a.requests.some(request => request.url.endsWith("/snapshot")))
+    const image = Reflect.get(a.controller, "pendingImages")[0]
+    await Reflect.get(a.controller, "scheduleImageFinalize").call(a.controller, true, image)
+    expect(a.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+    expect(storage.values.get(image.selected.cacheKey)).toBe("AQID")
+    const stopping = a.controller.stop(true)
+    deadline = Date.now() - 1
+    a.controller.refreshStopDeadline()
+    await stopping
+    const before = a.photoCaptions.length
+    const b = harness({storage, journalOwner: owner, startBody: {...fakeStart(), session_id: "new-selected-sitting"}})
+    await start(b)
+    try {
+      const raw = (await owner.read()).raw
+      release()
+      await new Promise(resolve => setTimeout(resolve, 5))
+      expect((await owner.read()).raw).toBe(raw)
+      expect(a.photoCaptions).toHaveLength(before)
+      expect(a.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+      expect(storage.values.has(image.selected.cacheKey)).toBe(true)
+      expect(b.controller.pendingPhotoIds).toContain(image.imageId)
+    } finally { release(); await b.controller.stop() }
+  })
+
+  test("catch-up cadence opens render only when sendable and expiry publishes the retired descriptor", async () => {
+    const snapshots: Array<string | null> = []
+    const h = harness({...selectionOptions, storage: new FakeStorage(), onFrameDeliveryChange: () => {
+      snapshots.push(h.controller.catchUpRender?.renderId ?? null)
+    }})
+    await start(h, "continuous", "", LIVE, {callMode: "video", maxMemorizedPhotos: 1})
+    Reflect.get(h.controller, "chosenIds").add("allowance-already-used")
+    let now = Date.now()
+    const clock = spyOn(Date, "now").mockImplementation(() => now)
+    try {
+      h.controller.setVisionAvailability(true)
+      h.controller.admitFrame(frame(1))
+      now += 100
+      await h.controller.sendImage({imageId: "off-tick-original", mimeType: "image/png", data: "AQID"})
+      await waitPhotoTask(h.sockets[0], "off-tick-original")
+      h.controller.admitFrame(frame(2))
+      await completePhotoCaption(h.sockets[0], "off-tick-original", "A fictional clock.")
+      await waitFor(() => h.photoCaptions.some(caption => caption.durable))
+      await finishPhotoQueue(h.sockets[0])
+      expect(h.controller.catchUpRender).toBeNull()
+      now += 1_900
+      h.controller.admitFrame(frame(3))
+      const attempt = h.controller.catchUpRender!
+      expect(attempt).not.toBeNull()
+      h.controller.submitCatchUp({startGeneration: 1, renderId: attempt.renderId, data: "AQID"})
+      expect(h.sockets[0].sent.map(value => JSON.parse(value)).filter(message => message.realtimeInput?.text?.includes("frames you missed"))).toHaveLength(1)
+      // Create another real pause, then let its published render expire at the next capture.
+      await h.controller.sendImage({imageId: "expired-render-original", mimeType: "image/png", data: "AQID"})
+      await waitPhotoTask(h.sockets[0], "expired-render-original")
+      h.controller.admitFrame(frame(4))
+      now += 2_000
+      await completePhotoCaption(h.sockets[0], "expired-render-original", "A fictional bell.")
+      await waitFor(() => h.photoCaptions.some(caption => caption.imageId === "expired-render-original" && caption.durable))
+      await finishPhotoQueue(h.sockets[0])
+      expect(h.controller.catchUpRender).not.toBeNull()
+      now += 2_000
+      h.controller.admitFrame(frame(5))
+      expect(snapshots.at(-1)).toBeNull()
+      expect(h.controller.catchUpRender).toBeNull()
+    } finally { clock.mockRestore(); await h.controller.stop() }
+  })
+
+  test("Stop deadline seals warm handover while old physical storage and append remain pending", async () => {
+    const storage = new FakeStorage()
+    const owner = new SessionJournalOwner(storage)
+    let deadline = Date.now() + 30_000
+    const a = harness({storage, journalOwner: owner, getStopDeadline: () => deadline})
+    await start(a)
+    let release!: () => void
+    storage.setGate = new Promise<void>(resolve => { release = resolve })
+    completeTurn(a, "Fictional original words.", "A fictional reply.")
+    await waitFor(() => storage.setCalls > 0)
+    const stopping = a.controller.stop(true)
+    deadline = Date.now() - 1
+    a.controller.refreshStopDeadline()
+    await stopping
+    expect(a.sockets[0].readyState).toBe(3)
+    const sealed = (await owner.read()).raw!
+    expect(sealed).toContain("Fictional original words.")
+    const b = harness({storage, journalOwner: owner})
+    const starting = b.controller.start()
+    await waitFor(() => b.sockets.length === 1)
+    b.sockets[0].open()
+    b.sockets[0].message({setupComplete: {}})
+    await starting
+    expect(b.requests.find(request => request.url.endsWith("/session/start"))?.body.recovery.events)
+      .toMatchObject([{content: "Fictional original words."}, {content: "A fictional reply."}])
+    expect(a.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+    const replacement = (await owner.read()).raw
+    const errors = a.persistenceErrors.length
+    storage.setGate = null
+    release()
+    await new Promise(resolve => setTimeout(resolve, 1))
+    expect(a.persistenceErrors).toHaveLength(errors)
+    expect((await owner.read()).raw).toBe(replacement)
+    expect((await owner.read()).raw ?? "").not.toContain("Fictional original words.")
+    await b.controller.stop()
+  })
+
+  test("replacement Start bypasses retired backup waits but its selected-photo commit still needs a real ACK", async () => {
+    const storage = new FakeStorage()
+    const owner = new SessionJournalOwner(storage)
+    let deadline = Date.now() + 30_000
+    const a = harness({storage, journalOwner: owner, getStopDeadline: () => deadline})
+    await start(a)
+    let release!: () => void
+    storage.setGate = new Promise<void>(resolve => { release = resolve })
+    completeTurn(a, "Fictional words to recover.", "A fictional reply.")
+    const stopping = a.controller.stop(true)
+    deadline = Date.now() - 1
+    a.controller.refreshStopDeadline()
+    await stopping
+    // The already-issued native operation remains held; byte writes need not share its lane.
+    storage.setGate = null
+    const b = harness({...selectionOptions, storage, journalOwner: owner,
+      startBody: {...fakeStart({}, 43), session_id: "selected-replacement", recovery: {sitting_id: "sitting-1", ack_sequence: 42}}})
+    await start(b, "continuous", "", LIVE, {callMode: "video", maxMemorizedPhotos: 1})
+    try {
+      await selectionOffer(b)
+      provisionalCaption(b.sockets[0], frame(1).imageId, "A newly selected fictional scene.", "new-selection")
+      await waitFor(() => b.controller.pendingImageIds.includes(frame(1).imageId) &&
+        Reflect.get(b.controller, "pendingImages").length === 1)
+      await new Promise(resolve => setTimeout(resolve, 1))
+      expect(b.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+      expect(functionResponses(b.sockets[0]).some(response => response.id === "new-selection")).toBe(false)
+      expect([...storage.values.keys()].some(key => key.startsWith("openalma:chosen-original:"))).toBe(true)
+      release()
+      await waitFor(() => functionResponses(b.sockets[0]).some(response => response.id === "new-selection"))
+      expect(functionResponses(b.sockets[0]).find(response => response.id === "new-selection")?.response).toEqual({ok: true, durable: true})
+      expect(b.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
+    } finally { release(); await b.controller.stop() }
+  })
+
+  test("warm rejected raw survives fresh-key preservation while the retired native write is still pending", async () => {
+    const storage = new FakeStorage()
+    const owner = new SessionJournalOwner(storage)
+    await owner.read()
+    const a = owner.acquire()
+    let release!: () => void
+    storage.setGate = new Promise<void>(resolve => { release = resolve })
+    const raw = '{"rejected":"unaltered fictional raw dialogue"}'
+    const writing = owner.write(raw, a)
+    await waitFor(() => storage.setCalls === 1)
+    owner.retire(a)
+    storage.setGate = null
+    const b = harness({storage, journalOwner: owner})
+    await start(b)
+    try {
+      expect(b.sockets[0].readyState).toBe(1)
+      release()
+      expect(await writing).toBe(true)
+      await waitFor(() => storage.values.has(`${JOURNAL_KEY}:1`))
+      expect(storage.values.get(JOURNAL_KEY)).toBe(raw)
+      expect(storage.values.get(`${JOURNAL_KEY}:1`)).toBe("")
+      expect(storage.values.has(RECOVERED_CHATS_KEY)).toBe(false)
+    } finally { release(); await b.controller.stop() }
+  })
+
+  test.each([false, true])("fresh rotation belongs to B's submission, not either queued retired A write (A timeout=%s)", async timeout => {
+    const storage = new FakeStorage()
+    const owner = new SessionJournalOwner(storage)
+    await owner.read()
+    const a = owner.acquire()
+    let release!: () => void
+    let reject!: (reason: Error) => void
+    storage.setGate = new Promise<void>((resolve, fail) => { release = resolve; reject = fail })
+    const first = owner.write("A's earlier snapshot", a)
+    await waitFor(() => storage.setCalls === 1)
+    const raw = '{"rejected":"A full final fictional conversation, preserved exactly"}'
+    const final = owner.write(raw, a)
+    owner.retire(a)
+    const b = owner.acquire()
+    owner.fresh()
+    const replacement = owner.write("B's replacement snapshot", b)
+    expect((await owner.read()).raw).toBe("B's replacement snapshot")
+    storage.setGate = null
+    if (timeout) reject(new Error("Native A timeout"))
+    else release()
+    expect(await first).toBe(!timeout)
+    expect(await final).toBe(true)
+    expect(await replacement).toBe(true)
+    const preservedKey = timeout ? `${JOURNAL_KEY}:1` : JOURNAL_KEY
+    const replacementKey = `${JOURNAL_KEY}:${timeout ? 2 : 1}`
+    if (timeout) storage.values.set(JOURNAL_KEY, "Late physical A's earlier snapshot")
+    expect(storage.values.get(preservedKey)).toBe(raw)
+    expect(storage.values.get(replacementKey)).toBe("B's replacement snapshot")
+    expect((await owner.read()).raw).toBe("B's replacement snapshot")
+  })
+
+  test.each([false, true])("warm selected mediaRef needs B's own commit before automatic filing/cache cleanup (A write fails=%s)", async fails => {
+    const storage = new FakeStorage()
+    const owner = new SessionJournalOwner(storage)
+    let deadline = Date.now() + 30_000
+    const a = harness({...selectionOptions, storage, journalOwner: owner, getStopDeadline: () => deadline})
+    await start(a, "continuous", "", LIVE, {callMode: "video", maxMemorizedPhotos: 1})
+    await selectionOffer(a)
+    const set = storage.set.bind(storage)
+    let release!: () => void
+    let reject!: (reason: Error) => void
+    const nativeWrite = new Promise<void>((resolve, fail) => { release = resolve; reject = fail })
+    let issued = false
+    storage.set = async (key, value) => {
+      if (!issued && key.startsWith(JOURNAL_KEY) && value && JSON.parse(value).pendingImages?.some((image: any) => image.selected && image.mediaRef)) {
+        issued = true
+        await nativeWrite
+      }
+      await set(key, value)
+    }
+    provisionalCaption(a.sockets[0], frame(2).imageId, "A fictional original across controllers.")
+    await waitFor(() => issued)
+    const original = Reflect.get(a.controller, "pendingImages")[0]
+    const stopping = a.controller.stop()
+    deadline = Date.now() - 1
+    a.controller.refreshStopDeadline()
+    await stopping
+    expect(a.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
+    expect(storage.values.has(original.selected.cacheKey)).toBe(true)
+    const history: any[] = []
+    const b = harness({storage, journalOwner: owner, history, startBody: {
+      ...fakeStart({}, 42), session_id: "warm-selected-replacement", recovery: {sitting_id: "sitting-1", ack_sequence: 41},
+    }})
+    await start(b, "continuous", "", LIVE, {callMode: "video", maxMemorizedPhotos: 1})
+    try {
+      await waitFor(() => Reflect.get(b.controller, "imageUpload") !== null)
+      expect(Reflect.get(b.controller, "selectedMediaCommitted").has(Reflect.get(b.controller, "pendingImages")[0])).toBe(false)
+      expect(b.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
+      expect(storage.values.has(original.selected.cacheKey)).toBe(true)
+      expect(b.controller.pendingImageIds).toContain(original.imageId)
+      if (fails) reject(new Error("Native media-reference commit timed out"))
+      else release()
+      await waitFor(() => b.photoCaptions.some(caption => caption.durable))
+      await waitFor(() => !b.controller.pendingImageIds.includes(original.imageId))
+      expect(storage.values.has(original.selected.cacheKey)).toBe(false)
+      expect(b.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+      expect(b.requests.filter(request => request.url.endsWith("/snapshot/finalize")))
+        .toMatchObject([{body: {image_id: original.imageId, caption_event_id: original.captionEventId}}])
+      expect(history.some(row => row.event_kind === "photo_caption")).toBe(false)
+      expect(b.controller.pendingPhotoIds).toEqual([])
+    } finally { release(); storage.set = set; await b.controller.stop() }
+  })
+
+  test("Video sends ordered paced model copies even when original retention is full", async () => {
+    const h = harness({frameRetention: {maxFrames: 1, maxEncodedBytes: 8}})
+    await start(h, "continuous", "", LIVE, {callMode: "video", maxMemorizedPhotos: 1})
+    let now = Date.now()
+    const clock = spyOn(Date, "now").mockImplementation(() => now)
+    try {
+      h.controller.setVisionAvailability(true)
+      expect(h.controller.admitFrame(frame(2))).toEqual({retained: true, delivery: "sent"})
+      expect(h.controller.admitFrame(frame(2))).toEqual({retained: true, delivery: "not-sent"})
+      expect(h.controller.admitFrame(frame(1))).toMatchObject({retained: false, reason: "stale"})
+      now += 2_000
+      expect(h.controller.admitFrame({...frame(3), data: "AQIDBAUG"})).toEqual({retained: false, delivery: "sent"})
+      const sent = h.sockets[0].sent.map(value => JSON.parse(value)).filter(message => message.realtimeInput?.video)
+      expect(sent.map(message => message.realtimeInput.video)).toEqual([
+        {data: "BAUG", mimeType: "image/jpeg"}, {data: "BAUG", mimeType: "image/jpeg"},
+      ])
+      expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+      expect(h.requests.find(request => request.url.endsWith("/session/start"))?.body.vision).toBe(true)
+      h.controller.setVisionAvailability(false)
+      now += 2_000
+      expect(h.controller.admitFrame(frame(4))).toMatchObject({delivery: "not-sent"})
+    } finally { clock.mockRestore(); await h.controller.stop() }
+  })
+
+  test.each(["send", "late", "hidden"])("one catch-up attempt owns exact originals and retires on %s", async outcome => {
+    const h = harness({storage: new FakeStorage(), frameRetention: {maxFrames: 12, maxEncodedBytes: 256}})
+    await start(h, "continuous", "", LIVE, {callMode: "video", maxMemorizedPhotos: 1})
+    try {
+      h.controller.setVisionAvailability(true)
+      await h.controller.sendImage({imageId: "catch-up-photo", mimeType: "image/png", data: "AQID"})
+      await waitPhotoTask(h.sockets[0], "catch-up-photo")
+      h.controller.admitFrame(frame(1))
+      h.controller.admitFrame(frame(2))
+      provisionalCaption(h.sockets[0], "catch-up-photo", "A fictional silver kite.")
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "caption-catch-up-photo"))
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      await waitFor(() => h.controller.catchUpRender !== null)
+      const attempt = h.controller.catchUpRender!
+      expect(attempt.imageIds).toEqual([frame(1).imageId, frame(2).imageId])
+      const before = h.sockets[0].sent.length
+      const clock = outcome === "late" ? spyOn(Date, "now").mockReturnValue(Date.now() + 2_001) : null
+      try {
+        if (outcome === "hidden") h.controller.setVisionAvailability(false)
+        h.controller.submitCatchUp({startGeneration: 1, renderId: attempt.renderId, data: "AQID"})
+        h.controller.submitCatchUp({startGeneration: 1, renderId: attempt.renderId, data: "AQID"})
+        const sent = h.sockets[0].sent.slice(before).map(value => JSON.parse(value)).filter(message => message.realtimeInput?.video)
+        expect(sent).toHaveLength(outcome === "send" ? 1 : 0)
+        if (outcome === "send") expect(sent[0].realtimeInput.text).toContain("Reading order is like prose in a book.")
+        expect(h.controller.catchUpRender).toBeNull()
+        expect(h.controller.readFrames(attempt.imageIds)).toEqual([frame(1), frame(2)])
+      } finally { clock?.mockRestore() }
+    } finally { await h.controller.stop() }
+  })
+
+  test("session journal isolates late physical writes and retires old producers", async () => {
+    const storage = new FakeStorage()
+    const owner = new SessionJournalOwner(storage)
+    await owner.read()
+    const a = owner.acquire()
+    let fail!: () => void
+    const first = new Promise<void>((_resolve, reject) => {fail = () => reject(new Error("Native timeout"))})
+    storage.setGate = first
+    const writeA = owner.write("old snapshot", a)
+    await waitFor(() => storage.setCalls === 1)
+    owner.retire(a)
+    const b = owner.acquire()
+    const writeB = owner.write("new snapshot", b)
+    expect((await owner.read()).raw).toBe("new snapshot")
+    expect(await owner.write("stale callback", a)).toBe(false)
+    storage.setGate = null
+    fail()
+    expect(await writeA).toBe(false)
+    expect(await writeB).toBe(true)
+    storage.values.set(JOURNAL_KEY, "late physical old snapshot")
+    expect(storage.values.get(`${JOURNAL_KEY}:1`)).toBe("new snapshot")
+    expect((await owner.read()).raw).toBe("new snapshot")
+  })
 
   test("passive intake needs explicit valid limits, not a hidden vision default", async () => {
     expect(() => harness({frameRetention: {maxFrames: 0, maxEncodedBytes: 8}})).toThrow("retention limits")
@@ -1341,7 +2044,8 @@ describe("GeminiLiveController", () => {
         h.controller.refreshStopDeadline()
       }
       await stopping
-      const summaries = h.requests.flatMap(request => request.body.events ?? []).filter(event => event.event_kind === "sitting_summary")
+      const summaries = (expiry === "shared" ? Reflect.get(h.controller, "pendingEvents") :
+        h.requests.flatMap(request => request.body.events ?? [])).filter((event: any) => event.event_kind === "sitting_summary")
       expect(summaries).toHaveLength(1)
       expect(summaries[0]).toMatchObject({role: "assistant", content: "I enjoyed our fictional walk"})
       expect(summaries[0]).not.toHaveProperty("status")
@@ -3720,7 +4424,7 @@ describe("GeminiLiveController", () => {
     expect(storage.values.get(JOURNAL_KEY)).toBe("")
   })
 
-  test("Stop stays muted while timeout recovery is blocked on local storage", async () => {
+  test("Stop detaches local storage at expiry and stays muted after retirement", async () => {
     const storage = new FakeStorage()
     let finishReplay!: () => void
     const h = harness({storage, photoDrainTimeoutMs: 5,
@@ -3741,7 +4445,9 @@ describe("GeminiLiveController", () => {
     const stopping = h.controller.stop(true)
     try {
       await waitFor(() => storage.setCalls > before && h.photoRetryChanges.at(-1) === true)
-      expect(h.requests.some(request => request.url.endsWith("/end"))).toBe(false)
+      await stopping
+      expect(h.requests.some(request => request.url.endsWith("/end"))).toBe(true)
+      expect(h.sockets[0].readyState).toBe(3)
       finishReplay()
       await new Promise(resolve => setTimeout(resolve, 0))
       expect(h.sockets[0].sent.filter(value => photoInput(JSON.parse(value)))).toHaveLength(1)
@@ -7016,7 +7722,7 @@ describe("GeminiLiveController", () => {
       }})
       expect(h.audio).toEqual(["AAAAAA=="])
       await h.controller.stop(true)
-      const rows = h.requests.flatMap(request => request.body.events ?? [])
+      const rows = Reflect.get(h.controller, "pendingEvents") as any[]
       expect(rows.filter(row => row.role === "assistant"))
         .toMatchObject([{event_kind: "transcript_gap", content: "Transcript unavailable."}])
       expect(h.persistenceErrors).toContain("Some spoken words could not be transcribed")
@@ -7402,7 +8108,9 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.sockets.length === 2)
     h.sockets[1].error()
     await h.controller.stop()
-    await waitFor(() => h.reconnecting.at(-1) === false)
+    const published = [...h.reconnecting]
+    await waitFor(() => Reflect.get(h.controller, "reconnecting") === false)
+    expect(h.reconnecting).toEqual(published)
 
     expect(h.errors).toEqual([])
     expect(h.sockets).toHaveLength(2)

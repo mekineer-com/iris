@@ -2,10 +2,11 @@ import {describe, expect, spyOn, test} from "bun:test"
 import {SpeakerStreamWriter} from "@mentra/miniapp"
 
 import type {GeminiCallbacks} from "./GeminiLiveController"
-import {GeminiLiveController, JOURNAL_KEY, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
+import {GeminiLiveController, JOURNAL_KEY, RECOVERED_CHATS_KEY, SessionJournalOwner} from "./GeminiLiveController"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import {SessionController} from "./SessionController"
-import type {FrameIntakeResult, LiveModel, MicSource, PassiveFrame, SessionSnapshot as Snapshot} from "../shared/types"
+import type {CatchUpRender, CatchUpResult, FrameIntakeResult, LiveModel, MicSource, PassiveFrame, SessionSnapshot as Snapshot, VisionStart} from "../shared/types"
+import {VISION_SETTINGS} from "../shared/types"
 
 const CONFIG: OpenAlmaConfig = {
   baseUrl: "http://127.0.0.1:9999",
@@ -34,14 +35,18 @@ function testPcm(value: number): string {
   return Buffer.alloc(8, value).toString("base64")
 }
 
-function passiveFrame(imageId = "camera-frame"): PassiveFrame {
-  return {imageId, mimeType: "image/jpeg", data: "AQID", modelData: "BAUG",
+function passiveFrame(imageId = "camera-frame", reservationSequence = 1): PassiveFrame {
+  return {imageId, reservationSequence, mimeType: "image/jpeg", data: "AQID", modelData: "BAUG",
     time: {source: "receipt", timestamp: "2026-01-02T03-04-05", receivedAt: 1_767_323_045_000}}
 }
 
 class FakeLive {
   model = ""
   modelChoices: Array<LiveModel | undefined> = []
+  visionStarts: Array<VisionStart | undefined> = []
+  catchUpRender: CatchUpRender | null = null
+  catchUpResults: CatchUpResult[] = []
+  visionAvailability: boolean[] = []
   frames: PassiveFrame[] = []
   frameDeliveryOpen = false
   stopDeadlineRefreshes = 0
@@ -70,7 +75,8 @@ class FakeLive {
 
   constructor(readonly callbacks: GeminiCallbacks) {}
 
-  async start(mode = "continuous", model?: LiveModel): Promise<void> {
+  async start(mode = "continuous", model?: LiveModel, vision?: VisionStart): Promise<void> {
+    this.visionStarts.push(vision)
     this.modelChoices.push(model)
     this.model = model ?? "custom-configured-model"
     this.starts += 1
@@ -80,6 +86,11 @@ class FakeLive {
 
   resumeBackgroundWork(): void { this.resumptions += 1 }
   refreshStopDeadline(): void { this.stopDeadlineRefreshes += 1 }
+  setVisionAvailability(available: boolean): void {
+    this.visionAvailability.push(available)
+    if (!available) this.catchUpRender = null
+  }
+  submitCatchUp(result: CatchUpResult): void { this.catchUpResults.push(result) }
 
   sendAudio(data: string, source?: MicSource): void {
     this.sent.push(data)
@@ -99,8 +110,8 @@ class FakeLive {
   admitFrame(frame: PassiveFrame, allowNew = true): FrameIntakeResult {
     if (this.frames.some(previous => previous.imageId === frame.imageId)) return {retained: true, delivery: "not-sent"}
     if (!allowNew) return {retained: false, delivery: "not-sent", reason: "unavailable"}
-    const {imageId, mimeType, data, modelData, time} = frame
-    this.frames.push({imageId, mimeType, data, modelData, time: {...time}})
+    const {imageId, reservationSequence, mimeType, data, modelData, time} = frame
+    this.frames.push({imageId, reservationSequence, mimeType, data, modelData, time: {...time}})
     return {retained: true, delivery: "not-sent"}
   }
 
@@ -183,7 +194,7 @@ class FakeSession {
     aborted: boolean
     closed: boolean
   }> = []
-  handlers: Record<string, (payload: unknown) => unknown> = {}
+  handlers: Record<string, (payload: unknown, ctx?: {signal: AbortSignal}) => unknown> = {}
   onOpenCb: (() => void) | null = null
   onCloseCb: (() => void) | null = null
   snapshots: Snapshot[] = []
@@ -223,8 +234,8 @@ class FakeSession {
       this.handlers[channel] = cb
       return () => {delete this.handlers[channel]}
     },
-    handle: (channel: string, handler: (payload: unknown) => unknown) => {
-      this.handlers[channel] = handler
+    handle: (channel: string, handler: (payload: unknown, ctx: {signal: AbortSignal}) => unknown) => {
+      this.handlers[channel] = (payload, ctx = {signal: new AbortController().signal}) => handler(payload, ctx)
       return () => delete this.handlers[channel]
     },
   }
@@ -347,6 +358,10 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
   return session.snapshots.at(-1)
 }
 
+function journalOwner(controller: SessionController): SessionJournalOwner {
+  return (controller as unknown as {journalOwner: SessionJournalOwner}).journalOwner
+}
+
 const flush = () => new Promise(resolve => setTimeout(resolve, 0))
 
 function sdkSpeaker(session: FakeSession, onClose: (streamId: string) => Promise<void>) {
@@ -363,6 +378,222 @@ function sdkSpeaker(session: FakeSession, onClose: (streamId: string) => Promise
 }
 
 describe("SessionController", () => {
+  test("call mode defaults to Audio and Video works with Manual/Thinking without mid-sitting switches", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(h.live.visionStarts).toEqual([{callMode: "audio", maxMemorizedPhotos: 1}])
+    expect(lastSnapshot(h.session)).toMatchObject({callMode: "audio", maxMemorizedPhotos: 1, catchUpRender: null})
+    await h.session.handlers["openalma:stop"]({})
+    await h.session.handlers["openalma:set-model"]({model: "gemini-3.8-live-extended-thinking"})
+    await h.session.handlers["openalma:set-max-memorized-photos"]({value: 3})
+    await h.session.handlers["openalma:start"]({mode: "manual", callMode: "video"})
+    expect(h.live.visionStarts).toEqual([{callMode: "video", maxMemorizedPhotos: 3}])
+    expect(h.live.modelChoices).toEqual(["gemini-3.8-live-extended-thinking"])
+    await h.session.handlers["openalma:start"]({mode: "continuous", callMode: "audio"})
+    expect(lastSnapshot(h.session)).toMatchObject({callMode: "video", mode: "manual"})
+    expect(h.live.starts).toBe(1)
+    await h.session.handlers["openalma:set-max-memorized-photos"]({value: 5})
+    expect(lastSnapshot(h.session)?.maxMemorizedPhotos).toBe(5)
+    expect(h.live.visionStarts).toEqual([{callMode: "video", maxMemorizedPhotos: 3}])
+    await h.session.handlers["openalma:stop"]({})
+    await expect(h.session.handlers["openalma:start"]({callMode: "invalid"})).rejects.toThrow("Invalid call mode")
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(h.live.visionStarts).toEqual([{callMode: "audio", maxMemorizedPhotos: 5}])
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test.each(["1", "5", "0", "6", "2.5", "", "NaN"])("saved photo allowance %j is bounded on load", async saved => {
+    const h = setup({stored: {"openalma.max-memorized-photos": saved}})
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(lastSnapshot(h.session)?.maxMemorizedPhotos).toBe(saved === "5" ? 5 : 1)
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test("photo allowance confirms writes, rejects invalid input, and Start uses the last confirmed preference", async () => {
+    const h = setup({stored: {"openalma.max-memorized-photos": "2"}})
+    await flush()
+    for (const value of [undefined, null, "3", 0, 6, 1.5, NaN, Infinity]) {
+      await expect(h.session.handlers["openalma:set-max-memorized-photos"]({value})).rejects.toThrow("Invalid Maximum")
+    }
+    let release!: () => void
+    const set = h.session.storage.set
+    h.session.storage.set = async (key, value) => {
+      if (key === "openalma.max-memorized-photos") {
+        await new Promise<void>(resolve => {release = resolve})
+        throw new Error("Fictional preference failure")
+      }
+      await set(key, value)
+    }
+    const saving = h.session.handlers["openalma:set-max-memorized-photos"]({value: 4}) as Promise<unknown>
+    const failed = saving.catch(error => error.message)
+    await flush()
+    await h.session.handlers["openalma:start"]({mode: "continuous", callMode: "video"})
+    expect(h.live.visionStarts).toEqual([{callMode: "video", maxMemorizedPhotos: 2}])
+    expect(lastSnapshot(h.session)?.maxMemorizedPhotos).toBe(2)
+    release()
+    expect(await failed).toBe("Fictional preference failure")
+    expect(lastSnapshot(h.session)?.maxMemorizedPhotos).toBe(2)
+    h.session.storage.set = set
+    await h.session.handlers["openalma:set-max-memorized-photos"]({value: 4})
+    expect(h.session.stored.get("openalma.max-memorized-photos")).toBe("4")
+    expect(h.live.visionStarts).toEqual([{callMode: "video", maxMemorizedPhotos: 2}])
+    await h.session.handlers["openalma:stop"]({})
+    const restored = setup({stored: Object.fromEntries(h.session.stored)})
+    await restored.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(restored.live.visionStarts).toEqual([{callMode: "audio", maxMemorizedPhotos: 4}])
+    await restored.session.handlers["openalma:stop"]({})
+  })
+
+  test("catch-up snapshots and result handlers fence visibility, capability, connection and sitting ownership", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous", callMode: "video"})
+    const live = h.live
+    const render = {renderId: "fictional-render", imageIds: ["fictional-frame"]}
+    live.catchUpRender = render
+    live.callbacks.onFrameDeliveryChange!(true)
+    expect(lastSnapshot(h.session)?.catchUpRender).toEqual(render)
+    const result = {startGeneration: 1, renderId: render.renderId, data: "AQID"}
+    const submit = h.session.handlers["openalma:catch-up-rendered"]
+    await submit(result)
+    await submit({...result, data: undefined, error: "Fictional decode failure"})
+    expect(live.catchUpResults).toHaveLength(2)
+    h.session.onCloseCb!()
+    expect(live.visionAvailability.at(-1)).toBe(false)
+    expect(lastSnapshot(h.session)?.catchUpRender).toBeNull()
+    await submit(result)
+    h.session.onOpenCb!()
+    expect(live.visionAvailability.at(-1)).toBe(true)
+    await h.session.handlers["openalma:set-capabilities"]({cameraEnabled: false})
+    await submit(result)
+    await h.session.handlers["openalma:set-capabilities"]({cameraEnabled: true})
+    live.reconnecting(true)
+    await submit(result)
+    live.reconnecting(false)
+    await flush()
+    await submit({...result, startGeneration: 0})
+    expect(live.catchUpResults).toHaveLength(2)
+    let release!: () => void
+    live.stopGate = new Promise<void>(resolve => {release = resolve})
+    const stopping = h.session.handlers["openalma:stop"]({})
+    expect(live.visionAvailability.at(-1)).toBe(false)
+    h.session.onOpenCb!()
+    expect(live.visionAvailability.at(-1)).toBe(false)
+    await submit(result)
+    await submit({...result, startGeneration: 2})
+    release()
+    await stopping
+    await h.session.handlers["openalma:start"]({mode: "continuous", callMode: "video"})
+    await submit(result)
+    expect(live.catchUpResults).toHaveLength(2)
+    expect(h.live.catchUpResults).toEqual([])
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test("camera disable invalidates catch-up before even a combined microphone preference write", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous", callMode: "video"})
+    h.live.catchUpRender = {renderId: "fictional-render", imageIds: ["fictional-frame"]}
+    let release!: () => void
+    const set = h.session.storage.set
+    h.session.storage.set = async (key, value) => {
+      expect(h.live.visionAvailability.at(-1)).toBe(false)
+      expect(h.live.catchUpRender).toBeNull()
+      if (key === "openalma.microphone-enabled") await new Promise<void>(resolve => {release = resolve})
+      await set(key, value)
+    }
+    const saving = h.session.handlers["openalma:set-capabilities"]({microphoneEnabled: false, cameraEnabled: false})
+    await flush()
+    expect(lastSnapshot(h.session)?.cameraEnabled).toBe(false)
+    await h.session.handlers["openalma:catch-up-rendered"]({startGeneration: 1, renderId: "fictional-render", data: "AQID"})
+    expect(h.live.catchUpResults).toEqual([])
+    release()
+    await saving
+    h.session.storage.set = set
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test("frame RPC cancellation before and across preference waits never reaches intake", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous", callMode: "video"})
+    const intake = spyOn(h.live, "admitFrame")
+    const frame = {...passiveFrame("fictional-frame", 7), startGeneration: 1}
+    const abort = new AbortController()
+    abort.abort()
+    await expect(h.session.handlers["openalma:frame"](frame, {signal: abort.signal})).rejects.toMatchObject({name: "AbortError"})
+    const during = new AbortController()
+    const pending = h.session.handlers["openalma:frame"](frame, {signal: during.signal})
+    during.abort()
+    await expect(pending).rejects.toMatchObject({name: "AbortError"})
+    expect(intake).not.toHaveBeenCalled()
+    await h.session.handlers["openalma:frame"](frame)
+    expect(intake).toHaveBeenCalledWith(frame, true)
+    expect(h.live.frames[0].reservationSequence).toBe(7)
+    intake.mockRestore()
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test("the real factory shares the session journal owner and consumes vision retention settings or the explicit override", async () => {
+    const instances: GeminiLiveController[] = []
+    const start = spyOn(GeminiLiveController.prototype, "start").mockImplementation(async function(this: GeminiLiveController) {
+      instances.push(this)
+    })
+    const stop = spyOn(GeminiLiveController.prototype, "stop").mockResolvedValue(undefined)
+    try {
+      for (const frameRetention of [undefined, {maxFrames: 2, maxEncodedBytes: 256}]) {
+        const session = new FakeSession()
+        session.stored.set("openalma.soul-id", CONFIG.soulId)
+        const controller = new SessionController(session as never, {config: CONFIG, frameRetention,
+          fetchFn: withOwnerDiscovery((async () => Response.json({souls: [CONFIG.soulId]})) as typeof fetch)})
+        controller.start()
+        await session.handlers["openalma:start"]({mode: "continuous", callMode: "video"})
+        const live = instances.at(-1)! as unknown as {journalOwner: SessionJournalOwner; frameRetention: unknown}
+        expect(live.journalOwner).toBe(journalOwner(controller))
+        expect(live.frameRetention).toMatchObject(frameRetention ?? {
+          maxFrames: VISION_SETTINGS.maxFrames, maxEncodedBytes: VISION_SETTINGS.maxEncodedBytes,
+        })
+        await session.handlers["openalma:stop"]({})
+        await session.handlers["openalma:start"]({mode: "continuous"})
+        expect((instances.at(-1)! as unknown as {journalOwner: SessionJournalOwner}).journalOwner).toBe(live.journalOwner)
+        await session.handlers["openalma:stop"]({})
+      }
+    } finally {
+      start.mockRestore()
+      stop.mockRestore()
+    }
+  })
+
+  test("recovery-lock and preference warm reads use the latest logical journal while its physical write is pending", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const raw = JSON.stringify({version: 3,
+      scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
+      pendingImages: [{imageId: "fictional-pending-photo"}],
+    })
+    let release!: () => void
+    let entered!: () => void
+    const gate = new Promise<void>(resolve => {release = resolve})
+    const writing = new Promise<void>(resolve => {entered = resolve})
+    const set = h.session.storage.set
+    h.session.storage.set = async (key, value) => {
+      if (key.startsWith(JOURNAL_KEY)) {entered(); await gate}
+      await set(key, value)
+    }
+    const owner = journalOwner(h.controller)
+    const pending = owner.write(raw, owner.acquire())
+    await writing
+    try {
+      expect([...h.session.stored.values()]).not.toContain(raw)
+      await h.session.handlers["openalma:stop"]({})
+      expect(lastSnapshot(h.session)?.soulLocked).toBe(true)
+      await h.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://fictional-repair.example"})
+      expect(lastSnapshot(h.session)).toMatchObject({soulLocked: true, soulId: CONFIG.soulId})
+    } finally {
+      release()
+      expect(await pending).toBe(true)
+      h.session.storage.set = set
+    }
+  })
+
   test("model choice defaults to server configuration and stays fixed while active", async () => {
     const h = setup()
     await h.session.handlers["openalma:start"]({mode: "manual"})
@@ -946,6 +1177,7 @@ describe("SessionController", () => {
     })
     const first = await Promise.all([reserve(), reserve(), reserve()])
     expect(first.map(result => result.imageId)).toEqual([time.timestamp, `${time.timestamp}-2`, `${time.timestamp}-3`])
+    expect(first.map(result => result.reservationSequence)).toEqual([1, 2, 3])
     expect((await reserve("2026-10-22T12-00-00")).imageId).toBe("2026-10-22T12-00-00")
     expect((await reserve()).imageId).toBe(`${time.timestamp}-4`)
     await h.session.handlers["openalma:stop"]({})
@@ -957,6 +1189,95 @@ describe("SessionController", () => {
     expect((await reserve()).imageId).toBe(time.timestamp)
     expect([...h.session.stored.keys()].filter(key => key.startsWith("openalma:image-references:"))).toHaveLength(3)
     expect(h.live.images).toEqual([])
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test("cancelled queued reservations skip storage and do not consume an allocation sequence", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous", callMode: "video"})
+    const set = h.session.storage.set
+    let release!: () => void
+    let entered!: () => void
+    const writing = new Promise<void>(resolve => {entered = resolve})
+    const gate = new Promise<void>(resolve => {release = resolve})
+    let writes = 0
+    h.session.storage.set = async (key, value) => {
+      if (key.startsWith("openalma:image-references:")) {writes += 1; entered(); await gate}
+      await set(key, value)
+    }
+    const payload = {startGeneration: 1, time: passiveFrame().time}
+    const reserve = h.session.handlers["openalma:reserve-image"]
+    const first = reserve(payload)
+    await writing
+    const cancellation = new AbortController()
+    const queued = reserve(payload, {signal: cancellation.signal}) as Promise<unknown>
+    const cancelled = queued.catch(error => error.name)
+    await flush()
+    cancellation.abort()
+    release()
+    expect(await first).toMatchObject({imageId: payload.time.timestamp, reservationSequence: 1})
+    expect(await cancelled).toBe("AbortError")
+    expect(writes).toBe(1)
+    expect(await reserve(payload)).toMatchObject({imageId: `${payload.time.timestamp}-2`, reservationSequence: 2})
+    h.session.storage.set = set
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test("cancellation during a reservation write consumes its suffix but not an issued sequence", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous", callMode: "video"})
+    const set = h.session.storage.set
+    let release!: () => void
+    let entered!: () => void
+    const writing = new Promise<void>(resolve => {entered = resolve})
+    const gate = new Promise<void>(resolve => {release = resolve})
+    h.session.storage.set = async (key, value) => {
+      if (key.startsWith("openalma:image-references:")) {entered(); await gate}
+      await set(key, value)
+    }
+    const payload = {startGeneration: 1, time: passiveFrame().time}
+    const cancellation = new AbortController()
+    const pending = h.session.handlers["openalma:reserve-image"](payload, {signal: cancellation.signal}) as Promise<unknown>
+    const cancelled = pending.catch(error => error.name)
+    await writing
+    cancellation.abort()
+    release()
+    expect(await cancelled).toBe("AbortError")
+    h.session.storage.set = set
+    expect(await h.session.handlers["openalma:reserve-image"](payload))
+      .toMatchObject({imageId: `${payload.time.timestamp}-2`, reservationSequence: 1})
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test("archive naming evidence loads after startup recovery once per sitting while live IDs stay fresh", async () => {
+    let release!: () => void
+    const h = setup({startGate: new Promise<void>(resolve => {release = resolve})})
+    const starting = h.session.handlers["openalma:start"]({mode: "continuous", callMode: "video"})
+    await flush()
+    const timestamp = passiveFrame().time.timestamp
+    const owner = journalOwner(h.controller)
+    await owner.archive(JSON.stringify({version: 3, scope: {userId: CONFIG.userId, soulId: CONFIG.soulId},
+      pendingImages: [{imageId: `${timestamp}-8`}]}), owner.acquire())
+    const get = h.session.storage.get
+    let archiveReads = 0
+    h.session.storage.get = async key => {
+      if (key === RECOVERED_CHATS_KEY) archiveReads += 1
+      return get(key)
+    }
+    expect(archiveReads).toBe(0)
+    release()
+    await starting
+    const reserve = () => h.session.handlers["openalma:reserve-image"]({
+      startGeneration: lastSnapshot(h.session)!.startGeneration, time: passiveFrame().time,
+    })
+    expect(await reserve()).toMatchObject({imageId: `${timestamp}-9`})
+    h.live.pendingImageIds = [`${timestamp}-15`]
+    expect(await reserve()).toMatchObject({imageId: `${timestamp}-16`})
+    expect(archiveReads).toBe(1)
+    await h.session.handlers["openalma:stop"]({})
+    await h.session.handlers["openalma:start"]({mode: "continuous", callMode: "video"})
+    expect(await reserve()).toMatchObject({imageId: `${timestamp}-17`})
+    expect(archiveReads).toBe(2)
     await h.session.handlers["openalma:stop"]({})
   })
 
@@ -976,7 +1297,7 @@ describe("SessionController", () => {
     expect(h.live.pendingPhotoIds).toEqual([])
     const result = await h.session.handlers["openalma:reserve-image"]({startGeneration: 1,
       time: {timestamp, source: "receipt", receivedAt: 1}})
-    expect(result).toEqual({startGeneration: 1, imageId: `${timestamp}-9`})
+    expect(result).toEqual({startGeneration: 1, imageId: `${timestamp}-9`, reservationSequence: 1})
     expect(h.live.pendingImageIds).toEqual([pendingId])
     expect(h.session.stored.get(RECOVERED_CHATS_KEY)).toContain("unreadable historical backup")
     await h.session.handlers["openalma:stop"]({})
@@ -1025,7 +1346,7 @@ describe("SessionController", () => {
     h.session.storage.set = set
     await h.session.handlers["openalma:start"]({mode: "continuous"})
     expect(await h.session.handlers["openalma:reserve-image"]({startGeneration: 3, time}))
-      .toEqual({startGeneration: 3, imageId: `${time.timestamp}-2`})
+      .toEqual({startGeneration: 3, imageId: `${time.timestamp}-2`, reservationSequence: 1})
     expect(h.live.images).toEqual([])
     await h.session.handlers["openalma:stop"]({})
   })
@@ -1046,7 +1367,7 @@ describe("SessionController", () => {
     await h.session.handlers["openalma:set-capabilities"]({cameraEnabled: true})
     await expect(h.session.handlers["openalma:reserve-image"]({startGeneration: 0, time})).rejects.toThrow("inactive sitting")
     expect(await h.session.handlers["openalma:reserve-image"]({startGeneration: 1, time}))
-      .toEqual({startGeneration: 1, imageId: time.timestamp})
+      .toEqual({startGeneration: 1, imageId: time.timestamp, reservationSequence: 1})
     await h.session.handlers["openalma:stop"]({})
   })
   test("Stop completes photo recovery status without the host's URLSearchParams global", async () => {
@@ -1947,18 +2268,19 @@ describe("SessionController", () => {
       pendingTranscripts: [{content: "Fictional pending transcript"}],
       pendingImage: {imageId: "fictional-photo"},
     })
-    h.session.stored.set("openalma:gemini-session-v1", journal)
+    const owner = journalOwner(h.controller)
+    await owner.write(journal, owner.acquire())
     await h.session.handlers["openalma:stop"]({})
     expect(lastSnapshot(h.session)).toMatchObject({connection: "idle", soulLocked: true})
     await expect(h.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true})).rejects.toThrow("Finish or recover")
     await h.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://repaired.example"})
-    expect(h.session.stored.get("openalma:gemini-session-v1")).toBe(journal)
+    expect((await owner.read()).raw).toBe(journal)
     await h.session.handlers["openalma:start"]({mode: "continuous"})
     expect(h.live).not.toBe(previousController)
     expect(previousController.stops).toBe(1)
     expect(h.configs.map((config) => config.baseUrl)).toEqual([CONFIG.baseUrl, "http://repaired.example"])
     expect(h.configs.map((config) => config.soulId)).toEqual([CONFIG.soulId, CONFIG.soulId])
-    h.session.stored.delete("openalma:gemini-session-v1")
+    await owner.write("", owner.acquire())
     await h.session.handlers["openalma:stop"]({})
     await h.session.handlers["openalma:set-soul"]({soulId: "Other Soul", useExisting: true})
     expect(lastSnapshot(h.session)).toMatchObject({soulId: "Other Soul", soulLocked: false})
@@ -2054,7 +2376,8 @@ describe("SessionController", () => {
     await locked.session.handlers["openalma:set-profile"](CONFIG)
     expect(lastSnapshot(locked.session)).toMatchObject({soulId: "Recovery Soul", soulLocked: true})
     locked.session.storage.keys = keys
-    locked.session.stored.set(`${JOURNAL_KEY}:10`, "")
+    const owner = journalOwner(locked.controller)
+    await owner.write("", owner.acquire())
     await locked.session.handlers["openalma:set-profile"](CONFIG)
     expect(lastSnapshot(locked.session)).toMatchObject({soulId: CONFIG.soulId, soulLocked: false})
 
@@ -2562,6 +2885,9 @@ describe("SessionController", () => {
     const harness = setup()
     harness.session.onOpenCb?.()
     expect(harness.session.snapshots[0]).toEqual({
+      callMode: "audio",
+      maxMemorizedPhotos: 1,
+      catchUpRender: null,
       modelChoice: null,
       model: null,
       configuredModel: null,
