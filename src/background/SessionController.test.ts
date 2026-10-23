@@ -1,4 +1,5 @@
 import {describe, expect, test} from "bun:test"
+import {SpeakerStreamWriter} from "@mentra/miniapp"
 
 import type {GeminiCallbacks} from "./GeminiLiveController"
 import {GeminiLiveController, JOURNAL_KEY, RECOVERED_CHATS_KEY} from "./GeminiLiveController"
@@ -225,10 +226,12 @@ class FakeSession {
       this.streams.push(rec)
       return {
         write: async (chunk: unknown) => {
+          if (rec.closed || rec.aborted) throw new Error("SpeakerStreamWriter is already closed/aborted")
           rec.writes.push(chunk)
           return {bufferedMs: 0}
         },
         writeBase64: async (chunk: string) => {
+          if (rec.closed || rec.aborted) throw new Error("SpeakerStreamWriter is already closed/aborted")
           rec.writes.push(chunk)
           return {bufferedMs: 0}
         },
@@ -1517,6 +1520,85 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:stop"]({})
     for (const action of ["retry", "discard"]) {
       await expect(harness.session.handlers["openalma:pending-image"]({action, imageId: image.imageId})).rejects.toThrow("Unknown failed photo")
+    }
+  })
+
+  test("ordinary response overlap waits for drain and uses a fresh SDK writer", async () => {
+    const h = setup()
+    let releaseA!: () => void
+    let releaseB!: () => void
+    const drainA = new Promise<void>(resolve => {releaseA = resolve})
+    const drainB = new Promise<void>(resolve => {releaseB = resolve})
+    const messages: Array<{type: string; streamId: string; base64?: string}> = []
+    let streamId = 0
+    h.session.speaker.createStream = async () => new SpeakerStreamWriter({
+      sendRequest: async (message: typeof messages[number]) => {
+        messages.push(message)
+        if (message.type === "miniapp_speaker_stream_close") await (message.streamId === "test-1" ? drainA : drainB)
+        return {}
+      },
+    } as never, `test-${++streamId}`) as never
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    try {
+      h.live.audio("AAAAAA==")
+      await new Promise(resolve => setTimeout(resolve, 1))
+      h.live.turnComplete()
+      await new Promise(resolve => setTimeout(resolve, 1))
+      expect(messages.at(-1)?.type).toBe("miniapp_speaker_stream_close")
+      h.live.audio("AQEBAQ==")
+      h.live.audio("AgICAg==")
+      h.live.turnComplete()
+      await new Promise(resolve => setTimeout(resolve, 1))
+      expect(messages.filter(message => message.base64).map(message => message.base64)).toEqual(["AAAAAA=="])
+      expect(lastSnapshot(h.session)?.connection).toBe("speaking")
+      releaseA()
+      await new Promise(resolve => setTimeout(resolve, 5))
+      expect(messages.filter(message => message.base64).map(message => [message.streamId, message.base64]))
+        .toEqual([["test-1", "AAAAAA=="], ["test-2", "AQEBAQ=="], ["test-2", "AgICAg=="]])
+      expect(h.session.speakerStops).toBe(0)
+      expect(lastSnapshot(h.session)?.connection).toBe("speaking")
+      expect(h.live.callbacks.canInvite?.()).toBe(false)
+      releaseB()
+      await new Promise(resolve => setTimeout(resolve, 5))
+      expect(lastSnapshot(h.session)).toMatchObject({connection: "listening", lastError: null})
+    } finally {
+      releaseA()
+      releaseB()
+      await h.session.handlers["openalma:stop"]({})
+    }
+  })
+
+  test.each(["Stop", "interruption"])("%s retires audio queued behind a draining writer", async action => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    let release!: () => void
+    try {
+      h.live.audio("AAAAAA==")
+      await new Promise(resolve => setTimeout(resolve, 1))
+      h.session.closeGate = new Promise<void>(resolve => {release = resolve})
+      h.live.turnComplete()
+      await new Promise(resolve => setTimeout(resolve, 1))
+      h.live.audio("AQEBAQ==")
+      if (action === "Stop") {
+        await h.session.handlers["openalma:stop"]({})
+        expect(lastSnapshot(h.session)?.connection).toBe("idle")
+      } else {
+        h.live.interrupted()
+        h.session.closeGate = null
+        h.live.audio("AgICAg==")
+        h.live.turnComplete()
+        await new Promise(resolve => setTimeout(resolve, 5))
+        expect(h.session.streams.at(-1)?.writes).toEqual(["AgICAg=="])
+        expect(lastSnapshot(h.session)?.connection).toBe("listening")
+      }
+      release()
+      await new Promise(resolve => setTimeout(resolve, 5))
+      expect(h.session.streams.flatMap(stream => stream.writes)).not.toContain("AQEBAQ==")
+      expect(lastSnapshot(h.session)?.lastError).toBeNull()
+    } finally {
+      release?.()
+      h.session.closeGate = null
+      await h.session.handlers["openalma:stop"]({})
     }
   })
 

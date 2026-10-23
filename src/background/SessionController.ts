@@ -92,7 +92,6 @@ export class SessionController {
   private speakerEpoch = 0
   private speakerWriter: SpeakerWriter | null = null
   private speakerOpenPromise: Promise<SpeakerWriter | null> | null = null
-  private readonly pendingSpeechWrites = new Set<Promise<void>>()
   private startupAudio: string[] = []
   private startupTurnComplete = false
   private speechFinishTail: Promise<void> = Promise.resolve()
@@ -639,6 +638,7 @@ export class SessionController {
   }
 
   private async abortCurrentWriter(): Promise<void> {
+    this.speechFinishTail = Promise.resolve()
     const writer = this.speakerWriter
     const opening = this.speakerOpenPromise
     this.speakerWriter = null
@@ -697,8 +697,6 @@ export class SessionController {
     this.pushSnapshot()
     await this.abortCurrentWriter()
     trace("session.speaker.aborted")
-    this.speechFinishTail = Promise.resolve()
-    this.pendingSpeechWrites.clear()
     await this.stopLiveController(graceful)
     trace("session.provider.stopped")
     if (graceful) {
@@ -706,7 +704,6 @@ export class SessionController {
       await this.finishSpeech()
     } else {
       this.speechFinishTail = Promise.resolve()
-      this.pendingSpeechWrites.clear()
     }
     if (generation !== this.startGeneration) return
 
@@ -849,9 +846,10 @@ export class SessionController {
       trace("session.speaking")
       this.pushSnapshot()
     }
-    const write = this.writeSpeech(base64Pcm)
-    this.pendingSpeechWrites.add(write)
-    void write.finally(() => this.pendingSpeechWrites.delete(write))
+    const epoch = this.speakerEpoch
+    this.speechFinishTail = this.speechFinishTail.then(() => {
+      if (epoch === this.speakerEpoch) return this.writeSpeech(base64Pcm)
+    })
   }
 
   private holdManualTake(): void {
@@ -904,27 +902,19 @@ export class SessionController {
     }
   }
 
-  private async finishSpeech(finalResponse = true): Promise<void> {
+  private async finishSpeech(finalResponse = true, tail = this.speechFinishTail): Promise<void> {
     const epoch = this.speakerEpoch
-    await Promise.all(this.pendingSpeechWrites)
     if (this.interruptPromise) await this.interruptPromise
     if (epoch !== this.speakerEpoch) return
     try {
       const writer = this.speakerWriter ?? (await this.speakerOpenPromise)
-      if (!writer || epoch !== this.speakerEpoch) {
-        const manualFinished = finalResponse && this.completeManualResponse()
-        if (this.connection === "speaking") {
-          this.connection = "listening"
-          this.pushSnapshot()
-        } else if (manualFinished) {
-          this.pushSnapshot()
-        }
-        this.liveController?.resumeBackgroundWork()
-        return
+      if (epoch !== this.speakerEpoch) return
+      if (writer) {
+        await writer.close()
+        if (this.speakerWriter === writer) this.speakerWriter = null
       }
-      await writer.close()
-      if (this.speakerWriter === writer) this.speakerWriter = null
-      if (epoch === this.speakerEpoch) {
+      // A queued response keeps input closed until its own playback finishes.
+      if (epoch === this.speakerEpoch && tail === this.speechFinishTail) {
         const manualFinished = finalResponse && this.completeManualResponse()
         if (this.connection === "speaking") {
           this.connection = "listening"
@@ -942,9 +932,10 @@ export class SessionController {
 
   private queueFinishSpeech(finalResponse = true): void {
     const epoch = this.speakerEpoch
-    this.speechFinishTail = this.speechFinishTail.then(() => {
-      if (epoch === this.speakerEpoch) return this.finishSpeech(finalResponse)
+    const finishing: Promise<void> = this.speechFinishTail.then(() => {
+      if (epoch === this.speakerEpoch) return this.finishSpeech(finalResponse, finishing)
     })
+    this.speechFinishTail = finishing
   }
 
   private handleManualAction(action: ManualAction): void {
