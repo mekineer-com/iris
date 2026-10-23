@@ -478,6 +478,27 @@ describe("SessionController", () => {
     })
   }
 
+  test("finished reflection playback retires the Stop timer before the final earcon", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    let now = Date.now()
+    const clock = spyOn(Date, "now").mockImplementation(() => now)
+    let release!: () => void
+    h.session.playGate = new Promise<void>(resolve => {release = resolve})
+    const stopping = h.session.handlers["openalma:stop"]({})
+    try {
+      await flush()
+      expect(h.session.plays.at(-1)?.audioUrl).toContain("listen-stop")
+      const stops = h.session.speakerStops
+      now += 31_000
+      h.session.handlers["openalma:visibility"]({visible: true})
+      expect(h.session.speakerStops).toBe(stops)
+      release()
+      await stopping
+      expect(lastSnapshot(h.session)?.connection).toBe("idle")
+    } finally { release(); await stopping; clock.mockRestore() }
+  })
+
   for (const stalled of ["creation", "abort", "reflection creation"] as const) {
     test(`Stop budget covers stalled writer ${stalled} without abandoning provider cleanup`, async () => {
       const h = setup()

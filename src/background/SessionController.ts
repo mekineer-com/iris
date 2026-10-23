@@ -796,6 +796,7 @@ export class SessionController {
     } else {
       this.speechFinishTail = Promise.resolve()
     }
+    this.clearStopPlaybackDeadline()
     if (generation !== this.startGeneration) return
 
     await this.refreshRecoveryLock()

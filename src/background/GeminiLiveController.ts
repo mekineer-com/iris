@@ -541,7 +541,7 @@ export class GeminiLiveController {
     const finish = () => {
       this.candidateFrames = []
       if (this.draining) this.drainResolve?.()
-      if (this.reflecting) this.finishReflection(this.outputTranscript.trim() || null)
+      if (this.reflecting) this.finishReflection()
     }
     const remaining = this.drainDeadlineAt - Date.now()
     if (remaining <= 0) finish()
@@ -965,7 +965,6 @@ export class GeminiLiveController {
     try {
       this.flushToolResponses()
       const drainAttempted = graceful && Boolean(
-        this.candidateFrames.length ||
         this.imageUpload || this.pendingImages.some(image => !image.retryRequested) ||
         this.photoJob || (this.toolBatch.started && this.toolBatch.background))
       const stoppedMidTurn = this.turnActive && (!this.toolBatch.invitation || this.turnAudioDelivered ||
@@ -1090,7 +1089,7 @@ export class GeminiLiveController {
   }
 
   private finishPhotoDrainIfAcknowledged(): void {
-    if (!this.candidateFrames.length && !this.pendingImages.some(image => !image.retryRequested) && !this.imageFinalization &&
+    if (!this.pendingImages.some(image => !image.retryRequested) && !this.imageFinalization &&
         !this.toolBatch.started && !this.turnActive && !this.photoJob && !this.imageUpload &&
         ![...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption")) {
       this.drainResolve?.()
@@ -1210,7 +1209,7 @@ export class GeminiLiveController {
           this.handleMessage(message)
         } catch (error) {
           const normalized = error instanceof Error ? error : new Error(String(error))
-          if (this.reflecting) this.finishReflection(null)
+          if (this.reflecting) this.finishReflection()
           if (ready) this.reportError(normalized)
           else finish(normalized)
         }
@@ -1327,6 +1326,10 @@ export class GeminiLiveController {
     if (!this.goAwayPending || this.reconnecting || this.stopping) return
     const deadlineAt = this.goAwayDeadlineAt
     this.clearGoAway()
+    if (this.reflecting) {
+      this.finishReflection()
+      return
+    }
     if (!this.resumptionHandle) {
       this.reportError(new Error("Gemini requested rollover without a resumable handle"))
       return
@@ -1337,7 +1340,6 @@ export class GeminiLiveController {
     this.publishFrameDelivery()
     this.callbacks.onReconnecting(true)
     this.disconnectToolBatch()
-    if (this.reflecting) this.finishReflection(null)
     const generation = this.generation
     const sessionId = this.sessionId
     const oldSocket = this.socket
@@ -1424,11 +1426,11 @@ export class GeminiLiveController {
       if (interrupted) {
         trace("provider.reflection.interrupted")
         this.callbacks.onInterrupted()
-        this.finishReflection(null)
+        this.finishReflection()
       } else if (this.thinking ? content.interactionStatus === "IDLE"
         : content.generationComplete === true || content.turnComplete === true) {
         this.callbacks.onTurnComplete(true)
-        this.finishReflection(this.outputTranscript.trim() || null)
+        this.finishReflection()
       }
       return
     }
@@ -1923,7 +1925,11 @@ export class GeminiLiveController {
             // A missing native completion cannot be invented; recover through the existing socket lifecycle.
             if (!this.draining && this.toolBatch === stalledBatch && !this.photoJob &&
                 (this.toolBatch.started || this.turnActive) && !this.voiceActive &&
-                (!this.spokenRequest || this.spokenRequest.retired)) this.socket?.close()
+                (!this.spokenRequest || this.spokenRequest.retired)) {
+              this.ready = false
+              stalledBatch.photo = false
+              this.socket?.close()
+            }
             this.resumeBackgroundWork()
           })
         }
@@ -2570,7 +2576,7 @@ export class GeminiLiveController {
     this.reflecting = true
     this.clearTurn()
     return new Promise((resolve) => {
-      const timeout = setTimeout(() => this.finishReflection(this.outputTranscript.trim() || null), REFLECTION_TIMEOUT_MS)
+      const timeout = setTimeout(() => this.finishReflection(), REFLECTION_TIMEOUT_MS)
       this.reflectionResolve = (value) => {
         clearTimeout(timeout)
         this.clearStopDeadlineTimer()
@@ -2588,13 +2594,14 @@ export class GeminiLiveController {
           }),
         )
       } catch {
-        this.finishReflection(null)
+        this.finishReflection()
       }
     })
   }
 
-  private finishReflection(value: string | null): void {
+  private finishReflection(): void {
     if (!this.reflecting) return
+    const value = this.outputTranscript.trim() || null
     this.reflecting = false
     this.turnActive = false
     this.clearTurn()
@@ -2615,7 +2622,7 @@ export class GeminiLiveController {
       this.ready = false
       this.disconnectToolBatch()
       if (this.reflecting) {
-        this.finishReflection(null)
+        this.finishReflection()
         return
       }
       const interrupted = this.turnActive || Boolean(this.outputTranscript.trim())

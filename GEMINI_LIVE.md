@@ -226,6 +226,12 @@ discard accepted candidates. Camera wiring, selection/promotion, render/catch-up
 delivery and provider activation remain unfinished; no production frame sender
 is enabled by these adapters.
 
+Stored candidates alone are not active Stop work: an actual review/caption job
+or filing owns the drain. Idle retained bytes must not force the full allowance
+or prevent closing thoughts. They remain available during active work/reflection
+and clear at expiry or terminal context teardown. Selection integration must
+create actual review work, not restore a candidate-count wait.
+
 ### Completion and connection rotation
 
 The scheduling rules below describe regular Live. Thinking uses the same
