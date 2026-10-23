@@ -8,7 +8,7 @@ Install Iris from the OpenAlma launcher and use a trusted private connection,
 such as your VPN, to reach your OpenAlma computer. Devices allowed onto that
 connection can access the Soul's Iris data.
 
-Choose an existing Soul or create one, then press **Start**. The selected Soul
+Choose an existing Soul or create one, then choose **Audio** or **Video**. The selected Soul
 stays fixed until the sitting and any pending recovery are finished. Connection
 settings live on your phone; **Edit Connection** can repair the server address
 without losing your selected Soul or installation identity.
@@ -29,6 +29,15 @@ that memory extraction has finished. Unchecked captions are unconfirmed previews
 and may be wrong, including when the photo did not arrive. Spoken photo
 descriptions remain separate.
 
+Video uses the foreground phone camera as well as audio. Its Photos controls
+start collapsed; expand them to grab a still from the current view or choose an
+image. Audio keeps the normal phone-camera picker. Hiding Iris releases the
+camera; returning resumes an active Video call. A provider reconnect keeps
+the camera but pauses frame submission.
+
+Under Settings, **Maximum memorized photos** limits photos she chooses to keep
+from Video, not deliberate photos. Slider changes apply to the next call.
+
 Unconfirmed uploads stay in phone recovery after Stop; Start Iris again to check
 the saved original. Once the server accepts a caption for filing, it owns that
 work. Failed server filings can be retried or discarded while Iris is idle,
@@ -47,5 +56,6 @@ See [AGENTS.md](AGENTS.md) for checkout, build and implementation guidance.
 ```sh
 bun install
 bun test
+bun run test:browser # Requires Chromium; CHROMIUM can name its executable.
 bun run build
 ```

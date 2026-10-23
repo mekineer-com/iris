@@ -6,17 +6,15 @@ export interface PhoneCameraState {
   cameraEnabled: boolean
   visible: boolean
   connection: ConnectionState
-  generation: number
-  startGeneration: number
 }
 
 export function cameraShouldRun(state: PhoneCameraState): boolean {
   return state.enabled && state.cameraEnabled && state.visible &&
-    state.generation === state.startGeneration &&
     (state.connection === "listening" || state.connection === "speaking" || state.connection === "reconnecting")
 }
 
 export interface CameraSample extends FrameSample {
+  canvas: HTMLCanvasElement
   mimeType: "image/jpeg"
   data: string
   receivedAt: number
@@ -103,7 +101,7 @@ export class PhoneCamera {
       const dataUrl = this.canvas.toDataURL("image/jpeg", options.jpegQuality)
       const prefix = "data:image/jpeg;base64,"
       if (!dataUrl.startsWith(prefix) || dataUrl.length === prefix.length) throw new Error("Camera produced no JPEG")
-      return {mimeType: "image/jpeg", data: dataUrl.slice(prefix.length),
+      return {canvas: this.canvas, mimeType: "image/jpeg", data: dataUrl.slice(prefix.length),
         width: this.canvas.width, height: this.canvas.height, receivedAt,
         comparison: {width: options.comparisonWidth, height: options.comparisonHeight, data: rgb}}
     } catch (error) {

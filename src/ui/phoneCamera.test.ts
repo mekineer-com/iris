@@ -57,6 +57,7 @@ test("samples one portrait frame, strips the data URL and separates RGB from alp
   await h.camera.start()
   const before = Date.now()
   const sample = h.camera.sample(options)!
+  expect(sample.canvas).toBe(h.canvases[0])
   expect(sample).toMatchObject({mimeType: "image/jpeg", data: "/9j/fixture", width: 320, height: 427,
     comparison: {width: 2, height: 1, data: new Uint8Array([1, 2, 3, 4, 5, 6])}})
   expect(sample.receivedAt).toBeGreaterThanOrEqual(before)
@@ -204,7 +205,7 @@ test("capture/encoding failure releases the camera instead of returning empty da
 })
 
 const running: PhoneCameraState = {enabled: true, cameraEnabled: true, visible: true,
-  connection: "listening", generation: 4, startGeneration: 4}
+  connection: "listening"}
 
 test("camera-run condition includes reconnect without requiring the mic", () => {
   expect(cameraShouldRun(running)).toBe(true)
@@ -213,8 +214,8 @@ test("camera-run condition includes reconnect without requiring the mic", () => 
 })
 
 test.each([
-  {enabled: false}, {cameraEnabled: false}, {visible: false}, {startGeneration: 5},
+  {enabled: false}, {cameraEnabled: false}, {visible: false},
   ...(["idle", "starting", "stopping", "error"] as const).map(connection => ({connection})),
-])("camera-run condition releases on ownership, capability or state loss: %j", change => {
+])("camera-run condition releases on capability or state loss: %j", change => {
   expect(cameraShouldRun({...running, ...change})).toBe(false)
 })

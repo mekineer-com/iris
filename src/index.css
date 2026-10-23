@@ -352,3 +352,18 @@ button:disabled {
     background: rgb(0 0 0 / 18%);
   }
 }
+
+.video-preview {
+  display: block;
+  width: 100%;
+  max-height: 15rem;
+  margin: 1.25rem 0;
+  background: #101d17;
+  object-fit: contain;
+}
+.video-preview[hidden] { display: none; }
+.photo-controls, .photo-allowance { margin: 1.25rem 0; }
+.photo-controls summary { cursor: pointer; font-weight: 700; }
+.photo-allowance { display: grid; gap: 0.5rem; }
+.allowance-slider { display: flex; gap: 0.75rem; align-items: center; }
+.allowance-slider input { min-width: 0; flex: 1; }

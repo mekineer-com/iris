@@ -6,6 +6,7 @@
     "release:private": "bun ./scripts/release-private.mjs",
     "build": "bun run build.ts",
     "test": "bun test",
+    "test:browser": "bun scripts/phone-vision-browser.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

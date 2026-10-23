@@ -29,7 +29,8 @@ function labelledCheckbox(tree: any, text: string) {
 }
 
 function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Promise<unknown>, now?: number) {
-  for (const [field, value] of Object.entries({modelChoice: null, model: null, configuredModel: null, modelSaving: false})) {
+  for (const [field, value] of Object.entries({modelChoice: null, model: null, configuredModel: null, modelSaving: false,
+    callMode: "audio", maxMemorizedPhotos: 1, catchUpRender: null})) {
     if (!(field in snapshot)) Object.assign(snapshot, {[field]: value})
   }
   if (!("startGeneration" in snapshot)) Object.assign(snapshot, {startGeneration: 1})
@@ -39,7 +40,7 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
   let cursor = 0
   let refCursor = 0
   const context = {
-    exports: {}, btoa, localStorage: {getItem: () => null},
+    exports: {}, btoa, document: {hidden: false}, localStorage: {getItem: () => null},
     ...(now === undefined ? {} : {Date: {now: () => now}}),
     require: (name: string) => {
       if (name === "react") return {
@@ -54,6 +55,10 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
       if (name === "react/jsx-runtime") return jsx
       if (name.endsWith("miniapp.json")) return {default: manifest, __esModule: true}
       if (name.endsWith("/useChannel")) return {useChannel: () => snapshot}
+      if (name.endsWith("/usePhoneVision")) return {usePhoneVision: () => ({videoRef: {current: null},
+        ready: true, error: null, stop() {}, takePhoto: async () => ({
+          file: new File([new Uint8Array([255, 216, 255])], "video-photo.jpg", {type: "image/jpeg"}), receivedAt: 1000,
+        })})}
       if (name.endsWith("/imageTime")) return {readImageTime}
       if (name.endsWith("/shared/types")) return sharedTypes
       if (name === "@mentra/miniapp/ui") return {useRpc: (channel: string) => (payload: unknown) => rpc(channel, payload)}
@@ -153,16 +158,20 @@ describe("SessionPage state projection", () => {
     expect(start().props.disabled).toBe(false)
   })
 
-  test("Closing thoughts lives beside Start/Stop, defaults checked, and follows the remembered snapshot", () => {
+  test("Closing thoughts replaces the idle call choices, defaults checked, and follows the remembered snapshot", () => {
     const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
       soulConfirmed: true, connection: "idle", closingThoughts: undefined as boolean | undefined}
     const render = renderPage(snapshot, async () => ({ok: true}))
     const row = nodes(render()).find(node => node.props?.className === "sitting-controls")
     expect(nodes(row).some(node => node.props?.className === "sitting-button")).toBe(true)
-    expect(labelledCheckbox(row, "Closing thoughts").props.checked).toBe(true)
+    expect(labelledCheckbox(row, "Closing thoughts")).toBeUndefined()
+    expect(nodes(row).filter(node => node.props?.className === "sitting-button").map(node => node.props.children))
+      .toEqual(["Audio", "Video"])
+    snapshot.connection = "listening"
+    expect(labelledCheckbox(render(), "Closing thoughts").props.checked).toBe(true)
     const settings = nodes(render()).find(node => node.props?.id === "iris-settings")
     expect(labelledCheckbox(settings, "Closing thoughts")).toBeUndefined()
-    for (const connection of ["idle", "listening", "speaking", "starting", "stopping"]) {
+    for (const connection of ["listening", "speaking", "starting", "stopping"]) {
       snapshot.connection = connection
       snapshot.closingThoughts = false
       const checkbox = labelledCheckbox(render(), "Closing thoughts")
@@ -231,7 +240,8 @@ describe("SessionPage state projection", () => {
         release()
         await new Promise(resolve => setTimeout(resolve, 0))
       }
-      expect(labelledCheckbox(render(), "Closing thoughts").props.disabled).toBe(false)
+      if (active) expect(labelledCheckbox(render(), "Closing thoughts").props.disabled).toBe(false)
+      else expect(labelledCheckbox(render(), "Closing thoughts")).toBeUndefined()
     })
   }
 
@@ -367,7 +377,7 @@ describe("SessionPage state projection", () => {
     await new Promise(resolve => setTimeout(resolve, 0))
     expect(calls).toEqual([
       {channel: "openalma:set-soul", payload: {soulId: "Fable", useExisting: false}},
-      {channel: "openalma:start", payload: {mode: "continuous"}},
+      {channel: "openalma:start", payload: {mode: "continuous", callMode: "audio"}},
     ])
     soulInput(render()).props.onChange({target: {value: "Quill"}})
     await arrow(render()).props.onClick()
@@ -411,7 +421,7 @@ describe("SessionPage state projection", () => {
     snapshot.connection = "idle"
     expect(countdown()).toBeUndefined()
     expect(button().props.disabled).toBe(false)
-    expect(JSON.stringify(button())).toContain("Start")
+    expect(JSON.stringify(button())).toContain("Audio")
   })
 
   test.each(["Is memU running?", "Owner discovery failed (409)", "Owner discovery failed (503)"])(
@@ -591,4 +601,93 @@ describe("SessionPage state projection", () => {
     })
   })
 
+})
+
+describe("Video UI and allowance projection", () => {
+  test("Video starts explicitly and Photos stays available but collapsed", async () => {
+    const calls: any[] = []
+    const snapshot = {configured: true, soulLoading: false, startGeneration: 1, soulId: "Quill", souls: ["Quill"],
+      soulConfirmed: true, soulLocked: false, connection: "idle", callMode: "audio"}
+    const render = renderPage(snapshot, async (channel, payload) => {
+      calls.push({channel, payload})
+      return channel === "openalma:set-soul" ? {soulId: "Quill", created: false} : {ok: true}
+    })
+    nodes(render()).find(node => node.props?.onFocus).props.onChange({target: {value: "Quill"}})
+    await nodes(render()).find(node => node.props?.["aria-label"] === "Use soul").props.onClick()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    calls.length = 0
+    await nodes(render()).find(node => node.type === "button" && node.props.children === "Video").props.onClick()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(calls).toEqual([{channel: "openalma:start", payload: {mode: "continuous", callMode: "video"}}])
+    snapshot.callMode = "video"; snapshot.connection = "listening"
+    const photos = nodes(render()).find(node => node.props.className === "photo-controls")
+    expect(photos.props.open).toBe(false)
+    expect(nodes(photos).some(node => node.props?.children === "Photos")).toBe(true)
+    expect(nodes(photos).filter(node => node.props?.type === "file")).toHaveLength(1)
+    expect(nodes(photos).find(node => node.type === "button" && node.props.children === "Take photo")).toBeDefined()
+    snapshot.callMode = "audio"
+    expect(nodes(render()).find(node => node.props.className === "photo-controls").props.open).toBe(true)
+    expect(nodes(render()).filter(node => node.props?.type === "file")).toHaveLength(2)
+  })
+
+  test("Video Take photo reserves the captured still and uses the deliberate upload path", async () => {
+    const calls: any[] = []
+    const render = renderPage({configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+      soulLocked: true, connection: "listening", callMode: "video", cameraEnabled: true}, async (channel, payload) => {
+      calls.push({channel, payload})
+      return channel === "openalma:reserve-image"
+        ? {startGeneration: 1, imageId: "2026-01-08T10-17-23", reservationSequence: 1}
+        : {ok: true}
+    })
+    const capture = nodes(render()).find(node => node.type === "button" && node.props.children === "Take photo")
+    expect(capture.props.disabled).toBe(false)
+    await capture.props.onClick()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(calls.map(call => call.channel)).toEqual(["openalma:reserve-image", "openalma:image"])
+    expect(calls[0].payload).toMatchObject({startGeneration: 1, time: {receivedAt: 1000}})
+    expect(calls[1].payload).toMatchObject({imageId: "2026-01-08T10-17-23", mimeType: "image/jpeg", data: "/9j/"})
+    expect(JSON.stringify(render())).toContain("Photo sent")
+  })
+
+  test("slider coalesces slow saves, shows one value set, and blocks Start until the last save", async () => {
+    const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
+      soulConfirmed: true, soulLocked: false, connection: "idle", maxMemorizedPhotos: 1}
+    let release!: () => void
+    const calls: any[] = []
+    const render = renderPage(snapshot, async (channel, payload) => {
+      if (channel === "openalma:set-soul") return {soulId: "Quill", created: false}
+      calls.push({channel, payload})
+      if (channel === "openalma:set-max-memorized-photos") {
+        await new Promise<void>(resolve => {release = resolve})
+        snapshot.maxMemorizedPhotos = payload.value
+      }
+      return {ok: true}
+    })
+    nodes(render()).find(node => node.props?.onFocus).props.onChange({target: {value: "Quill"}})
+    await nodes(render()).find(node => node.props?.["aria-label"] === "Use soul").props.onClick()
+    const slider = () => nodes(render()).find(node => node.props?.type === "range")
+    slider().props.onChange({target: {value: "2"}})
+    slider().props.onChange({target: {value: "4"}})
+    slider().props.onChange({target: {value: "5"}})
+    expect(slider().props.value).toBe(5)
+    expect(nodes(render()).filter(node => node.type === "output")).toHaveLength(1)
+    expect(nodes(render()).find(node => node.type === "output").props.children).toEqual([5, " in 5 min, ", 10, " in 15 min, ", 15, " in 45 min"])
+    const start = () => nodes(render()).find(node => node.props?.className === "sitting-button")
+    expect(start().props.disabled).toBe(true)
+    start().props.onClick()
+    expect(calls).toEqual([{channel: "openalma:set-max-memorized-photos", payload: {value: 2}}])
+    release(); await new Promise(resolve => setTimeout(resolve, 0))
+    expect(calls).toEqual([2, 5].map(value => ({channel: "openalma:set-max-memorized-photos", payload: {value}})))
+    expect(start().props.disabled).toBe(true)
+    release(); await new Promise(resolve => setTimeout(resolve, 0))
+    expect(slider().props.value).toBe(5)
+    expect(start().props.disabled).toBe(false)
+    snapshot.connection = "starting"
+    expect(slider().props.disabled).toBe(true)
+    snapshot.connection = "stopping"
+    expect(slider().props.disabled).toBe(true)
+    snapshot.connection = "listening"
+    expect(slider().props.disabled).toBe(false)
+    expect(JSON.stringify(render())).toContain("Changes apply to the next call.")
+  })
 })

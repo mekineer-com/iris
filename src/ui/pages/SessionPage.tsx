@@ -6,6 +6,7 @@ import {readImageTime, type ImageTime} from "../imageTime"
 import {
   LIVE_MODELS,
   PHOTO_RETRY_MESSAGE,
+  type CallMode,
   type ConnectionState,
   type LiveModel,
   type ManualAction,
@@ -14,6 +15,7 @@ import {
   type SessionMode,
 } from "../../shared/types"
 import {useChannel} from "../hooks/useChannel"
+import {usePhoneVision} from "../hooks/usePhoneVision"
 import memuIcon from "../memu-icon.png"
 import manifest from "../../../miniapp.json"
 
@@ -125,6 +127,12 @@ export default function SessionPage() {
   const [rpcError, setRpcError] = useState<string | null>(null)
   const [profilePending, setProfilePending] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [foreground, setForeground] = useState(() => !document.hidden)
+  const [maxPhotosDraft, setMaxPhotosDraft] = useState<number | null>(null)
+  const [maxPhotosPending, setMaxPhotosPending] = useState(false)
+  const maxPhotosSaving = useRef(false)
+  const maxPhotosDesired = useRef<number | null>(null)
+  const maxPhotosRpc = useRpc<Channels, "openalma:set-max-memorized-photos">("openalma:set-max-memorized-photos")
   const [editingConnection, setEditingConnection] = useState(false)
   const [profile, setProfile] = useState<OpenAlmaProfile>({
     baseUrl: "",
@@ -174,9 +182,13 @@ export default function SessionPage() {
   const starting = visible === "starting"
   const stopping = visible === "stopping"
   const stopDeadline = snapshot?.stopDeadlineAt ?? null
+  const callMode = snapshot?.callMode ?? "audio"
+  const vision = usePhoneVision(snapshot, foreground && !stopPending)
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | undefined
     const publish = (foreground: boolean) => {
+      if (!foreground) vision.stop()
+      setForeground(foreground)
       mentra.send("openalma:visibility", {visible: foreground})
       setStopNow(Date.now())
       if (timer !== undefined) clearInterval(timer)
@@ -186,10 +198,12 @@ export default function SessionPage() {
     const hide = () => publish(false)
     document.addEventListener("visibilitychange", visibility)
     window.addEventListener("pagehide", hide)
+    window.addEventListener("pageshow", visibility)
     visibility()
     return () => {
       document.removeEventListener("visibilitychange", visibility)
       window.removeEventListener("pagehide", hide)
+      window.removeEventListener("pageshow", visibility)
       if (timer !== undefined) clearInterval(timer)
     }
   }, [stopping])
@@ -244,7 +258,8 @@ export default function SessionPage() {
     }
   }
 
-  const onStart = async () => {
+  const onStart = async (callMode: CallMode) => {
+    if (maxPhotosSaving.current) return
     const owner = ++startOwner.current
     imageOwner.current += 1
     filingOwner.current += 1
@@ -257,7 +272,7 @@ export default function SessionPage() {
         if (pendingNewSoul !== soulName.trim() || !await selectSoul(soulName.trim(), false)) return
       }
       if (owner !== startOwner.current) return
-      await startRpc({mode})
+      await startRpc({mode, callMode})
     } catch (error) {
       if (owner === startOwner.current) {
         setRpcError(error instanceof Error ? error.message : String(error))
@@ -268,6 +283,7 @@ export default function SessionPage() {
   }
 
   const onStop = async () => {
+    vision.stop()
     startOwner.current += 1
     setStartPending(false)
     setRpcError(null)
@@ -382,17 +398,11 @@ export default function SessionPage() {
     }
   }
 
-  const onImagePicked = async (input: HTMLInputElement) => {
-    const file = input.files?.[0]
-    input.value = ""
-    const generation = pickerGeneration.current
-    pickerGeneration.current = null
-    if (!file) return
+  const preparePhoto = async (file: File, generation: number | null, receivedAt: number) => {
     if (generation === null || generation !== snapshot?.startGeneration) {
       setRpcError("Choose the photo again for this sitting.")
       return
     }
-    const receivedAt = Date.now()
     setRpcError(null)
     setImageStatus(null)
     try {
@@ -420,6 +430,52 @@ export default function SessionPage() {
       if (owner === imageOwner.current) setRpcError(error instanceof Error ? error.message : String(error))
     } finally {
       if (owner === imageOwner.current) setImagePending(false)
+    }
+  }
+
+  const onImagePicked = async (input: HTMLInputElement) => {
+    const file = input.files?.[0]
+    input.value = ""
+    const generation = pickerGeneration.current
+    pickerGeneration.current = null
+    if (file) await preparePhoto(file, generation, Date.now())
+  }
+
+  const onVideoPhoto = async () => {
+    const owner = ++imageOwner.current
+    const generation = snapshot?.startGeneration ?? null
+    setImagePending(true)
+    setRpcError(null)
+    try {
+      const photo = await vision.takePhoto()
+      if (owner === imageOwner.current) await preparePhoto(photo.file, generation, photo.receivedAt)
+    } catch (error) {
+      if (owner === imageOwner.current) setRpcError(error instanceof Error ? error.message : String(error))
+    } finally {
+      if (owner === imageOwner.current) setImagePending(false)
+    }
+  }
+
+  const onMaxPhotos = async (value: number) => {
+    setMaxPhotosDraft(value)
+    maxPhotosDesired.current = value
+    if (maxPhotosSaving.current) return
+    maxPhotosSaving.current = true
+    setMaxPhotosPending(true)
+    setRpcError(null)
+    try {
+      while (maxPhotosDesired.current !== null) {
+        const next = maxPhotosDesired.current
+        maxPhotosDesired.current = null
+        await maxPhotosRpc({value: next})
+      }
+    } catch (error) {
+      maxPhotosDesired.current = null
+      setRpcError(error instanceof Error ? error.message : String(error))
+    } finally {
+      maxPhotosSaving.current = false
+      setMaxPhotosPending(false)
+      setMaxPhotosDraft(null)
     }
   }
 
@@ -459,14 +515,10 @@ export default function SessionPage() {
     ? "Stopping..."
     : starting
       ? "Cancel"
-      : active
-        ? "Stop"
-        : visible === "error"
-          ? "Retry"
-          : "Start"
+      : "Stop"
   const soulSubmitted = soulReady || pendingNewSoul === soulName.trim()
   const sittingDisabled = stopping || stopPending || modePending || soulPending || snapshot?.soulLoading !== false ||
-    (!active && (startPending || modelSaving || !soulSubmitted))
+    (!active && (startPending || modelSaving || maxPhotosPending || !soulSubmitted))
   const showSpinner = starting || reconnecting || stopping
   const manualDisabled = manualPending || visible === "speaking"
   const voiceReady = visible === "listening" || visible === "speaking"
@@ -576,7 +628,7 @@ export default function SessionPage() {
             ) : null}
           </span>
         </label>
-        {showNewSoulInfo ? <p className="soul-info">A new soul will be created when you press Start.</p> : null}
+        {showNewSoulInfo ? <p className="soul-info">A new soul will be created when you start a call.</p> : null}
         {confirmationSoul ? (
           <div role="alert">
             <p>{confirmationSoul} already exists. Use its existing database?</p>
@@ -606,21 +658,24 @@ export default function SessionPage() {
                 ? `Using server setting: ${snapshot.configuredModel}`
                 : "Using server setting"}</p>
         </section>
+        <span>Call</span>
         <div className="sitting-controls">
-          <button
+          {active || stopping ? <button
             type="button"
             className="sitting-button"
             disabled={sittingDisabled}
-            onClick={() => void (active ? onStop() : onStart())}
+            onClick={() => void onStop()}
           >
             {sittingLabel}
-          </button>
-          <label className="closing-thoughts">
+          </button> : (["audio", "video"] as const).map(kind => <button
+            key={kind} type="button" className="sitting-button" disabled={sittingDisabled}
+            onClick={() => void onStart(kind)}>{kind === "audio" ? "Audio" : "Video"}</button>)}
+          {active || stopping ? <label className="closing-thoughts">
             <input type="checkbox" aria-label="Closing thoughts" checked={closingThoughts}
               disabled={closingThoughtsPending || starting || stopping}
               onChange={event => void onClosingThoughts(event.target.checked)} />
             Closing thoughts
-          </label>
+          </label> : null}
         </div>
         {mode === "manual" && voiceReady ? (
           <div className="manual-controls">
@@ -653,8 +708,14 @@ export default function SessionPage() {
           </div>
         ) : null}
       </section>
+      <video ref={vision.videoRef} className="video-preview" muted playsInline
+        hidden={callMode !== "video" || !active} aria-label="Phone camera preview" />
+      {vision.error ? <p role="alert">{vision.error}</p> : null}
+      <details className="photo-controls" key={callMode} open={callMode !== "video"}>
+      <summary>Photos</summary>
       <div className="image-actions">
-        <label className="image-picker">
+        {callMode === "video" ? <button type="button" disabled={!vision.ready || !cameraEnabled || !voiceReady || imagePending || stopping}
+          onClick={() => void onVideoPhoto()}>Take photo</button> : <label className="image-picker">
           <span>Take photo</span>
           <input
             type="file"
@@ -664,7 +725,7 @@ export default function SessionPage() {
             disabled={!cameraEnabled || !voiceReady || imagePending || stopping}
             onChange={(event) => onImagePicked(event.currentTarget)}
           />
-        </label>
+        </label>}
         <label className="image-picker">
           <span>Choose image</span>
           <input
@@ -676,6 +737,7 @@ export default function SessionPage() {
           />
         </label>
       </div>
+      </details>
       {pendingPhoto?.previewUrl ? <img className="image-preview" src={pendingPhoto.previewUrl} alt="Selected photo preview" /> : null}
       {pendingPhoto && shouldWarnLargeImage(pendingPhoto.file.size, largeImageWarningDismissed) ? (
         <div role="alert">
@@ -758,6 +820,14 @@ export default function SessionPage() {
             onClick={() => void onMode("manual")}>Manual</button>
         </div>
       </section>
+      <label className="photo-allowance">
+        Maximum memorized photos:
+        <output>{maxPhotosDraft ?? snapshot.maxMemorizedPhotos} in 5 min, {(maxPhotosDraft ?? snapshot.maxMemorizedPhotos) * 2} in 15 min, {(maxPhotosDraft ?? snapshot.maxMemorizedPhotos) * 3} in 45 min</output>
+        <span className="allowance-slider">Fewer <input type="range" min="1" max="5" step="1"
+          aria-label="Maximum memorized photos" value={maxPhotosDraft ?? snapshot.maxMemorizedPhotos}
+          disabled={starting || stopping} onChange={event => void onMaxPhotos(Number(event.target.value))} /> More</span>
+        {active ? <small>Changes apply to the next call.</small> : null}
+      </label>
       <label className="preview-control">
         <input
           type="checkbox"
