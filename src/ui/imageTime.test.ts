@@ -24,15 +24,19 @@ test("preserves an original date with no supplied timezone", async () => {
     source: "DateTimeOriginal", receivedAt: receipt, originalTime: "2000:02:29 01:02:03"})
 })
 
-test.each(["broken", "+99:99", "+24:00", "+05:60"])("invalid offset %s does not discard a usable original date", async invalidOffset => {
+test.each([
+  ["broken", undefined], ["+99:99", undefined], ["+24:00", undefined], ["+05:60", undefined],
+  ["+14:00", "+14:00"], ["-12:00", "-12:00"], ["+05:45", "+05:45"],
+] as const)("offset %s keeps the original date and only valid timezone provenance", async (input, expectedOffset) => {
   const bytes = new Uint8Array(await fixture("capture.jpg").arrayBuffer())
   const offset = new TextEncoder().encode("-05:00")
   const start = bytes.findIndex((_, index) => offset.every((value, part) => bytes[index + part] === value))
   expect(start).toBeGreaterThan(-1)
-  bytes.set(new TextEncoder().encode(invalidOffset), start)
+  bytes.set(new TextEncoder().encode(input), start)
   expect(await readImageTime(new File([bytes], "invalid-offset.jpg"), receipt)).toEqual({
     timestamp: "2026-01-08T10-17-23", source: "DateTimeOriginal", receivedAt: receipt,
     originalTime: "2026:01:08 10:17:23",
+    ...(expectedOffset === undefined ? {} : {offset: expectedOffset}),
   })
 })
 
