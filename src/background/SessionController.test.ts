@@ -1,4 +1,4 @@
-import {describe, expect, test} from "bun:test"
+import {describe, expect, spyOn, test} from "bun:test"
 import {SpeakerStreamWriter} from "@mentra/miniapp"
 
 import type {GeminiCallbacks} from "./GeminiLiveController"
@@ -35,6 +35,7 @@ function testPcm(value: number): string {
 }
 
 class FakeLive {
+  stopDeadlineRefreshes = 0
   resumptions = 0
   starts = 0
   stops = 0
@@ -67,6 +68,7 @@ class FakeLive {
   }
 
   resumeBackgroundWork(): void { this.resumptions += 1 }
+  refreshStopDeadline(): void { this.stopDeadlineRefreshes += 1 }
 
   sendAudio(data: string, source?: MicSource): void {
     this.sent.push(data)
@@ -156,6 +158,7 @@ class FakeSession {
   }> = []
   handlers: Record<string, (payload: unknown) => unknown> = {}
   onOpenCb: (() => void) | null = null
+  onCloseCb: (() => void) | null = null
   snapshots: Snapshot[] = []
   createGate: Promise<void> | null = null
   closeGate: Promise<void> | null = null
@@ -184,6 +187,14 @@ class FakeSession {
       return () => {
         this.onOpenCb = null
       }
+    },
+    onClose: (cb: () => void) => {
+      this.onCloseCb = cb
+      return () => {this.onCloseCb = null}
+    },
+    on: (channel: string, cb: (payload: unknown) => void) => {
+      this.handlers[channel] = cb
+      return () => {delete this.handlers[channel]}
     },
     handle: (channel: string, handler: (payload: unknown) => unknown) => {
       this.handlers[channel] = handler
@@ -310,6 +321,76 @@ function lastSnapshot(session: FakeSession): Snapshot | undefined {
 }
 
 describe("SessionController", () => {
+  for (const initiallyVisible of [true, false]) {
+    test(`Stop deadlines stay anchored across focus changes (initially ${initiallyVisible ? "visible" : "hidden"})`, async () => {
+      const h = setup()
+      await h.session.handlers["openalma:start"]({mode: "continuous"})
+      if (!initiallyVisible) h.session.onCloseCb!()
+      const live = h.live
+      let release!: () => void
+      live.stopGate = new Promise<void>(resolve => {release = resolve})
+      const startedAt = 1_000_000
+      let now = startedAt
+      const clock = spyOn(Date, "now").mockImplementation(() => now)
+      const stop = h.session.handlers["openalma:stop"]({})
+      try {
+        const deadline = () => {
+          expect(live.callbacks.getStopDeadline!()).toBe(lastSnapshot(h.session)!.stopDeadlineAt)
+          return lastSnapshot(h.session)!.stopDeadlineAt
+        }
+        expect(deadline()).toBe(startedAt + (initiallyVisible ? 30_000 : 300_000))
+        // Let teardown reach the provider's still-pending Stop before changing focus.
+        await new Promise(resolve => setTimeout(resolve, 0))
+        expect(live.stops).toBe(1)
+        const refreshes = live.stopDeadlineRefreshes
+        now += 10_000
+        h.session.handlers["openalma:visibility"]({visible: false})
+        expect(deadline()).toBe(startedAt + 300_000)
+        now = startedAt + 45_000
+        h.session.onOpenCb!()
+        expect(deadline()).toBe(startedAt + 30_000)
+        expect(deadline()!).toBeLessThan(now)
+        now = startedAt + 290_000
+        h.session.onCloseCb!()
+        expect(deadline()).toBe(startedAt + 300_000)
+        now = startedAt + 301_000
+        h.session.handlers["openalma:visibility"]({visible: false})
+        expect(deadline()).toBeLessThan(now)
+        expect(live.stopDeadlineRefreshes - refreshes).toBe(4)
+      } finally {
+        release()
+        await stop
+        clock.mockRestore()
+      }
+    })
+  }
+
+  test("early Stop completion clears the deadline and allows a new sitting", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const live = h.live
+    let release!: () => void
+    live.stopGate = new Promise<void>(resolve => {release = resolve})
+    const clock = spyOn(Date, "now").mockReturnValue(1_000_000)
+    const stop = h.session.handlers["openalma:stop"]({})
+    try {
+      expect(lastSnapshot(h.session)).toMatchObject({connection: "stopping", stopDeadlineAt: 1_030_000})
+      release()
+      await stop
+      expect(lastSnapshot(h.session)).toMatchObject({connection: "idle", stopDeadlineAt: null, soulLocked: false})
+      expect(live.callbacks.getStopDeadline!()).toBeNull()
+      await h.session.handlers["openalma:start"]({mode: "continuous"})
+      expect(h.live).not.toBe(live)
+      expect(h.live.starts).toBe(1)
+      expect(lastSnapshot(h.session)).toMatchObject({connection: "listening", stopDeadlineAt: null})
+    } finally {
+      release()
+      await stop
+      await h.session.handlers["openalma:stop"]({})
+      clock.mockRestore()
+    }
+  })
+
   test("phone reservations serialize collisions and remember older dates across sittings and Souls", async () => {
     const h = setup()
     const time = {timestamp: "2026-01-08T10-17-23", source: "DateTimeOriginal",
@@ -1944,6 +2025,7 @@ describe("SessionController", () => {
     const harness = setup()
     harness.session.onOpenCb?.()
     expect(harness.session.snapshots[0]).toEqual({
+      stopDeadlineAt: null,
       startGeneration: 0,
       configured: true,
       connectionProfile: {baseUrl: CONFIG.baseUrl,

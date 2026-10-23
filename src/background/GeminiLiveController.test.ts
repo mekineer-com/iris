@@ -106,6 +106,7 @@ class FakeStorage {
 
 function harness(
   options: {
+    getStopDeadline?: () => number | null
     canInvite?: () => boolean
     config?: OpenAlmaConfig
     heartbeatMs?: number
@@ -283,6 +284,7 @@ function harness(
   const controller = new GeminiLiveController(
     options.config ?? CONFIG,
     {
+      getStopDeadline: options.getStopDeadline,
       canInvite: options.canInvite,
       onAudio: (data) => audio.push(data),
       onTurnComplete: (finalResponse) => events.push(finalResponse ? "turnComplete" : "toolBoundary"),
@@ -421,8 +423,8 @@ function admitRequest(h: ReturnType<typeof harness>, mode: "continuous" | "manua
 }
 
 describe("GeminiLiveController", () => {
-  test("Stop does not request reflection while nokoru's native reply is outstanding", async () => {
-    const h = harness()
+  test("Stop waits for nokoru's native reply before requesting reflection", async () => {
+    const h = harness({photoDrainTimeoutMs: 500})
     await start(h)
     completeTurn(h, "A fictional morning.", "A bright one.")
     completeTurn(h, "A fictional evening.", "A calm one.")
@@ -430,9 +432,256 @@ describe("GeminiLiveController", () => {
     await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "late-memory"))
     h.sockets[0].message({serverContent: {turnComplete: true}})
     expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.text === "nokoru")).toBe(true)
-    await h.controller.stop(true)
+    const stopping = h.controller.stop(true)
     expect(h.sockets[0].sent.some(value => value.includes("Reflect briefly"))).toBe(false)
+    h.sockets[0].message({serverContent: {turnComplete: true}})
+    await waitFor(() => h.sockets[0].sent.some(value => value.includes("Reflect briefly")))
+    h.sockets[0].message({serverContent: {outputTranscription: {text: "NO_SUMMARY"}, turnComplete: true}})
+    await stopping
     expect(h.errors).toEqual([])
+  })
+
+  test.each(["lookup", "prepared"] as const)("a late caption supersedes a retry held at %s", async phase => {
+    let releaseLookup!: () => void
+    let releaseFiling!: () => void
+    let idle = true
+    const storage = new FakeStorage()
+    const h = harness({storage, canInvite: () => idle,
+      replayGates: [Promise.resolve(), new Promise<void>(resolve => {releaseLookup = resolve})],
+      finalizeGates: [new Promise<void>(resolve => {releaseFiling = resolve})]})
+    await start(h)
+    try {
+      await h.controller.sendImage({imageId: "late-original", mimeType: "image/png", data: "AQID"})
+      await waitPhotoTask(h.sockets[0], "late-original")
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "retry-ready", name: "nothing_to_add", args: {}}]},
+        serverContent: {turnComplete: true}})
+      await waitFor(() => h.requests.filter(request => request.url.endsWith("/snapshot/replay")).length === 2)
+      if (phase === "prepared") {
+        idle = false
+        releaseLookup()
+        await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed === true)
+      }
+      provisionalCaption(h.sockets[0], "late-original", "A fictional first caption.")
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+      releaseLookup()
+      idle = true
+      h.controller.resumeBackgroundWork()
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "retry-ready"))
+      expect(h.sockets[0].sent.filter(value => photoTask(JSON.parse(value)))).toHaveLength(1)
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed).not.toBe(true)
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "retry-ready"))
+        .toMatchObject({response: {ok: true}, scheduling: "SILENT"})
+      releaseFiling()
+      await waitFor(() => h.finalizations.length === 1)
+    } finally {
+      releaseLookup(); releaseFiling()
+      await h.controller.stop()
+    }
+  })
+
+  test("canceling a caption reply does not strand the next accepted original", async () => {
+    let release!: () => void
+    const h = harness({storage: new FakeStorage(), finalizeGates: [new Promise<void>(resolve => {release = resolve})]})
+    await start(h)
+    try {
+      await h.controller.sendImage({imageId: "canceled-first", mimeType: "image/png", data: "AQID"})
+      await h.controller.sendImage({imageId: "queued-second", mimeType: "image/png", data: "BAUG"})
+      await completePhotoCaption(h.sockets[0], "canceled-first", "A fictional red square.", "canceled-save")
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+      h.sockets[0].message({toolCallCancellation: {ids: ["canceled-save"]}})
+      completeTurn(h, "A fictional question.", "A fictional answer.")
+      const invitations = () => h.sockets[0].sent.filter(value => JSON.parse(value).realtimeInput?.text === "nokoru").length
+      const before = invitations()
+      release()
+      await waitFor(() => invitations() > before)
+      expect(functionResponses(h.sockets[0]).some(response => response.id === "canceled-save")).toBe(false)
+      await waitPhotoTask(h.sockets[0], "queued-second", false)
+    } finally {
+      release()
+      await h.controller.stop()
+    }
+  })
+
+  test("reconnect drops old readiness IDs and invites queued work on the new socket", async () => {
+    let idle = false
+    const h = harness({storage: new FakeStorage(), canInvite: () => idle})
+    await start(h)
+    try {
+      await h.controller.sendImage({imageId: "replacement-photo", mimeType: "image/png", data: "AQID"})
+      h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "fictional-handle"}})
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "old-ready", name: "nothing_to_add", args: {}}]},
+        serverContent: {turnComplete: true}})
+      h.sockets[0].close()
+      await waitFor(() => h.sockets.length === 2)
+      h.sockets[1].open()
+      h.sockets[1].message({setupComplete: {}})
+      await waitFor(() => h.reconnecting.at(-1) === false)
+      idle = true
+      h.controller.resumeBackgroundWork()
+      await waitFor(() => h.sockets[1].sent.some(value => JSON.parse(value).realtimeInput?.text === "nokoru"))
+      expect(functionResponses(h.sockets[1]).some(response => response.id === "old-ready")).toBe(false)
+      await waitPhotoTask(h.sockets[1], "replacement-photo", false)
+    } finally { await h.controller.stop() }
+  })
+
+  test("caption and co-packet readiness cannot consume the next original or its retry", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    try {
+      await h.controller.sendImage({imageId: "packet-first", mimeType: "image/png", data: "AQID"})
+      await h.controller.sendImage({imageId: "packet-next", mimeType: "image/png", data: "BAUG"})
+      await waitPhotoTask(h.sockets[0], "packet-first")
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "packet-save", name: "save_photo_caption", args: {image_id: "packet-first", caption: "A fictional red square."}},
+        {id: "packet-ready", name: "nothing_to_add", args: {}},
+      ]}, serverContent: {turnComplete: true}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "packet-save"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "packet-ready"))
+        .toMatchObject({response: {ok: true}, scheduling: "SILENT"})
+      expect(h.sockets[0].sent.filter(value => photoTask(JSON.parse(value)))).toHaveLength(1)
+      const next = await providerReady(h.sockets[0])
+      expect(next).toMatchObject({response: {task: "please-caption-packet-next"}, scheduling: "WHEN_IDLE"})
+    } finally { await h.controller.stop() }
+  })
+
+  test.each([true, false])("Stop does not wait out its budget for completed or parked work (durable=%s)", async durable => {
+    const h = harness({storage: new FakeStorage(), photoDrainTimeoutMs: 1_000,
+      finalizeStatuses: durable ? [] : [500]})
+    await start(h)
+    await h.controller.sendImage({imageId: "finished-photo", mimeType: "image/png", data: "AQID", speakDescription: durable})
+    await completePhotoCaption(h.sockets[0], "finished-photo", "A fictional green notebook.")
+    await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "caption-finished-photo"))
+    // The model may complete its receipt turn without another readiness call.
+    h.sockets[0].message({serverContent: {turnComplete: true}})
+    if (durable) {
+      await waitFor(() => h.sockets[0].sent.some(value => value.includes("Describe this image")))
+      completeTurn(h, "", "A fictional description.")
+    }
+    const before = Date.now()
+    await h.controller.stop(true)
+    expect(Date.now() - before).toBeLessThan(500)
+    expect(h.controller.pendingImageIds).toEqual(durable ? [] : ["finished-photo"])
+  })
+
+  test("Iris's own playback hold does not time out a photo readiness or spend its retry", async () => {
+    const original = globalThis.setTimeout
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: TimerHandler, ms?: number, ...args: any[]) =>
+      original(callback, ms === 30_000 ? 15 : ms, ...args)) as typeof setTimeout)
+    let idle = true
+    const storage = new FakeStorage()
+    const h = harness({storage, canInvite: () => idle})
+    try {
+      await start(h)
+      await h.controller.sendImage({imageId: "held-photo", mimeType: "image/png", data: "AQID"})
+      expect((await providerReady(h.sockets[0])).response).toEqual(PHOTO_NEXT)
+      idle = false
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "held-ready", name: "nothing_to_add", args: {}}]},
+        serverContent: {turnComplete: true}})
+      await new Promise(resolve => original(resolve, 50))
+      expect(h.controller.pendingPhotoIds).toEqual([])
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed).not.toBe(true)
+      idle = true
+      h.controller.resumeBackgroundWork()
+      await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "held-ready"))
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "held-ready"))
+        .toMatchObject({response: {task: "please-caption-held-photo"}})
+    } finally { timer.mockRestore(); await h.controller.stop() }
+  })
+
+  test("the original Stop deadline can extend and expires without dispatching more work", async () => {
+    let deadline = Date.now() + 20
+    const storage = new FakeStorage()
+    const h = harness({storage, getStopDeadline: () => deadline})
+    await start(h)
+    await h.controller.sendImage({imageId: "deadline-photo", mimeType: "image/png", data: "AQID"})
+    deadline = Date.now() + 25
+    const stopping = h.controller.stop(true)
+    deadline += 500
+    h.controller.refreshStopDeadline()
+    await new Promise(resolve => setTimeout(resolve, 40))
+    expect(h.sockets[0].readyState).toBe(1)
+    deadline = Date.now() - 1
+    h.controller.refreshStopDeadline()
+    await stopping
+    expect(h.sockets[0].readyState).toBe(3)
+    expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0]).toMatchObject({retryRequested: true})
+    expect(h.sockets[0].sent.filter(value => photoTask(JSON.parse(value)))).toEqual([])
+  })
+
+  test("an expired Stop budget admits neither a new photo job nor another nokoru", async () => {
+    let deadline = Date.now() + 1_000
+    let idle = false
+    const h = harness({storage: new FakeStorage(), canInvite: () => idle, getStopDeadline: () => deadline})
+    await start(h)
+    await h.controller.sendImage({imageId: "expired-photo", mimeType: "image/png", data: "AQID"})
+    // Expiry and the next resume happen in the same stack, before teardown's microtask.
+    deadline = Date.now() - 1
+    const stopping = h.controller.stop(true)
+    idle = true
+    h.controller.resumeBackgroundWork()
+    await stopping
+    expect(h.sockets[0].sent.some(value => JSON.parse(value).realtimeInput?.text === "nokoru")).toBe(false)
+    expect(h.sockets[0].sent.filter(value => photoTask(JSON.parse(value)))).toEqual([])
+  })
+
+  test.each([false, true])("a stalled photo recovers the queue or reports an unusable connection (resumable=%s)", async resumable => {
+    const original = globalThis.setTimeout
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: TimerHandler, ms?: number, ...args: any[]) =>
+      original(callback, ms === 30_000 ? 25 : ms, ...args)) as typeof setTimeout)
+    const h = harness({storage: new FakeStorage()})
+    try {
+      await start(h)
+      await h.controller.sendImage({imageId: "stalled-photo", mimeType: "image/png", data: "AQID"})
+      await h.controller.sendImage({imageId: "after-stall", mimeType: "image/png", data: "BAUG"})
+      await waitPhotoTask(h.sockets[0], "stalled-photo")
+      if (resumable) h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "fictional-stall-handle"}})
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "A provider-only stalled thought."}}})
+      await waitFor(() => h.controller.pendingPhotoIds.includes("stalled-photo"))
+      if (resumable) {
+        await waitFor(() => h.sockets.length === 2)
+        h.sockets[1].open()
+        h.sockets[1].message({setupComplete: {}})
+        await waitFor(() => h.reconnecting.at(-1) === false)
+        await waitPhotoTask(h.sockets[1], "after-stall", false)
+        expect(h.errors).toEqual([])
+      } else {
+        await waitFor(() => h.errors.includes("Gemini connection closed"))
+      }
+    } finally { timer.mockRestore(); await h.controller.stop() }
+  })
+
+  test.each(["close", "goAway"] as const)("terminal %s reconnect failure ends Stop without waiting out the budget", async reason => {
+    const h = harness({storage: new FakeStorage(), photoDrainTimeoutMs: 1_000, tokenStatuses: [403]})
+    await start(h)
+    await h.controller.sendImage({imageId: "offline-photo", mimeType: "image/png", data: "AQID"})
+    await waitPhotoTask(h.sockets[0], "offline-photo")
+    h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "fictional-stop-handle"}})
+    const before = Date.now()
+    const stopping = h.controller.stop(true)
+    if (reason === "close") h.sockets[0].close()
+    else h.sockets[0].message({goAway: {timeLeft: "0.1s"}})
+    await stopping
+    expect(Date.now() - before).toBeLessThan(500)
+    expect(h.controller.pendingPhotoIds).toEqual(["offline-photo"])
+    expect(h.requests.some(request => request.url.endsWith("/token"))).toBe(true)
+  })
+
+  test.each([false, true])("the shared Stop deadline caps reflection (already elapsed=%s)", async elapsed => {
+    let deadline = Date.now() + (elapsed ? -1 : 1_000)
+    const h = harness({getStopDeadline: () => deadline})
+    await start(h)
+    completeTurn(h, "A fictional morning.", "A bright one.")
+    completeTurn(h, "A fictional evening.", "A calm one.")
+    const stopping = h.controller.stop(true)
+    if (!elapsed) {
+      await waitFor(() => h.sockets[0].sent.some(value => value.includes("Reflect briefly")))
+      deadline = Date.now() - 1
+      h.controller.refreshStopDeadline()
+    }
+    await stopping
+    expect(h.sockets[0].sent.some(value => value.includes("Reflect briefly"))).toBe(!elapsed)
+    expect(h.sockets[0].readyState).toBe(3)
   })
 
   test.each(["Snapshot image id conflicts", "Soul is paused"])("only a confirmed original conflict permits a new reference (%s)", async detail => {

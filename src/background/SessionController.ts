@@ -4,7 +4,7 @@ import {makeRequestId} from "@mentra/miniapp"
 import type {Channels} from "../shared/channels"
 import type {ImageReferenceRequest, ImageRequest} from "../shared/channels"
 import {formatImageTimestamp, nextImageReference} from "../shared/imageReference"
-import {MIC_SOURCES, type MicSource} from "../shared/types"
+import {MIC_SOURCES, STOP_BACKGROUND_MS, STOP_FOREGROUND_MS, type MicSource} from "../shared/types"
 import type {
   ConnectionState,
   EarconName,
@@ -57,6 +57,8 @@ function trace(event: string, detail: Record<string, unknown> = {}): void {
 }
 
 export class SessionController {
+  private foreground = true
+  private stopStartedAt: number | null = null
   private started = false
   private readonly unsubs: Array<() => void> = []
   private send: Send | null = null
@@ -134,6 +136,8 @@ export class SessionController {
     const ui = this.session.ui as unknown as {
       send: Send
       onOpen: (cb: () => void) => () => void
+      onClose: (cb: () => void) => () => void
+      on: (channel: "openalma:visibility", cb: (payload: unknown) => void) => () => void
       handle: <C extends keyof Channels & string>(
         channel: C,
         handler: (payload: unknown) => Promise<unknown> | unknown,
@@ -143,11 +147,17 @@ export class SessionController {
     this.send = ui.send
     this.preferencesLoaded = this.loadPreferences()
     this.unsubs.push(ui.onOpen(() => {
-      this.pushSnapshot()
+      this.setForeground(true)
       void this.preferencesLoaded.then(() => this.refreshFailedPhotos()).catch((error) => {
         this.lastError = error instanceof Error ? error.message : String(error)
         this.pushSnapshot()
       })
+    }))
+    this.unsubs.push(ui.onClose(() => this.setForeground(false)))
+    this.unsubs.push(ui.on("openalma:visibility", payload => {
+      const visible = (payload as {visible?: unknown} | null)?.visible
+      if (typeof visible !== "boolean") throw new Error("Invalid Iris visibility")
+      this.setForeground(visible)
     }))
     this.unsubs.push(
       ui.handle("openalma:set-profile", async (payload) => {
@@ -414,6 +424,7 @@ export class SessionController {
 
   private snapshot(): SessionSnapshot {
     return {
+      stopDeadlineAt: this.stopDeadline(),
       startGeneration: this.startGeneration,
       configured: Boolean(this.config),
       connectionProfile: this.config ? {baseUrl: this.config.baseUrl,
@@ -515,6 +526,7 @@ export class SessionController {
       this.recoverySoulId = this.soulId
       if (!this.liveController) {
         this.liveController = this.createLiveController({...this.currentConfig(), soulId: this.soulId}, {
+          getStopDeadline: () => this.stopDeadline(),
           canInvite: () => this.connection === "listening" &&
             (this.mode === "continuous" || this.manualPhase === "idle"),
           onAudio: (pcm) => this.onGeminiAudio(pcm),
@@ -625,6 +637,7 @@ export class SessionController {
   private beginTeardown(kind: "stop" | "fail"): number {
     this.liveController?.muteForStop()
     this.connection = "stopping"
+    this.stopStartedAt = kind === "stop" ? Date.now() : null
     this.teardownKind = kind
     this.startGeneration += 1
     this.startInFlight = false
@@ -729,6 +742,18 @@ export class SessionController {
     }
     if (generation !== this.startGeneration) return
     this.teardownKind = null
+    this.stopStartedAt = null
+    this.pushSnapshot()
+  }
+
+  private stopDeadline(): number | null {
+    return this.connection === "stopping" && this.stopStartedAt !== null
+      ? this.stopStartedAt + (this.foreground ? STOP_FOREGROUND_MS : STOP_BACKGROUND_MS) : null
+  }
+
+  private setForeground(visible: boolean): void {
+    this.foreground = visible
+    this.liveController?.refreshStopDeadline()
     this.pushSnapshot()
   }
 
@@ -1180,7 +1205,10 @@ export class SessionController {
   ): Promise<void> {
     if (expected && this.liveController !== expected) return
     const controller = this.liveController
-    this.liveController = null
-    if (controller) await controller.stop(graceful)
+    try {
+      if (controller) await controller.stop(graceful)
+    } finally {
+      if (this.liveController === controller) this.liveController = null
+    }
   }
 }

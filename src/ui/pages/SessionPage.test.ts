@@ -10,6 +10,7 @@ import {
   imageRequest,
   shouldWarnLargeImage,
   statusText,
+  stopSecondsRemaining,
   validateImageFile,
   visibleConnection,
 } from "./SessionPage"
@@ -18,7 +19,7 @@ type Node = {props: Record<string, any>}
 const nodes = (tree: any): any[] => !tree || typeof tree !== "object" ? []
   : Array.isArray(tree) ? tree.flatMap(nodes) : [tree, ...nodes(tree.props?.children)]
 
-function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Promise<unknown>) {
+function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Promise<unknown>, now?: number) {
   if (!("startGeneration" in snapshot)) Object.assign(snapshot, {startGeneration: 1})
   if (!("pendingPhotoIds" in snapshot)) Object.assign(snapshot, {pendingPhotoIds: ["local-photo"]})
   const states: unknown[] = []
@@ -27,6 +28,7 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
   let refCursor = 0
   const context = {
     exports: {}, btoa, localStorage: {getItem: () => null},
+    ...(now === undefined ? {} : {Date: {now: () => now}}),
     require: (name: string) => {
       if (name === "react") return {
         useState(initial: unknown) {
@@ -195,6 +197,39 @@ describe("SessionPage state projection", () => {
     expect(visibleConnection("idle", true, true)).toBe("stopping")
     expect(visibleConnection("error", true, false)).toBe("starting")
     expect(visibleConnection("idle", false, false)).toBe("idle")
+  })
+
+  test("Stop countdown rounds up partial seconds and clamps expired deadlines", () => {
+    const stoppedAt = 1_000_000
+    const deadline = stoppedAt + 30_000
+    expect([0, 1, 999, 1000, 29_999, 30_000, 45_000].map(elapsed =>
+      stopSecondsRemaining(deadline, stoppedAt + elapsed))).toEqual([30, 30, 30, 29, 1, 0, 0])
+    expect(stopSecondsRemaining(stoppedAt + 300_000, stoppedAt + 45_000)).toBe(255)
+  })
+
+  test("inline Stop countdown uses the snapshot deadline and clears when Start is enabled early", async () => {
+    const now = 1_000_000
+    const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
+      soulConfirmed: true, soulLocked: false, connection: "idle", stopDeadlineAt: null as number | null}
+    const render = renderPage(snapshot, async () => ({soulId: "Quill", created: false}), now)
+    // This fixture skips effects, so establish the selected Soul through its existing UI actions.
+    nodes(render()).find(node => node.props?.onFocus).props.onChange({target: {value: "Quill"}})
+    await nodes(render()).find(node => node.props?.["aria-label"] === "Use soul").props.onClick()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    snapshot.connection = "stopping"
+    const countdown = () => nodes(render()).find(node => node.type === "span" && node.props["aria-live"] === "off")
+    const button = () => nodes(render()).find(node => node.props?.className === "sitting-button")
+    for (const [deadline, seconds] of [[now + 30_000, 30], [now + 255_000, 255], [now - 15_000, 0]]) {
+      snapshot.stopDeadlineAt = deadline
+      expect(countdown().props.children).toEqual([" ", seconds, "s remaining"])
+      expect(button().props.disabled).toBe(true)
+      expect(JSON.stringify(button())).toContain("Stopping...")
+    }
+    snapshot.stopDeadlineAt = null
+    snapshot.connection = "idle"
+    expect(countdown()).toBeUndefined()
+    expect(button().props.disabled).toBe(false)
+    expect(JSON.stringify(button())).toContain("Start")
   })
 
   test.each(["Is memU running?", "Owner discovery failed (409)", "Owner discovery failed (503)"])(

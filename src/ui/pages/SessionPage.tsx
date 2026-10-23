@@ -63,6 +63,9 @@ export function validateImageFile(file: Pick<File, "size" | "type">): "image/jpe
 export const shouldWarnLargeImage = (size: number, warningDismissed: boolean) =>
   size > LARGE_IMAGE_BYTES && !warningDismissed
 
+export const stopSecondsRemaining = (deadline: number, now = Date.now()) =>
+  Math.max(0, Math.ceil((deadline - now) / 1000))
+
 export async function imageRequest(
   file: File,
   imageId: string,
@@ -93,6 +96,7 @@ export default function SessionPage() {
   const pendingImageRpc = useRpc<Channels, "openalma:pending-image">("openalma:pending-image")
   const [startPending, setStartPending] = useState(false)
   const [stopPending, setStopPending] = useState(false)
+  const [stopNow, setStopNow] = useState(Date.now)
   const [soulName, setSoulName] = useState("")
   const [soulDirty, setSoulDirty] = useState(true)
   const [soulPending, setSoulPending] = useState(false)
@@ -162,6 +166,26 @@ export default function SessionPage() {
   const visible = visibleConnection(connection, startPending, stopPending)
   const starting = visible === "starting"
   const stopping = visible === "stopping"
+  const stopDeadline = snapshot?.stopDeadlineAt ?? null
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | undefined
+    const publish = (foreground: boolean) => {
+      mentra.send("openalma:visibility", {visible: foreground})
+      setStopNow(Date.now())
+      if (timer !== undefined) clearInterval(timer)
+      timer = stopping && foreground ? setInterval(() => setStopNow(Date.now()), 1000) : undefined
+    }
+    const visibility = () => publish(!document.hidden)
+    const hide = () => publish(false)
+    document.addEventListener("visibilitychange", visibility)
+    window.addEventListener("pagehide", hide)
+    visibility()
+    return () => {
+      document.removeEventListener("visibilitychange", visibility)
+      window.removeEventListener("pagehide", hide)
+      if (timer !== undefined) clearInterval(timer)
+    }
+  }, [stopping])
   const reconnecting = visible === "reconnecting"
   const active = starting || reconnecting || visible === "listening" || visible === "speaking"
   const modeDisabled = active || stopping || startPending || stopPending || modePending
@@ -455,6 +479,7 @@ export default function SessionPage() {
       <p className="status" role="status" aria-live="polite">
         {showSpinner ? <span className="spinner" aria-hidden="true" /> : null}
         {statusText(visible, mode, manualPhase, snapshot.soulId, microphoneEnabled)}
+        {stopping && stopDeadline !== null ? <span aria-live="off"> {stopSecondsRemaining(stopDeadline, stopNow)}s remaining</span> : null}
       </p>
       {snapshot?.memuAvailable === false ? (
         <p className="memu-status" role="status">

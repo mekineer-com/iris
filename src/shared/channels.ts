@@ -16,6 +16,7 @@ export type SelectSoulResult =
   | {soulId: string; confirmationRequired: true}
 
 export interface Channels {
+  "openalma:visibility": {visible: boolean}
   "openalma:update": SessionSnapshot
   "openalma:set-profile": Rpc<OpenAlmaProfile, {ok: true}>
   "openalma:start": Rpc<{mode: SessionMode}, {ok: true}>

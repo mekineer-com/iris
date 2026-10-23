@@ -6,6 +6,8 @@ export type EarconName = "listen-start" | "listen-stop" | "disconnected"
 export type ManualPhase = "idle" | "recording" | "review" | "submitted"
 export type ManualAction = "talk" | "done" | "redo" | "send"
 export const PHOTO_RETRY_MESSAGE = "Photo processing is unfinished. Retry or discard the pending work."
+export const STOP_FOREGROUND_MS = 30_000
+export const STOP_BACKGROUND_MS = 5 * 60_000
 
 export type OpenAlmaProfile = {
   baseUrl: string
@@ -26,6 +28,7 @@ export interface ImageTime {
 }
 
 export interface SessionSnapshot {
+  stopDeadlineAt: number | null
   startGeneration: number
   configured: boolean
   connectionProfile: OpenAlmaProfile | null

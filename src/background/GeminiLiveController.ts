@@ -2,7 +2,7 @@ import {approxBase64ByteLength} from "./audioHelpers"
 import {timeoutSignal} from "./timeoutSignal"
 import type {OpenAlmaConfig} from "./openAlmaConfig"
 import type {ImageRequest} from "../shared/channels"
-import {MIC_SOURCES, PHOTO_RETRY_MESSAGE, type ImageTime, type MicSource, type PhotoCaption, type SessionMode} from "../shared/types"
+import {MIC_SOURCES, PHOTO_RETRY_MESSAGE, STOP_FOREGROUND_MS, type ImageTime, type MicSource, type PhotoCaption, type SessionMode} from "../shared/types"
 
 type StartResponse = {
   photo_work_protocol: typeof PHOTO_WORK_PROTOCOL
@@ -22,6 +22,7 @@ type StartResponse = {
 export class PhotoUploadConflict extends Error {}
 
 export type GeminiCallbacks = {
+  getStopDeadline?: () => number | null
   canInvite?: () => boolean
   onAudio: (base64Pcm: string) => void
   onTurnComplete: (finalResponse: boolean) => void
@@ -104,6 +105,7 @@ type ToolBatch = {
 }
 
 type PendingToolCall = {
+  photoCaption?: boolean
   invites?: boolean
   name: string
   generation: number
@@ -161,7 +163,6 @@ const TOOL_TIMEOUT_MS = 30_000
 const WRITE_UNCERTAINTY_MESSAGE =
   "Write outcome is uncertain; it may have saved. Read current working state before deciding whether to try again."
 const REFLECTION_TIMEOUT_MS = 8_000
-const PHOTO_DRAIN_TIMEOUT_MS = 30_000
 const RECONNECT_SETUP_ATTEMPTS = 6
 const GO_AWAY_MARGIN_MS = 2_000
 export const JOURNAL_KEY = "openalma:gemini-session-v1"
@@ -309,7 +310,6 @@ export class GeminiLiveController {
   private publishPhotoRetry(): void {
     this.callbacks.onPhotoRetryChange(this.pendingImages.some(image => image.retryRequested))
   }
-  private photoClosingBatch: ToolBatch | null = null
   private previewRevision = 0
   private settledPreviewRevision = -1
   private acceptedCaptions = new Map<string, string>()
@@ -319,6 +319,7 @@ export class GeminiLiveController {
   private drainInputFlushed = false
   private outputMuted = false
   private drainDeadlineAt = 0
+  private stopDeadlineTimer: ReturnType<typeof setTimeout> | null = null
   private drainResolve: (() => void) | null = null
   private imageRetrying = false
   private appendTail: Promise<void> = Promise.resolve()
@@ -355,7 +356,7 @@ export class GeminiLiveController {
     this.openSocket = options.openSocket ?? ((url) => new WebSocket(url) as unknown as SocketLike)
     this.setupTimeoutMs = options.setupTimeoutMs ?? REQUEST_TIMEOUT_MS
     this.heartbeatMs = options.heartbeatMs
-    this.photoDrainTimeoutMs = options.photoDrainTimeoutMs ?? PHOTO_DRAIN_TIMEOUT_MS
+    this.photoDrainTimeoutMs = options.photoDrainTimeoutMs ?? STOP_FOREGROUND_MS
     this.storage = options.storage
   }
 
@@ -388,7 +389,6 @@ export class GeminiLiveController {
     this.draftEvents = []
     this.missingSpeech = false
     this.pendingImages = []
-    this.photoClosingBatch = null
     this.previewRevision = 0
     this.settledPreviewRevision = -1
     this.acceptedCaptions.clear()
@@ -489,8 +489,29 @@ export class GeminiLiveController {
     this.flushToolResponses()
   }
 
+  refreshStopDeadline(): void {
+    if (!this.draining && !this.reflecting) return
+    const supplied = this.callbacks.getStopDeadline?.()
+    if (supplied !== null && supplied !== undefined) this.drainDeadlineAt = supplied
+    else if (!this.draining) return
+    this.clearStopDeadlineTimer()
+    const finish = () => {
+      if (this.draining) this.drainResolve?.()
+      if (this.reflecting) this.finishReflection(null)
+    }
+    const remaining = this.drainDeadlineAt - Date.now()
+    if (remaining <= 0) finish()
+    else this.stopDeadlineTimer = setTimeout(finish, remaining)
+  }
+
+  private clearStopDeadlineTimer(): void {
+    if (this.stopDeadlineTimer) clearTimeout(this.stopDeadlineTimer)
+    this.stopDeadlineTimer = null
+  }
+
   private sendInvitation(): void {
     this.requestSpokenPhotoDescription()
+    if (this.draining && Date.now() >= this.drainDeadlineAt) { this.refreshStopDeadline(); return }
     if (!this.invitationPending || this.handlingMessage || !this.ready || this.stopping || (this.stopPromise && !this.draining) || (this.outputMuted && !this.draining) ||
         this.reconnecting || this.goAwayPending || this.reflecting || this.activityPauseReason ||
         this.voiceActive || this.turnActive || this.toolBatch.started || this.spokenRequest || this.photoJob ||
@@ -613,7 +634,6 @@ export class GeminiLiveController {
 
     if (pending.mediaRef && pending.mediaRef !== mediaRef) throw new Error("OpenAlma snapshot media reference changed")
     pending.mediaRef = mediaRef
-    this.photoClosingBatch = null
     pending.speakDescription = image.speakDescription === true
     pending.generation = this.generation
     pending.sessionId = this.sessionId
@@ -668,7 +688,6 @@ export class GeminiLiveController {
     }
     image.providerSent = false
     image.retryUsed = false
-    this.photoClosingBatch = null
     if (this.photoJob?.image === image) this.clearPhotoJob()
     await this.retryPendingImage(true, image)
   }
@@ -700,7 +719,6 @@ export class GeminiLiveController {
         socket.readyState !== WS_OPEN || !this.pendingImages.includes(image) || (this.stopPromise && !this.draining)) return false
     socket.send(JSON.stringify({realtimeInput: {video: {data, mimeType}}}))
     this.previewRevision += 1
-    this.photoClosingBatch = null
     this.invitationPending = true
     return true
   }
@@ -727,6 +745,7 @@ export class GeminiLiveController {
   }
 
   private dispatchPhotoWork(): void {
+    if (this.draining && Date.now() >= this.drainDeadlineAt) { this.refreshStopDeadline(); return }
     if (!this.ready || this.stopping || this.reflecting || this.activityPauseReason || this.imageRetrying || (this.outputMuted && !this.draining) ||
         (this.stopPromise && !this.draining) || (this.draining && !this.drainInputFlushed)) return
     while (true) {
@@ -734,13 +753,12 @@ export class GeminiLiveController {
         call.dispatched && call.response === undefined)
       if (!ready) return
       const [id, call] = ready
-      if (this.photoJob?.batch === call.batch) { call.response = {ok: true}; continue }
+      if (this.photoJob?.batch === call.batch || call.photoCaption) { call.response = {ok: true}; continue }
       if (this.photoJob?.phase === "loading" || this.photoJob?.phase === "filing" || this.imageFinalization ||
           [...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption" && call.response === undefined)) return
       const image = this.photoJob?.image ?? this.pendingImages.find(image => !image.caption && !image.retryRequested && image.mediaRef)
       if (!image) {
         call.response = {ok: true}
-        this.photoClosingBatch = call.batch
         continue
       }
       if (!this.draining && (this.voiceActive || this.turnActive || (this.spokenRequest && !this.spokenRequest.retired) ||
@@ -771,10 +789,10 @@ export class GeminiLiveController {
     const response = await this.request(`/integration/mentra/session/${this.sessionId}/snapshot/replay`, {
       user_id: this.config.userId, soul_id: this.config.soulId, image_id: image.imageId,
     }, SNAPSHOT_TIMEOUT_MS)
-    if (this.photoJob !== job || !this.isCurrentToolCall(id, call)) return
+    if (this.photoJob !== job || job.phase !== "loading" || image.caption || !this.isCurrentToolCall(id, call)) return
     if (!response.ok) throw new Error(`Photo original lookup failed (${response.status})`)
     const replay = await response.json()
-    if (this.photoJob !== job || !this.isCurrentToolCall(id, call)) return
+    if (this.photoJob !== job || job.phase !== "loading" || image.caption || !this.isCurrentToolCall(id, call)) return
     if (this.activityPauseReason) throw new Error(this.activityPauseReason)
     const filed = this.filingCaption(replay.filing)
     if (filed !== null) {
@@ -807,7 +825,7 @@ export class GeminiLiveController {
     this.enqueueImageMarker(image)
     await this.persistJournal()
     this.scheduleAppend()
-    if (this.photoJob !== job || !this.isCurrentToolCall(id, call)) return
+    if (this.photoJob !== job || job.phase !== "loading" || image.caption || !this.isCurrentToolCall(id, call)) return
     if (this.activityPauseReason) throw new Error(this.activityPauseReason)
     call.parts = [{inlineData: {mimeType: replay.mime_type, data: replay.data}}]
     call.scheduling = "WHEN_IDLE"
@@ -829,7 +847,6 @@ export class GeminiLiveController {
         return
       }
       this.invitationPending = true
-      this.photoClosingBatch = null
       await this.persistJournal()
       if (generation !== this.generation || !this.pendingImages.includes(pending)) return
       this.publishPhotoRetry()
@@ -859,7 +876,6 @@ export class GeminiLiveController {
         pending.mediaRef = replay.media_ref
         pending.retryRequested = false
         this.invitationPending = true
-        this.photoClosingBatch = null
       }
       await this.persistJournal()
       this.publishPhotoRetry()
@@ -902,15 +918,16 @@ export class GeminiLiveController {
     try {
       this.flushToolResponses()
       const drainAttempted = graceful && Boolean(
-        (this.pendingImage && (this.imageUpload || !this.pendingImage.retryRequested)) ||
-        this.photoJob || (this.previewRevision > 0 && this.photoClosingBatch?.completed !== true))
-      const stoppedMidTurn = this.turnActive || (!drainAttempted && this.toolBatch.started && this.toolBatch.background)
+        this.imageUpload || this.pendingImages.some(image => !image.retryRequested) ||
+        this.photoJob || (this.toolBatch.started && this.toolBatch.background))
+      const stoppedMidTurn = this.turnActive && (!this.toolBatch.invitation || this.turnAudioDelivered ||
+        Boolean(this.spokenRequest && !this.spokenRequest.retired))
       if (drainAttempted) await this.drainPhoto()
       if (stoppedMidTurn || this.outputTranscript.trim()) {
         this.finalizeInterruptedTurn()
         this.interruptionFinalized = false
       }
-      if (graceful && (!drainAttempted || !this.pendingImage) && (!this.photoClosingBatch || this.photoClosingBatch.completed) &&
+      if (graceful && (!drainAttempted || !this.pendingImages.some(image => !image.retryRequested)) && !this.toolBatch.started &&
           !this.activityPauseReason && !stoppedMidTurn && this.ready && this.completeUserTurns >= 2) {
         trace("provider.reflection.begin")
         const reflection = await this.requestReflection()
@@ -953,6 +970,7 @@ export class GeminiLiveController {
       this.clearHeartbeat()
       this.clearDurationWarning()
       this.clearGoAway()
+      this.clearStopDeadlineTimer()
       if (graceful) {
         this.resumptionHandle = ""
         this.resumptionUpdatedAt = 0
@@ -973,9 +991,8 @@ export class GeminiLiveController {
     this.draining = true
     this.drainInputFlushed = false
     this.drainDeadlineAt = Date.now() + this.photoDrainTimeoutMs
-    let timeout!: ReturnType<typeof setTimeout>
     const completion = new Promise<void>(resolve => { this.drainResolve = resolve })
-    const deadline = new Promise<void>(resolve => { timeout = setTimeout(resolve, this.photoDrainTimeoutMs) })
+    this.refreshStopDeadline()
     const work = async () => {
       await this.imageUpload?.catch(() => {})
       if (!this.draining || this.stopping) return
@@ -1006,11 +1023,11 @@ export class GeminiLiveController {
       await completion
     }
     try {
-      await Promise.race([work(), deadline])
+      await Promise.race([work(), completion])
     } catch (error) {
       this.reportError(error instanceof Error ? error : new Error(String(error)))
     } finally {
-      clearTimeout(timeout)
+      this.clearStopDeadlineTimer()
       this.draining = false
       this.clearPhotoJob()
       this.drainResolve?.()
@@ -1024,7 +1041,7 @@ export class GeminiLiveController {
 
   private finishPhotoDrainIfAcknowledged(): void {
     if (!this.pendingImages.some(image => !image.retryRequested) && !this.imageFinalization &&
-        this.photoClosingBatch?.completed === true && !this.photoJob && !this.imageUpload &&
+        !this.toolBatch.started && !this.turnActive && !this.photoJob && !this.imageUpload &&
         ![...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption")) {
       this.drainResolve?.()
     }
@@ -1272,6 +1289,7 @@ export class GeminiLiveController {
       }
     } finally {
       this.reconnecting = false
+      if (this.draining && !this.ready) this.drainResolve?.()
       this.resumeBackgroundWork()
     }
   }
@@ -1488,6 +1506,7 @@ export class GeminiLiveController {
     const dispatch: Array<() => void> = []
     for (const {id, name, args} of parsed) {
       const pending: PendingToolCall = {
+        photoCaption: name === "nothing_to_add" && parsed.some(call => call.name === "save_photo_caption"),
         name,
         generation: this.generation,
         sessionId: this.sessionId,
@@ -1649,6 +1668,14 @@ export class GeminiLiveController {
       image.captionEventId ??= `${image.sessionId}:photo:${image.imageId}`
       image.retryRequested = false
       if (this.photoJob?.image === image) {
+        const job = this.photoJob
+        const readiness = this.pendingToolCalls.get(job.callId)
+        if (readiness) {
+          readiness.parts = undefined
+          readiness.response = {ok: true}
+          readiness.scheduling = "SILENT"
+        }
+        if (job.retryReserved && job.phase !== "dispatched") image.retryUsed = false
         this.photoJob.phase = "filing"
         if (this.photoTimer) clearTimeout(this.photoTimer)
         this.photoTimer = null
@@ -1663,7 +1690,7 @@ export class GeminiLiveController {
     const durable = this.acceptedCaptions.get(imageId) === caption
     if (this.photoJob?.image === image) this.clearPhotoJob()
     call.scheduling = durable ? "WHEN_IDLE" : "SILENT"
-    if (!durable && this.pendingImages.some(image => !image.retryRequested && !image.caption)) this.invitationPending = true
+    if (!this.isCurrentToolCall(id, call) || (!durable && this.pendingImages.some(image => !image.retryRequested && !image.caption))) this.invitationPending = true
     this.completeToolCall(id, call, {ok: durable, durable}, false)
     this.flushToolResponses()
   }
@@ -1756,6 +1783,10 @@ export class GeminiLiveController {
         continue
       }
       if (!this.ready || !this.socket || this.socket.readyState !== WS_OPEN) continue
+      if (pending.scheduling === "WHEN_IDLE" && this.draining && Date.now() >= this.drainDeadlineAt) {
+        this.refreshStopDeadline()
+        continue
+      }
       if (pending.scheduling === "WHEN_IDLE" && this.outputMuted && (!this.draining || !this.drainInputFlushed)) continue
       if (pending.parts && this.photoJob?.callId === id && this.settledPreviewRevision !== this.previewRevision) {
         const job = this.photoJob
@@ -1790,14 +1821,27 @@ export class GeminiLiveController {
           void this.persistJournal()
         }
         if (this.photoTimer) clearTimeout(this.photoTimer)
-        this.photoTimer = setTimeout(() => {
+        const expire = () => {
           if (this.photoJob !== job || job.phase === "filing") return
+          // Iris holds readiness during human speech/playback; that is not a model timeout.
+          const heldReadiness = [...this.pendingToolCalls.values()].some(call => call.name === "nothing_to_add")
+          if (!this.draining && (this.voiceActive || (heldReadiness && this.callbacks.canInvite?.() === false) ||
+              (this.spokenRequest && !this.spokenRequest.retired))) {
+            this.photoTimer = setTimeout(expire, TOOL_TIMEOUT_MS)
+            return
+          }
+          const stalledBatch = this.toolBatch
           this.clearPhotoJob()
           void this.requestPhotoRetry(job.image).then(() => {
             if (this.pendingImages.some(image => !image.retryRequested && !image.caption)) this.invitationPending = true
+            // A missing native completion cannot be invented; recover through the existing socket lifecycle.
+            if (!this.draining && this.toolBatch === stalledBatch && !this.photoJob &&
+                (this.toolBatch.started || this.turnActive) && !this.voiceActive &&
+                (!this.spokenRequest || this.spokenRequest.retired)) this.socket?.close()
             this.resumeBackgroundWork()
           })
-        }, TOOL_TIMEOUT_MS)
+        }
+        this.photoTimer = setTimeout(expire, TOOL_TIMEOUT_MS)
       }
       if (pending.scheduling === "WHEN_IDLE") {
         if (pending.batch.completed) this.toolBatch.started = true
@@ -1844,6 +1888,9 @@ export class GeminiLiveController {
   }
 
   private disconnectToolBatch(): void {
+    for (const [id, call] of this.pendingToolCalls) {
+      if (call.name === "nothing_to_add") this.pendingToolCalls.delete(id)
+    }
     // A dropped socket is not proof of native completion. Preserve settled
     // obligations, but do not manufacture a wake for unfinished provider work.
     if (this.spokenRequest && (!this.spokenRequest.settled || this.spokenRequest.continuing)) {
@@ -2110,7 +2157,6 @@ export class GeminiLiveController {
 
   private requestSpokenPhotoDescription(): void {
     if (!this.spokenPhotos.length || this.turnActive || this.toolBatch.started || this.stopPromise || this.stopping || this.reflecting ||
-        (this.previewRevision > 0 && this.photoClosingBatch?.completed !== true) ||
         this.callbacks.canInvite?.() === false || this.voiceActive ||
         this.photoJob || this.imageFinalization || this.pendingImages.some(image => !image.retryRequested) ||
         (this.spokenRequest && !this.spokenRequest.retired) ||
@@ -2396,14 +2442,19 @@ export class GeminiLiveController {
   }
 
   private requestReflection(): Promise<string | null> {
+    const deadline = this.callbacks.getStopDeadline?.()
+    if (deadline !== null && deadline !== undefined && deadline <= Date.now()) return Promise.resolve(null)
     this.reflecting = true
     this.clearTurn()
     return new Promise((resolve) => {
       const timeout = setTimeout(() => this.finishReflection(null), REFLECTION_TIMEOUT_MS)
       this.reflectionResolve = (value) => {
         clearTimeout(timeout)
+        this.clearStopDeadlineTimer()
         resolve(value)
       }
+      this.refreshStopDeadline()
+      if (!this.reflecting) return
       try {
         this.socket!.send(
           JSON.stringify({
@@ -2482,6 +2533,7 @@ export class GeminiLiveController {
       this.reportError(new Error("Gemini connection closed"))
     } finally {
       this.reconnecting = false
+      if (this.draining && !this.ready) this.drainResolve?.()
       this.resumeBackgroundWork()
     }
   }

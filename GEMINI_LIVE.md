@@ -151,8 +151,14 @@ provider resumption. A different photo cannot implicitly discard pending work.
 An optional spoken description remains separate from this internal caption.
 
 Normal Stop mutes provider output before callbacks and retains the socket/lease
-for a shared 30-second caption handoff window. The visible countdown and
-focus-aware five-minute extension remain planned, not implemented here. Continuous Stop flushes existing
+for a shared 30-second foreground allowance, shown as an inline countdown. While
+Iris lacks focus, the allowance extends to five minutes from the original Stop,
+not from the focus change. Returning after 30 elapsed seconds ends admission
+immediately. Work may finish early; no compulsory delay or popup is added.
+The same deadline caps reflection. Native UI close/open and WebView visibility
+update the actual provider deadline, not only its display. Hidden execution is
+not guaranteed by the host; the absolute deadline is checked on return.
+Continuous Stop flushes existing
 audio with 1.8 seconds of real-time-paced silence and `audioStreamEnd`, then
 waits for the preceding response's native completion before a new image
 turn. `audioStreamEnd` alone cannot release that fence. The existing flush owner
@@ -161,7 +167,10 @@ Stop does not send an unsent take. Replay cannot deliver a task mid-flush or
 after the drain closes. An already-delivered task is not resent merely
 because Stop was pressed. Timeout is logged and retains recovery state. Optional
 reflection follows both handoff and the caption's native completion, even if the
-handoff preceded Stop. An unrelated failed photo does not suppress reflection.
+handoff preceded Stop. A receipt turn that genuinely completes without another
+readiness call is sufficient; parked originals alone do not hold Stop open.
+Stop waits for a pending nokoru reply before reflection rather than silently
+skipping the summary because an internal cue was outstanding. An unrelated failed photo does not suppress reflection.
 Its text can settle at
 `generationComplete` rather than waiting for delayed playback completion.
 
