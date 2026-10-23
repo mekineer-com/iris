@@ -14,13 +14,14 @@ No model/configuration cutover has occurred. Photo/tool plumbing, late-speech
 reservations and requested-answer scheduling are implemented locally.
 The current source is not a release-ready migration.
 
-Checkpoint-3 foundations, 2026-10-22: Start requires and echoes
-`photo_work_protocol: "iris-photo-work-v1"`. Iris refuses a missing/mismatched
+The coordinated ordinary-photo contract requires and echoes
+`photo_work_protocol: "iris-photo-work-v2"`. Iris refuses a missing/mismatched
 response marker before opening Gemini and releases any acquired lease. Token
 mint/renewal expose six NON_BLOCKING tools, including argument-free
-`nothing_to_add`; Iris handles its empty acknowledgment locally with SILENT,
-without taking away a pending human answer's continuation. Startup/photo prompt
-replacement and the text-invitation/inline-job dispatcher are not yet applied.
+`nothing_to_add`; Iris handles it through the local photo dispatcher, using
+SILENT for an empty acknowledgment without taking away a pending human answer's
+continuation. The deliberate-photo startup instruction and inline-job path are
+implemented. The combined camera/selection prompt is not enabled.
 The delivery/accounting behavior below still describes the current photo sender.
 
 ## Source Contract
@@ -93,66 +94,50 @@ the same ID. The file picker is bound to the sitting in which it opened.
 
 ### Internal photo task
 
-Iris snapshots the original in OpenAlma before provider delivery; upload and
-replay each allow 120 seconds. Between spoken turns it sends the original as
-realtime video, then the unchanged caption task after 500 ms:
+Iris stores each original in OpenAlma before provider delivery. Upload and stored
+original lookup retain their existing 120-second request deadline. A newly
+chosen/taken photo is previewed as realtime video, including during conversation;
+that preview does not request a caption. Recovered originals are not replayed
+as standalone video over a newer preview. Captioning has one path only:
 
-```json
-{"realtimeInput":{"video":{"data":"<base64>","mimeType":"image/jpeg"}}}
-{"realtimeInput":{"text":"image_id: <id>\n<PHOTO_CAPTION_INSTRUCTION>"}}
-```
+1. At a quiet opening, an eligible readiness call or one coalesced `nokoru`
+   invitation starts work. Manual recording/review and actual playback hold new
+   jobs. Ordinary memory results retain their existing requested-answer behavior.
+2. The first `nothing_to_add` after fresh previews receives only
+   `{"next":"A photo task is ready. Call nothing_to_add to receive it."}`,
+   scheduled WHEN_IDLE. A fresh preview during lookup/preparation requires this
+   settling step again. Same-cohort calls do not bypass it or consume a retry.
+3. A distinct readiness call receives `response.task: "please-caption-<id>"`
+   and that exact stored original in `functionResponses[].parts[].inlineData`,
+   with the actual provider call ID and WHEN_IDLE scheduling. No separate caption
+   text turn, 500ms timer, IMAGE-token baseline or ingestion-count gate exists.
+4. `save_photo_caption` names its exact original. A valid first caption is
+   journaled and handed off independently of timeline append. Its successful
+   durable receipt uses WHEN_IDLE so the next readiness call can follow.
+5. An empty queue gets `{"ok":true}` / SILENT. Stop and optional spoken
+   descriptions wait for that real closing-readiness native completion; Iris
+   never manufactures a provider completion event.
 
-The text contains `image_id: <id>` and `PHOTO_CAPTION_INSTRUCTION`, the exact
-Marcos-approved wording.
-Manual mode disables automatic activity detection, so its delayed text uses
-`clientContent` with one user text part and `turnComplete: true`. Continuous
-mode retains the realtime text shown above. Neither photo path sends activity
-markers or admits a spoken request. An activityStart/text/activityEnd sequence
-without audio caused a real1007 "Precondition check failed" and destroyed the
-provider session; subsequent1008 resumption errors were its consequence.
-The original video stays500ms before the text in both modes. The explicit text
-turn passed a quiet, grounded Manual provider check before implementation.
-Receipt-checked replay adds Marcos's approved line before the unchanged caption
-instruction: "Your memory store didn't receive the photo caption. Please send it!"
-This covers reconnect recovery, automatic/explicit Retry and deferred delivery;
-it is not added to direct initial delivery. Existing accepted receipts return
-without resending either image or request. The line reports missing filing,
-not proof that Gemini saw the image or never attempted a tool call. Accounting,
-normal native completion and durable handoff remain required.
-Immediate separate delivery failed three cold checks;500ms spacing passed
-those three but later missed a photo after resumption.
-The wait alone is not acknowledgment. The reviewed candidate therefore holds
-tool captions provisionally until normal native response completion and a
-response-owned IMAGE token count above the pre-photo baseline. Only then may the
-caption enter the journal's accepted-caption field, timeline or durable filing.
-Preview rows can appear earlier without a green check. JPEG and PNG remain
-native inputs. Caption content comes only from `save_photo_caption`,
-never from a nearby answer or output transcription. Its `photo_caption` event
-carries the original's `media_ref` and has no spoken-transcript status.
+One existing arrival-ordered pending collection owns recovery; one active job
+tracks loading, settling, dispatch and filing. Valid late captions target their
+known dispatched original, not whichever photo is first. Wrong/undispatched IDs
+and conflicting captions cannot file. An image-based caption receipt ID is stable
+across timeline replacement. Actual human speech remains audible and saved;
+internal captions are `photo_caption` events, not assistant dialogue.
 
-Use any IMAGE-count increase, not a fixed increment: the sequential test measured
-266 then329, retained329 after resumed setup and stayed329 when a third photo
-was missed. Fresh provider contexts start at zero; resumed contexts retain their
-known count and pending baseline with the existing journal. A valid detail list
-without IMAGE reports zero, as in the fresh-miss observations; missing or invalid
-details remain unknown. Invalidating a resumption handle does not reset the
-current context. Native response ownership, rather than merely sending a frame,
-determines which photo may consume a usage sample.
+A readiness call that normally returns without its caption checks existing
+filing receipts, then resends the same ID/original once with the approved prefix:
+"Your memory store didn't receive the photo caption. Please send it!" A second
+miss parks that original for user Retry/Discard and serves the next eligible
+original through the same call. Interruption, reconnect and pre-send deferral
+do not spend or refill that allowance. Explicit Retry resets it. A stalled
+settling/job phase has a 30-second deadline and retains its original for Retry.
 
-One normally completed failed response permits an actual retry of the same
-stored original and ID. Persist retryUsed when entering this retry phase; it is
-not a frame-send limit. Interruption, speech deferral, reconnect/go-away replay
-and aborted pre-send writes do not spend it. A second completed failure exposes
-Retry/Discard. A rising count without a caption fails promptly; a completed
-reply with unknown accounting can use its retry at the existing 30-second bound.
-Stop retains its shorter drain. If speech starts during the500ms delay, defer
-the task until the spoken answer finishes without spending the retry. Immediate
-idle go-away rotation waits for the photo, but the existing deadline still wins.
-No receipt or durable success is invented. Explicit Retry is separate from this
-automatic allowance. Copies need no new deduplication guard. Internal photo
-output is kept off playback/history without muting an adopted spoken request.
-The implementation still needs provider acceptance; this is not a guarantee of
-visual grounding or successful resend.
+JPEG and PNG stay native inputs. Correct ID, native completion and durable
+handoff prove their own boundaries, not correct visual perception or image
+arrival. No new runtime visual classifier or fabricated ingestion receipt is
+introduced. Historical IMAGE-count experiments remain evidence in the workspace,
+not a production fallback. This dispatcher still needs phone acceptance.
 
 The existing snapshot-finalize route acknowledges durable server ownership from
 the scoped original and caption independently of transcript append. Its stable
@@ -166,7 +151,8 @@ provider resumption. A different photo cannot implicitly discard pending work.
 An optional spoken description remains separate from this internal caption.
 
 Normal Stop mutes provider output before callbacks and retains the socket/lease
-for an eight-second caption handoff window. Continuous Stop flushes existing
+for a shared 30-second caption handoff window. The visible countdown and
+focus-aware five-minute extension remain planned, not implemented here. Continuous Stop flushes existing
 audio with 1.8 seconds of real-time-paced silence and `audioStreamEnd`, then
 waits for the preceding response's native completion before a new image
 turn. `audioStreamEnd` alone cannot release that fence. The existing flush owner
@@ -251,8 +237,8 @@ Its text can settle at
   It merges pending and matching recovered-journal IDs. A lost unpublished reply
   may leave an unused suffix; a known reference is reused, never renamed on Retry.
   This naming adapter does not admit frames or send photos. The replacement
-  dispatcher must remove the old sender and IMAGE-accounting gates in its slice;
-  do not keep them as a fallback path.
+  dispatcher replaces the old sender and IMAGE-accounting gates; neither remains
+  as a fallback path.
 - `serverContent.generationComplete: true` means generation has finished; it is
   not a replacement for `turnComplete` in Iris transcript finalization.
 - `goAway.timeLeft` announces a provider disconnect deadline. Iris rotates
