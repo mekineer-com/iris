@@ -504,14 +504,16 @@ describe("GeminiLiveController", () => {
     } finally { await h.controller.stop() }
   })
 
-  test.each(["read", "retry"] as const)("Stop expiry checked by %s discards candidates but protects deliberate originals", async entry => {
+  test.each([["read", true], ["retry", true], ["read", false], ["retry", false]] as const)("Stop expiry checked by %s discards candidates but protects deliberate originals (draining=%s)", async (entry, draining) => {
     let deadline = Date.now() + 1_000
     const storage = new FakeStorage()
     const h = harness({storage, frameRetention: {maxFrames: 2, maxEncodedBytes: 16}, getStopDeadline: () => deadline})
     await start(h, "manual")
     h.controller.admitFrame(frame(1))
     await h.controller.sendImage({imageId: "protected-original", mimeType: "image/png", data: "AQID"})
-    const stopping = h.controller.stop(true)
+    let stopping: Promise<void> | undefined
+    if (draining) stopping = h.controller.stop(true)
+    else h.controller.muteForStop()
     try {
       expect(h.controller.readFrames([frame(1).imageId])).toEqual([frame(1)])
       expect(h.controller.admitFrame(frame(2))).toEqual({retained: false, delivery: "not-sent", reason: "unavailable"})
@@ -527,12 +529,13 @@ describe("GeminiLiveController", () => {
       if (entry === "retry") expect(h.controller.admitFrame(frame(1)))
         .toEqual({retained: false, delivery: "not-sent", reason: "unavailable"})
       expect(() => h.controller.readFrames([frame(1).imageId])).toThrow("Unknown retained frame")
+      stopping ??= h.controller.stop(true)
       await stopping
       expect(h.controller.pendingImageIds).toEqual(["protected-original"])
       expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0])
         .toMatchObject({imageId: "protected-original", retryRequested: true})
       expect(h.controller.admitFrame(frame(2))).toEqual({retained: false, delivery: "not-sent", reason: "unavailable"})
-    } finally { deadline = Date.now() - 1; h.controller.refreshStopDeadline(); await stopping }
+    } finally { deadline = Date.now() - 1; h.controller.refreshStopDeadline(); await h.controller.stop(true) }
   })
 
   test("unselected frames expire without a provider reply and cannot return in the next sitting", async () => {
@@ -943,8 +946,8 @@ describe("GeminiLiveController", () => {
     expect(h.sockets[0].readyState).toBe(3)
   })
 
-  test("deadline-cut closing thoughts preserve actual text through the existing summary contract", async () => {
-    let deadline = Date.now() + 1_000
+  test.each(["shared", "reflection"] as const)("%s deadline-cut closing thoughts preserve actual text through the existing summary contract", async expiry => {
+    let deadline = Date.now() + 30_000
     const h = harness({getStopDeadline: () => deadline, storage: new FakeStorage()})
     await start(h)
     completeTurn(h, "A fictional morning.", "A bright one.")
@@ -954,8 +957,10 @@ describe("GeminiLiveController", () => {
       await waitFor(() => h.sockets[0].sent.some(value => value.includes("Reflect briefly")))
       h.sockets[0].message({serverContent: {outputTranscription: {text: "I enjoyed our fictional walk"},
         modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
-      deadline = Date.now() - 1
-      h.controller.refreshStopDeadline()
+      if (expiry === "shared") {
+        deadline = Date.now() - 1
+        h.controller.refreshStopDeadline()
+      }
       await stopping
       const summaries = h.requests.flatMap(request => request.body.events ?? []).filter(event => event.event_kind === "sitting_summary")
       expect(summaries).toHaveLength(1)
@@ -963,7 +968,7 @@ describe("GeminiLiveController", () => {
       expect(summaries[0]).not.toHaveProperty("status")
       expect(h.errors).toEqual([])
     } finally { deadline = Date.now() - 1; h.controller.refreshStopDeadline(); await stopping }
-  })
+  }, 15_000)
 
   test.each(["Snapshot image id conflicts", "Soul is paused"])("only a confirmed original conflict permits a new reference (%s)", async detail => {
     const h = harness({storage: new FakeStorage(), snapshotResponse: Response.json({detail}, {status: 409})})

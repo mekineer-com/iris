@@ -316,7 +316,7 @@ export class GeminiLiveController {
   }
 
   admitFrame(frame: PassiveFrame, allowNew = true): FrameIntakeResult {
-    if (this.draining) this.refreshStopDeadline()
+    this.refreshStopDeadline()
     const limits = this.frameRetention
     if (!limits) throw new Error("Passive frame intake is not configured")
     if (!frame || typeof frame.imageId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(frame.imageId) ||
@@ -350,7 +350,7 @@ export class GeminiLiveController {
   }
 
   readFrames(imageIds: readonly string[]): PassiveFrame[] {
-    if (this.draining) this.refreshStopDeadline()
+    this.refreshStopDeadline()
     if (!Array.isArray(imageIds) || imageIds.length > (this.frameRetention?.maxFrames ?? 0) ||
         imageIds.some(id => typeof id !== "string" || !id) || new Set(imageIds).size !== imageIds.length) {
       throw new Error("Invalid frame references")
@@ -577,8 +577,12 @@ export class GeminiLiveController {
   }
 
   refreshStopDeadline(): void {
-    if (!this.draining && !this.reflecting) return
     const supplied = this.callbacks.getStopDeadline?.()
+    if (!this.draining && !this.reflecting) {
+      // Speaker retirement can consume the Stop allowance before provider draining starts.
+      if (supplied !== null && supplied !== undefined && supplied <= Date.now()) this.candidateFrames = []
+      return
+    }
     if (supplied !== null && supplied !== undefined) this.drainDeadlineAt = supplied
     else if (!this.draining) return
     this.clearStopDeadlineTimer()
@@ -2594,7 +2598,7 @@ export class GeminiLiveController {
     this.reflecting = true
     this.clearTurn()
     return new Promise((resolve) => {
-      const timeout = setTimeout(() => this.finishReflection(null), REFLECTION_TIMEOUT_MS)
+      const timeout = setTimeout(() => this.finishReflection(this.outputTranscript.trim() || null), REFLECTION_TIMEOUT_MS)
       this.reflectionResolve = (value) => {
         clearTimeout(timeout)
         this.clearStopDeadlineTimer()
