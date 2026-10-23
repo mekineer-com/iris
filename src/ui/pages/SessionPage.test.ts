@@ -628,6 +628,12 @@ describe("Video UI and allowance projection", () => {
     snapshot.callMode = "audio"
     expect(nodes(render()).find(node => node.props.className === "photo-controls").props.open).toBe(true)
     expect(nodes(render()).filter(node => node.props?.type === "file")).toHaveLength(2)
+    snapshot.callMode = "video"
+    for (const connection of ["idle", "error"]) {
+      snapshot.connection = connection
+      expect(nodes(render()).find(node => node.props.className === "photo-controls").props.open).toBe(true)
+      expect(nodes(render()).filter(node => node.props?.type === "file")).toHaveLength(2)
+    }
   })
 
   test("Video Take photo reserves the captured still and uses the deliberate upload path", async () => {

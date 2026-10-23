@@ -1,6 +1,7 @@
 import {act, createElement} from "react"
 import {createRoot} from "react-dom/client"
 import {usePhoneVision} from "../src/ui/hooks/usePhoneVision"
+import SessionPage from "../src/ui/pages/SessionPage"
 import {VISION_SETTINGS, type SessionSnapshot} from "../src/shared/types"
 
 declare global {interface Window {visionTest: Promise<unknown>}}
@@ -24,12 +25,16 @@ const devices: Array<{canvas: HTMLCanvasElement; stream: MediaStream}> = []
 let acquisition: ReturnType<typeof deferred<MediaStream>> | null = null
 let reservation: ReturnType<typeof deferred<any>> | null = null
 let intakeReply: ReturnType<typeof deferred<any>> | null = null
-let unknown = false
+let frameError: Error | null = null
 let outcome = {retained: true, delivery: "sent"}
 let sequence = 0
 let lastReference: any
 let readFrames: any[] = []
 const signals: AbortSignal[] = []
+const listeners = new Map<string, (payload: any) => void>()
+const warnings: string[] = []
+const warn = console.warn
+console.warn = (...args) => {warnings.push(args.join(" ")); warn(...args)}
 function device() {
   const canvas = document.createElement("canvas"); canvas.width = 1080; canvas.height = 1920
   canvas.getContext("2d")!.fillStyle = "rgb(20,160,40)"; canvas.getContext("2d")!.fillRect(0, 0, canvas.width, canvas.height)
@@ -40,7 +45,10 @@ Object.defineProperty(navigator.mediaDevices, "getUserMedia", {configurable: tru
   assert(options.audio === false, "camera requested audio")
   return acquisition ? acquisition.promise : device().stream
 }})
-;(globalThis as any).mentra = {request(channel: string, payload: any, options: {signal: AbortSignal}) {
+;(globalThis as any).mentra = {
+  on(channel: string, callback: (payload: any) => void) {listeners.set(channel, callback); return () => listeners.delete(channel)},
+  send(channel: string, payload: any) {calls.push({channel, payload})},
+  request(channel: string, payload: any, options: {signal: AbortSignal}) {
   calls.push({channel, payload}); signals.push(options.signal)
   let result: Promise<any>
   if (channel === "openalma:reserve-image") {
@@ -48,7 +56,7 @@ Object.defineProperty(navigator.mediaDevices, "getUserMedia", {configurable: tru
     lastReference = value
     result = reservation ? reservation.promise : Promise.resolve(value)
   } else if (channel === "openalma:frame") {
-    result = unknown ? Promise.reject(Object.assign(new Error("reply lost"), {name: "MentraRpcTimeoutError"}))
+    result = frameError ? Promise.reject(frameError)
       : intakeReply ? intakeReply.promise : Promise.resolve(outcome)
   } else if (channel === "openalma:frames") result = Promise.resolve({frames: readFrames})
   else result = Promise.resolve()
@@ -110,12 +118,21 @@ window.visionTest = (async () => {
     assert(original.pixel[0] > 150 && model.pixel[0] > 150 && photo.pixel[2] > 150, "still overwrote reserved passive pixels")
     checks.push("serial reservation and separate Video still preserve original/model binding")
 
-    await paint("rgb(180,140,30)"); unknown = true; await tick()
-    await wait(() => !!control.error); const failed = count("openalma:frame"); unknown = false
+    await paint("rgb(180,140,30)")
+    frameError = Object.assign(new Error("reply lost"), {name: "MentraRpcTimeoutError"}); await tick()
+    await wait(() => warnings.some(warning => warning.includes("reply lost")))
+    assert(control.error === null, "best-effort frame timeout flashed an alert")
+    const failed = count("openalma:frame"); frameError = null
     await tick(); await wait(() => count("openalma:frame") === failed + 1)
     await wait(() => control.error === null); const confirmed = count("openalma:reserve-image"); await tick()
     assert(count("openalma:reserve-image") === confirmed, "unknown advanced baseline or confirmed repeat was not filtered")
     checks.push("uncertain intake is not success; confirmed exact repeats are filtered")
+
+    await paint("rgb(110,70,130)"); frameError = new Error("Fictional frame validation failure"); await tick()
+    await wait(() => !!control.error)
+    assert(control.error!.includes("Fictional frame validation failure"), "non-timeout failure lost its alert")
+    frameError = null; await tick(); await wait(() => control.error === null)
+    checks.push("frame timeouts log quietly while genuine frame errors remain visible")
 
     for (const [color, result] of [
       ["rgb(30,100,180)", {retained: true, delivery: "not-sent"}],
@@ -178,7 +195,17 @@ window.visionTest = (async () => {
     assert(devices[0].stream.getTracks().every(track => track.readyState === "ended"), "Stop did not release tracks synchronously")
     checks.push("imperative Stop rejects a held decode before React cleanup")
 
-    foreground = false; await render(); assert(signals.some(signal => signal.aborted), "RPC cleanup did not abort")
+    foreground = false; await render()
+    const heldBefore = count("openalma:reserve-image")
+    reservation = deferred<any>(); foreground = true; await render()
+    await wait(() => count("openalma:reserve-image") > heldBefore)
+    const heldSignal = signals[signals.length - 1]!, framesAtHide = count("openalma:frame")
+    assert(!heldSignal.aborted, "new held reservation was already aborted")
+    foreground = false; await render()
+    assert(heldSignal.aborted, "hide did not abort its pending reservation")
+    reservation.resolve(lastReference)
+    await act(async () => {await Promise.resolve()})
+    assert(count("openalma:frame") === framesAtHide, "hidden reservation submitted a frame after cancellation")
     reservation = null; acquisition = deferred<MediaStream>(); foreground = true; await render()
     const late = device(); control.stop(); foreground = false; await render(); acquisition.resolve(late.stream)
     await act(async () => {await Promise.resolve(); await new Promise(resolve => setTimeout(resolve, 20))})
@@ -186,6 +213,28 @@ window.visionTest = (async () => {
     checks.push("hide/unmount and late permission release native tracks and cancel work")
 
     acquisition = null
+    const oldReservation = deferred<any>(); reservation = oldReservation
+    const beforeOld = count("openalma:reserve-image"); foreground = true; await render()
+    await wait(() => count("openalma:reserve-image") > beforeOld)
+    const oldReference = lastReference
+    const toBlob = HTMLCanvasElement.prototype.toBlob; let finishStill: (() => void) | undefined
+    HTMLCanvasElement.prototype.toBlob = function(callback, type, quality) {
+      toBlob.call(this, blob => {finishStill = () => callback(blob)}, type, quality)
+    }
+    const oldStill = control.takePhoto().then(() => "accepted", error => String(error))
+    await wait(() => !!finishStill)
+    HTMLCanvasElement.prototype.toBlob = toBlob
+    reservation = null; const framesAtRestart = count("openalma:frame")
+    snapshot = {...snapshot, startGeneration: 2}; await render()
+    await wait(() => count("openalma:frame") > framesAtRestart)
+    oldReservation.resolve(oldReference); finishStill!()
+    assert((await oldStill).includes("inactive camera"), "old still was accepted into the replacement sitting")
+    await act(async () => {await Promise.resolve()})
+    assert(calls.filter(call => call.channel === "openalma:frame").slice(framesAtRestart)
+      .every(call => call.payload.startGeneration === 2), "old frame submitted into the replacement sitting")
+    checks.push("replacement sitting rejects held frame reservations and still encodes")
+
+    foreground = false; await render()
     Object.defineProperty(navigator.mediaDevices, "getUserMedia", {configurable: true, value: async () => {
       throw new DOMException("Camera permission denied", "NotAllowedError")
     }})
@@ -193,7 +242,33 @@ window.visionTest = (async () => {
     snapshot = {...snapshot, callMode: "audio"}; await render()
     assert(control.error === null, "camera failure leaked into Audio call")
     checks.push("camera permission errors clear when leaving Video")
-    return {ok: true, checks, frames: calls.filter(call => call.channel === "openalma:frame").map(call => call.payload)}
+
+    Object.defineProperty(navigator.mediaDevices, "getUserMedia", {configurable: true, value: async () => device().stream})
+    let hidden = false
+    Object.defineProperty(document, "hidden", {configurable: true, get: () => hidden})
+    await act(async () => {root.render(createElement(SessionPage))})
+    const beforePage = devices.length
+    const pageSnapshot = {...snapshot, callMode: "video", configured: true,
+      soulId: "Quill", souls: ["Quill"], soulConfirmed: true, soulLoading: false, modelChoice: null,
+      model: null, configuredModel: null, modelSaving: false, maxMemorizedPhotos: 1,
+      pendingPhotoIds: [], photoCaptions: [], photoRetryPending: false, catchUpRender: null}
+    await act(async () => {listeners.get("openalma:update")!(pageSnapshot)})
+    await wait(() => devices.length === beforePage + 1 && container.querySelector("video")!.readyState >= 2)
+    const active = devices[devices.length - 1]!, beforeHide = devices.length
+    await act(async () => {
+      hidden = true; document.dispatchEvent(new Event("visibilitychange"))
+      assert(active.stream.getTracks().every(track => track.readyState === "ended"), "page hide did not release tracks synchronously")
+      hidden = false; document.dispatchEvent(new Event("visibilitychange"))
+    })
+    await wait(() => devices.length === beforeHide + 1 && container.querySelector("video")!.readyState >= 2)
+    assert(devices[devices.length - 1]!.stream.getTracks().every(track => track.readyState === "live"), "batched show left the camera off")
+    checks.push("real SessionPage recovers from hide/show in a single React batch")
+    const allowances = []
+    for (const n of [1, 2, 3, 4, 5]) {
+      await act(async () => {listeners.get("openalma:update")!({...pageSnapshot, connection: "idle", maxMemorizedPhotos: n})})
+      allowances.push({n, label: container.querySelector("output")!.textContent})
+    }
+    return {ok: true, checks, allowances, frames: calls.filter(call => call.channel === "openalma:frame").map(call => call.payload)}
   } catch (error) {return {ok: false, error: String(error), stack: (error as Error).stack, checks}}
-  finally {await act(async () => root.unmount()); for (const item of devices) item.stream.getTracks().forEach(track => track.stop())}
+  finally {console.warn = warn; await act(async () => root.unmount()); for (const item of devices) item.stream.getTracks().forEach(track => track.stop())}
 })()

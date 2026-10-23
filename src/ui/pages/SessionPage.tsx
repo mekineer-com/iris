@@ -1,4 +1,5 @@
 import {useEffect, useRef, useState} from "react"
+import {flushSync} from "react-dom"
 import {useRpc} from "@mentra/miniapp/ui"
 
 import type {Channels, ImageRequest, SelectSoulResult} from "../../shared/channels"
@@ -194,12 +195,13 @@ export default function SessionPage() {
       if (timer !== undefined) clearInterval(timer)
       timer = stopping && foreground ? setInterval(() => setStopNow(Date.now()), 1000) : undefined
     }
-    const visibility = () => publish(!document.hidden)
-    const hide = () => publish(false)
+    // Commit hide before a quick show can fold it away and strand the stopped camera.
+    const visibility = () => flushSync(() => publish(!document.hidden))
+    const hide = () => flushSync(() => publish(false))
     document.addEventListener("visibilitychange", visibility)
     window.addEventListener("pagehide", hide)
     window.addEventListener("pageshow", visibility)
-    visibility()
+    publish(!document.hidden)
     return () => {
       document.removeEventListener("visibilitychange", visibility)
       window.removeEventListener("pagehide", hide)
@@ -209,6 +211,7 @@ export default function SessionPage() {
   }, [stopping])
   const reconnecting = visible === "reconnecting"
   const active = starting || reconnecting || visible === "listening" || visible === "speaking"
+  const videoCall = callMode === "video" && (active || stopping)
   const modeDisabled = active || stopping || startPending || stopPending || modePending
   const modelSaving = modelPending || snapshot?.modelSaving === true
   const modelDisabled = active || stopping || startPending || stopPending || modelSaving
@@ -398,11 +401,7 @@ export default function SessionPage() {
     }
   }
 
-  const preparePhoto = async (file: File, generation: number | null, receivedAt: number) => {
-    if (generation === null || generation !== snapshot?.startGeneration) {
-      setRpcError("Choose the photo again for this sitting.")
-      return
-    }
+  const preparePhoto = async (file: File, generation: number, receivedAt: number) => {
     setRpcError(null)
     setImageStatus(null)
     try {
@@ -438,12 +437,17 @@ export default function SessionPage() {
     input.value = ""
     const generation = pickerGeneration.current
     pickerGeneration.current = null
-    if (file) await preparePhoto(file, generation, Date.now())
+    if (!file) return
+    if (generation === null || generation !== snapshot?.startGeneration) {
+      setRpcError("Choose the photo again for this sitting.")
+      return
+    }
+    await preparePhoto(file, generation, Date.now())
   }
 
   const onVideoPhoto = async () => {
     const owner = ++imageOwner.current
-    const generation = snapshot?.startGeneration ?? null
+    const generation = snapshot!.startGeneration
     setImagePending(true)
     setRpcError(null)
     try {
@@ -709,12 +713,12 @@ export default function SessionPage() {
         ) : null}
       </section>
       <video ref={vision.videoRef} className="video-preview" muted playsInline
-        hidden={callMode !== "video" || !active} aria-label="Phone camera preview" />
+        hidden={!videoCall || !active} aria-label="Phone camera preview" />
       {vision.error ? <p role="alert">{vision.error}</p> : null}
-      <details className="photo-controls" key={callMode} open={callMode !== "video"}>
+      <details className="photo-controls" key={String(videoCall)} open={!videoCall}>
       <summary>Photos</summary>
       <div className="image-actions">
-        {callMode === "video" ? <button type="button" disabled={!vision.ready || !cameraEnabled || !voiceReady || imagePending || stopping}
+        {videoCall ? <button type="button" disabled={!vision.ready || !cameraEnabled || !voiceReady || imagePending || stopping}
           onClick={() => void onVideoPhoto()}>Take photo</button> : <label className="image-picker">
           <span>Take photo</span>
           <input

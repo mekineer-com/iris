@@ -62,7 +62,7 @@ async function check() {
     }
     const result = response.result.value
     if (!result?.ok) throw new Error(JSON.stringify(result))
-    assert.equal(result.checks.length, 10)
+    assert.equal(result.checks.length, 13)
     // Validate actual browser JPEG/wire payloads at the production admission boundary.
     const noop = () => {}
     const controller = new GeminiLiveController({baseUrl: "http://127.0.0.1:1", userId: "FictionalOwner",
@@ -70,7 +70,18 @@ async function check() {
     {onAudio: noop, onTurnComplete: noop, onInterrupted: noop, onReconnecting: noop, onUsage: noop,
       onDurationWarning: noop, onPhotoRetryChange: noop, onPersistenceError: noop, onError: noop}, {frameRetention: VISION_SETTINGS})
     for (const frame of result.frames) assert.deepEqual(controller.admitFrame(frame), {retained: false, delivery: "not-sent", reason: "unavailable"})
+    for (const {n, label} of result.allowances) {
+      Reflect.set(controller, "vision", {callMode: "video", maxMemorizedPhotos: n})
+      const stoppedAt = Date.now()
+      Reflect.set(controller, "visionStoppedAt", stoppedAt)
+      const counts = [5, 15, 45].map(minutes => {
+        Reflect.set(controller, "sittingStartedAt", stoppedAt - minutes * 60_000)
+        return Reflect.get(controller, "selectionAllowance").call(controller)
+      })
+      assert.equal(label, `${counts[0]} in 5 min, ${counts[1]} in 15 min, ${counts[2]} in 45 min`)
+    }
     console.log(result.checks.join("\n"))
+    console.log("all five allowance labels match the production formula")
   } finally {
     if (browser) await browser("Browser.close").catch(() => {})
     for (const socket of sockets) socket.close()

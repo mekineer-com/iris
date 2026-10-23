@@ -17,6 +17,7 @@ function jpeg(canvas: HTMLCanvasElement): string {
 
 const message = (error: unknown) => error instanceof Error ? error.message : String(error)
 const canceled = (error: unknown) => !!error && typeof error === "object" && "name" in error && error.name === "AbortError"
+const timedOut = (error: unknown) => !!error && typeof error === "object" && "name" in error && error.name === "MentraRpcTimeoutError"
 const connected = (snapshot: SessionSnapshot | undefined) =>
   snapshot?.connection === "listening" || snapshot?.connection === "speaking"
 
@@ -104,7 +105,7 @@ export function usePhoneVision(snapshot: SessionSnapshot | undefined, foreground
       } catch (error) {
         if (alive && !canceled(error)) {
           console.warn("Video frame not confirmed:", message(error))
-          if (current()) setError(`Video frame not confirmed: ${message(error)}`)
+          if (current() && !timedOut(error)) setError(`Video frame not confirmed: ${message(error)}`)
         }
       } finally { busy = false }
     }
