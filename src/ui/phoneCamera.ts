@@ -131,8 +131,4 @@ export class PhoneCamera {
   stop(reason: PhoneCameraStopReason = "stopped"): void {
     if (this.release()) this.onStopped(reason)
   }
-
-  dispose(): void {
-    this.stop()
-  }
 }

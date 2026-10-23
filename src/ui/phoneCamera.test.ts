@@ -49,7 +49,7 @@ test("requests rear video without a second microphone and enables inline playbac
   expect(h.getUserMedia).toHaveBeenCalledWith({audio: false, video: {facingMode: {ideal: "environment"}}})
   expect(h.video.srcObject).toBe(h.active.stream)
   expect(h.video.muted && h.video.playsInline).toBe(true)
-  h.camera.dispose()
+  h.camera.stop()
 })
 
 test("samples one portrait frame, strips the data URL and separates RGB from alpha", async () => {
@@ -64,7 +64,7 @@ test("samples one portrait frame, strips the data URL and separates RGB from alp
   expect(h.canvases[0].toDataURL).toHaveBeenCalledWith("image/jpeg", 0.7)
   expect(h.canvases[1].getContext).toHaveBeenCalledWith("2d", {willReadFrequently: true})
   expect(h.contexts[1].imageSmoothingQuality).toBe("high")
-  h.camera.dispose()
+  h.camera.stop()
 })
 
 test("does not upscale the original or sample before decoded pixels exist", async () => {
@@ -77,7 +77,7 @@ test("does not upscale the original or sample before decoded pixels exist", asyn
   h.video.videoWidth = 100
   h.video.videoHeight = 50
   expect(h.camera.sample(options)).toMatchObject({width: 100, height: 50})
-  h.camera.dispose()
+  h.camera.stop()
   expect(h.camera.sample(options)).toBeNull()
 })
 
@@ -90,7 +90,7 @@ test("rotation resets comparison even when the normalized thumbnail is unchanged
   const landscape = h.camera.sample(options)!
   expect(portrait.comparison).toEqual(landscape.comparison)
   expect(compareSamples(portrait, landscape)).toBeNull()
-  h.camera.dispose()
+  h.camera.stop()
 })
 
 test("stopped notification follows resource release and is emitted only once", async () => {
@@ -102,7 +102,6 @@ test("stopped notification follows resource release and is emitted only once", a
   await h.camera.start()
   h.camera.stop()
   h.camera.stop()
-  h.camera.dispose()
   expect(h.onStopped).toHaveBeenCalledTimes(1)
   expect(h.onStopped).toHaveBeenCalledWith("stopped")
 })
@@ -111,22 +110,21 @@ test("permission refusal leaves no active camera and reports the error", async (
   const h = harness(async () => {throw new Error("Permission denied")})
   await expect(h.camera.start()).rejects.toThrow("Permission denied")
   expect(h.onStopped).toHaveBeenCalledWith("error")
-  h.camera.dispose()
+  h.camera.stop()
 })
 
-test.each(["stop", "dispose"])("%s during permission wait closes the late stream", async action => {
+test("stop during permission wait closes the late stream", async () => {
   const pending = deferred<MediaStream>()
   const h = harness(() => pending.promise)
   const starting = h.camera.start()
-  if (action === "dispose") h.camera.dispose()
-  else h.camera.stop()
+  h.camera.stop()
   pending.resolve(h.active.stream)
   expect(await starting).toBe(false)
   expect(h.active.track.stop).toHaveBeenCalledTimes(1)
   expect(h.video.srcObject).toBeNull()
   expect(h.onStopped).toHaveBeenCalledTimes(1)
   expect(h.onStopped).toHaveBeenCalledWith("stopped")
-  h.camera.dispose()
+  h.camera.stop()
 })
 
 test("overlapping starts close the late original without stopping its replacement", async () => {
@@ -143,7 +141,7 @@ test("overlapping starts close the late original without stopping its replacemen
   expect(next.track.stop).not.toHaveBeenCalled()
   expect(h.video.srcObject).toBe(next.stream)
   expect(h.onStopped).not.toHaveBeenCalled()
-  h.camera.dispose()
+  h.camera.stop()
 })
 
 test("Stop while video.play waits cannot later report a successful start", async () => {
@@ -156,7 +154,7 @@ test("Stop while video.play waits cannot later report a successful start", async
   playback.resolve()
   expect(await starting).toBe(false)
   expect(h.active.track.stop).toHaveBeenCalledTimes(1)
-  h.camera.dispose()
+  h.camera.stop()
 })
 
 test("a stale playback rejection does not close the replacement stream", async () => {
@@ -172,7 +170,7 @@ test("a stale playback rejection does not close the replacement stream", async (
   expect(first.track.stop).toHaveBeenCalledTimes(1)
   expect(second.track.stop).not.toHaveBeenCalled()
   expect(h.video.srcObject).toBe(second.stream)
-  h.camera.dispose()
+  h.camera.stop()
 })
 
 test("an ended track releases a running stream", async () => {
@@ -182,7 +180,7 @@ test("an ended track releases a running stream", async () => {
   expect(h.onStopped).toHaveBeenCalledWith("ended")
   expect(h.video.srcObject).toBeNull()
   expect(h.active.track.stop).toHaveBeenCalledTimes(1)
-  h.camera.dispose()
+  h.camera.stop()
   expect(h.onStopped).toHaveBeenCalledTimes(1)
 })
 
@@ -192,7 +190,7 @@ test("playback failure releases acquired tracks", async () => {
   await expect(h.camera.start()).rejects.toThrow("Cannot play")
   expect(h.active.track.stop).toHaveBeenCalledTimes(1)
   expect(h.onStopped).toHaveBeenCalledWith("error")
-  h.camera.dispose()
+  h.camera.stop()
 })
 
 test("capture/encoding failure releases the camera instead of returning empty data", async () => {
@@ -202,7 +200,7 @@ test("capture/encoding failure releases the camera instead of returning empty da
   expect(() => h.camera.sample(options)).toThrow("no JPEG")
   expect(h.onStopped).toHaveBeenCalledWith("error")
   expect(h.active.track.stop).toHaveBeenCalledTimes(1)
-  h.camera.dispose()
+  h.camera.stop()
 })
 
 const running: PhoneCameraState = {enabled: true, cameraEnabled: true, visible: true,
