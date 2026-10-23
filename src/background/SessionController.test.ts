@@ -1619,13 +1619,28 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)?.connection).toBe("idle")
   })
 
-  test("watchdog failure plays disconnected once and stops Gemini", async () => {
+  test.each(["listening", "speaking", "reconnecting"] as const)("watchdog failure during %s stops Gemini", async state => {
     const harness = setup({watchdogMs: 15})
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    if (state === "speaking") harness.live.audio()
+    if (state === "reconnecting") harness.live.callbacks.onReconnecting(true)
     await new Promise((resolve) => setTimeout(resolve, 40))
     expect(lastSnapshot(harness.session)?.connection).toBe("error")
     expect(harness.live.stops).toBe(1)
     expect(harness.session.plays).toHaveLength(2)
+  })
+
+  test("microphone frames during playback prove capture without forwarding human audio", async () => {
+    const harness = setup({watchdogMs: 15})
+    await harness.session.handlers["openalma:start"]({mode: "continuous"})
+    harness.live.audio()
+    harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})
+    harness.live.turnComplete()
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", lastError: null})
+    expect(harness.live.sent).toEqual([])
+    expect(harness.live.stops).toBe(0)
+    await harness.session.handlers["openalma:stop"]({})
   })
 
   test("selects Manual while idle and rejects active mode changes", async () => {

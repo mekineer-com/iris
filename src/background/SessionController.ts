@@ -732,14 +732,12 @@ export class SessionController {
     const generation = this.startGeneration
     this.firstPcmTimeout = setTimeout(() => {
       if (generation !== this.startGeneration) return
-      if (this.connection !== "starting" && this.connection !== "listening") return
       void this.fail(new Error("no microphone audio"))
     }, this.watchdogMs)
   }
 
   private handlePcmFrame(chunk: AudioChunkData & {source?: string}): void {
     if (!ACTIVE.has(this.connection)) return
-    if (this.connection === "speaking") return
     try {
       const normalized = normalizePcm16Audio(chunk)
       if (!this.sawMicFrame) {
@@ -747,6 +745,7 @@ export class SessionController {
         trace("session.microphone.first_frame")
         this.clearFirstPcmTimeout()
       }
+      if (this.connection === "speaking") return
       if (this.mode === "continuous") {
         this.liveController?.sendAudio(normalized, MIC_SOURCES.find(source => source === chunk.source))
         return
