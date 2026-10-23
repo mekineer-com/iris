@@ -2665,12 +2665,15 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:stop"]({})
   })
 
-  test.each([undefined, "", "unknown"])("Manual clears a source on accepted unlabelled audio (%s)", async source => {
+  test.each([
+    {sources: ["glasses", undefined]}, {sources: ["glasses", ""]}, {sources: ["glasses", "unknown"]},
+    {sources: ["glasses", "phone"]}, {sources: ["glasses", "phone", "glasses"]},
+    {sources: [undefined, "phone"]},
+  ])("Manual leaves mixed or unlabelled takes without a source (%j)", async ({sources}) => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "manual"})
     harness.session.handlers["openalma:manual-action"]({action: "talk"})
-    harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000, source: "glasses"})
-    harness.session.micHandler?.({data: testPcm(2), format: "pcm_s16le", sampleRate: 16000, source})
+    sources.forEach(source => harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000, source}))
     harness.session.handlers["openalma:manual-action"]({action: "done"})
     harness.session.handlers["openalma:manual-action"]({action: "send"})
     expect(harness.live.activitySources).toEqual([undefined])
@@ -2694,6 +2697,27 @@ describe("SessionController", () => {
     harness.session.handlers["openalma:manual-action"]({action: "send"})
     expect(harness.live.activities).toEqual([[testPcm(1)]])
     expect(harness.live.activitySources).toEqual(["glasses"])
+  })
+
+  test("a failed Manual transmission ends the sitting instead of retrying the admitted take", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "manual"})
+    h.session.handlers["openalma:manual-action"]({action: "talk"})
+    h.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000, source: "phone"})
+    h.session.handlers["openalma:manual-action"]({action: "done"})
+    const failed = h.live
+    const error = new Error("Gemini manual activity send failed")
+    spyOn(failed, "sendActivity").mockImplementation(() => {
+      failed.callbacks.onError(error)
+      throw error
+    })
+    expect(() => h.session.handlers["openalma:manual-action"]({action: "send"})).toThrow(error.message)
+    expect(() => h.session.handlers["openalma:manual-action"]({action: "send"})).toThrow("ready session")
+    await h.session.handlers["openalma:stop"]({})
+    await h.session.handlers["openalma:start"]({mode: "manual"})
+    expect(h.live).not.toBe(failed)
+    expect(lastSnapshot(h.session)?.manualPhase).toBe("idle")
+    await h.session.handlers["openalma:stop"]({})
   })
 
   test("Stop discards an unsent Manual draft", async () => {

@@ -925,9 +925,11 @@ export class SessionController {
         this.pushSnapshot()
         return
       }
+      const source = MIC_SOURCES.find(source => source === chunk.source)
+      if (this.manualAudio.length === 0) this.manualMicSource = source
+      else if (this.manualMicSource !== source) this.manualMicSource = undefined
       this.manualAudio.push(normalized)
       this.manualAudioBytes += bytes
-      this.manualMicSource = MIC_SOURCES.find(source => source === chunk.source)
     } catch (error) {
       void this.fail(error)
     }
