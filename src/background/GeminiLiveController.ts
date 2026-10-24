@@ -1097,14 +1097,15 @@ export class GeminiLiveController {
         this.completeSelectionIfReady(this.photoJob)
         return
       }
-      if ((this.photoJob?.phase !== "settling" && this.photoJob?.batch === call.batch) || call.batch.photoCaption) {
+      const image = this.photoJob?.image ?? this.pendingImages.find(image => !image.caption && !image.retryRequested && image.mediaRef)
+      if ((this.photoJob?.phase !== "settling" && this.photoJob?.batch === call.batch) ||
+          (call.batch.photoCaption && (!this.thinking || this.photoJob || !image))) {
         if (this.thinking && !this.photoJob) this.answerNoWork(call)
         else call.response = {ok: true}
         continue
       }
       if (this.photoJob?.phase === "loading" || this.photoJob?.phase === "filing" || this.imageFinalization ||
           [...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption" && call.response === undefined)) return
-      const image = this.photoJob?.image ?? this.pendingImages.find(image => !image.caption && !image.retryRequested && image.mediaRef)
       if (!image) {
         if (this.selectionDemand() && !this.imageUpload && (this.draining ||
             (!this.voiceActive && !this.turnActive && !this.spokenRequest && this.callbacks.canInvite?.() !== false))) {
@@ -1586,6 +1587,7 @@ export class GeminiLiveController {
       if (type !== "ACTIVITY_START" && type !== "ACTIVITY_END") throw new Error("Gemini returned malformed voice activity")
       this.voiceActive = type === "ACTIVITY_START"
       if (this.voiceActive) {
+        this.quietOutput = null
         if (this.mode === "continuous") {
           const adoptingEarlyTranscript = this.pendingSpeechDraft()?.speech?.admitted === false && this.spokenRequest
           this.reserveSpeech()
@@ -2273,10 +2275,10 @@ export class GeminiLiveController {
   }
 
   private answerNoWork(call: PendingToolCall, failed = false): void {
-    call.response = failed ? {ok: false, status: "failed"} : this.thinking
+    call.quietChoice = this.thinking && !failed && call.quietChoice !== false
+    call.response = failed ? {ok: false, status: "failed"} : call.quietChoice
       ? "No photo task is ready. Say 'Done' once to finish this private exchange."
       : {ok: true}
-    call.quietChoice = this.thinking && !failed
   }
 
   private flushToolResponses(): void {
@@ -2309,6 +2311,15 @@ export class GeminiLiveController {
       const resume = needsAnswer && !pending.batch.continuationSent && !request.continuing &&
         ![...this.pendingToolCalls.values()].some(call => call !== pending &&
           call.name !== "nothing_to_add" && call.batch.request === request && !call.batch.continuationSent)
+      if (this.thinking && pending.invites) {
+        this.quietOutput = null
+        // A memory supersedes quiet choices already waiting to be answered.
+        for (const call of this.pendingToolCalls.values()) {
+          if (call.name !== "nothing_to_add") continue
+          if (call.quietChoice) call.response = {ok: true}
+          call.quietChoice = false
+        }
+      }
       if (this.thinking && pending.quietChoice) {
         this.quietOutput ??= {keepTranscript: this.turnAudioDelivered}
       }

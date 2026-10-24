@@ -2437,6 +2437,126 @@ describe("GeminiLiveController", () => {
     } finally { await h.controller.stop() }
   })
 
+  test.each([[false, 200], [true, 200], [true, 503]] as const)("Thinking recall delivery honors quiet ownership (same packet=%s, status=%s)", async (samePacket, status) => {
+    let release!: () => void
+    const h = harness({storage: new FakeStorage(), recallStatus: status,
+      recallGate: new Promise<void>(resolve => {release = resolve})})
+    await start(h, "continuous", "", THINKING)
+    try {
+      const recall = {id: "memory-after-quiet", name: "recall_memory", args: {query: "A fictional memory"}}
+      const quiet = {id: "decline-before-memory", name: "nothing_to_add", args: {}}
+      h.sockets[0].message({toolCall: {functionCalls: samePacket ? [recall, quiet] : [quiet]},
+        serverContent: {turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === quiet.id))
+      expect(Reflect.get(h.controller, "quietOutput")).not.toBeNull()
+      h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AgACAA=="}}]},
+        outputTranscription: {text: "Discard this old acknowledgment."}, turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      expect(h.audio).toEqual([])
+      if (!samePacket) h.sockets[0].message({toolCall: {functionCalls: [recall]}})
+      release()
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === recall.id))
+      expect(Reflect.get(h.controller, "quietOutput") === null).toBe(status === 200)
+      h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]},
+        outputTranscription: {text: "This new memory changes what I want to say."},
+        turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      expect(h.audio).toEqual(status === 200 ? ["AQABAA=="] : [])
+      await providerReady(h.sockets[0], "a-new-quiet-choice", false)
+      expect(Reflect.get(h.controller, "quietOutput")).not.toBeNull()
+      h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AgACAA=="}}]},
+        outputTranscription: {text: "Discard this fresh acknowledgment."}, interactionStatus: "IDLE"}})
+      await h.controller.stop()
+      const rows = h.requests.flatMap(request => request.body.events ?? [])
+      expect(rows.some(row => row.content === "This new memory changes what I want to say.")).toBe(status === 200)
+      expect(rows.some(row => row.content.includes("Discard this old acknowledgment."))).toBe(false)
+      expect(rows.some(row => row.content.includes("Discard this fresh acknowledgment."))).toBe(false)
+    } finally { release(); await h.controller.stop() }
+  })
+
+  test("Thinking deferred responses send a memory before an older quiet sibling without re-muting it", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, "continuous", "", THINKING)
+    try {
+      h.sockets[0].readyState = 0
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "deferred-memory", name: "recall_memory", args: {query: "A fictional memory"}},
+        {id: "deferred-quiet", name: "nothing_to_add", args: {}},
+      ]}})
+      await waitFor(() => Reflect.get(h.controller, "pendingToolCalls").get("deferred-memory")?.response !== undefined)
+      expect(Reflect.get(h.controller, "pendingToolCalls").get("deferred-quiet").quietChoice).toBe(true)
+      h.sockets[0].readyState = 1
+      h.sockets[0].message({usageMetadata: {totalTokenCount: 1}})
+      expect(functionResponses(h.sockets[0]).map(reply => reply.id)).toEqual(["deferred-memory", "deferred-quiet"])
+      expect(functionResponses(h.sockets[0])[1].response).toEqual({ok: true})
+      expect(Reflect.get(h.controller, "quietOutput")).toBeNull()
+      completeTurn(h, "", "The new memory is worth mentioning.")
+      expect(h.audio).toEqual(["AQABAA=="])
+    } finally { h.sockets[0].readyState = 1; await h.controller.stop() }
+  })
+
+  test("Thinking fresh speech releases quiet output when adopting early transcription", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, "continuous", "", THINKING)
+    try {
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "An earlier question."}, interrupted: true}})
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "Early text for the next question."}}})
+      await providerReady(h.sockets[0], "early-transcript-quiet", false)
+      expect(Reflect.get(h.controller, "quietOutput")).not.toBeNull()
+      const request = Reflect.get(h.controller, "spokenRequest")
+      expect(request).not.toBeNull()
+      h.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+      expect(Reflect.get(h.controller, "spokenRequest")).toBe(request)
+      expect(Reflect.get(h.controller, "quietOutput")).toBeNull()
+      completeTurn(h, "", "An answer to the fresh question.")
+      expect(h.audio).toEqual(["AQABAA=="])
+    } finally { await h.controller.stop() }
+  })
+
+  test("Thinking caption readiness dispatches an already queued second photo", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, "continuous", "", THINKING)
+    try {
+      await h.controller.sendImage({imageId: "queued-a", mimeType: "image/png", data: "AQID"})
+      expect((await providerReady(h.sockets[0], "queued-settle-a", true, "IDLE")).response).toEqual(PHOTO_NEXT)
+      expect((await providerReady(h.sockets[0], "queued-task-a", true, "IDLE")).response.task).toBe("please-caption-queued-a")
+      await h.controller.sendImage({imageId: "queued-b", mimeType: "image/png", data: "BAUG"})
+      provisionalCaption(h.sockets[0], "queued-a", "A fictional red square.")
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === "caption-queued-a"))
+      const next = await providerReady(h.sockets[0], "queued-after-caption", false)
+      expect(next.response).toEqual(PHOTO_NEXT)
+      expect(next.response).not.toEqual(PHOTO_EMPTY)
+      h.sockets[0].message({serverContent: {interactionStatus: "IDLE"}})
+      const task = await providerReady(h.sockets[0], "queued-task-b", true, "IDLE")
+      expect(task.response.task).toBe("please-caption-queued-b")
+    } finally { await h.controller.stop() }
+  })
+
+  test.each(["continuous", "manual"] as const)("Thinking memory delivery preserves an older queued photo readiness (%s)", async mode => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, mode, "", THINKING)
+    try {
+      await h.controller.sendImage({imageId: "settling-human", mimeType: "image/png", data: "AQID"})
+      expect((await providerReady(h.sockets[0], "human-settle-photo", true, "IDLE")).response).toEqual(PHOTO_NEXT)
+      admitRequest(h, mode)
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "A fictional question during settling."}}})
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "human-during-settling", name: "nothing_to_add", args: {}},
+        {id: "memory-during-settling", name: "recall_memory", args: {query: "A fictional memory"}},
+      ]}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === "memory-during-settling"))
+      expect(Reflect.get(h.controller, "pendingToolCalls").get("human-during-settling").quietChoice).toBe(false)
+      completeTurn(h, "", "The returned memory answers the question.")
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === "human-during-settling"))
+      const task = functionResponses(h.sockets[0]).find(reply => reply.id === "human-during-settling")!
+      expect(task.response.task).toBe("please-caption-settling-human")
+      expect(task.parts).toHaveLength(1)
+      expect(h.audio).toEqual(["AQABAA=="])
+      expect(Reflect.get(h.controller, "quietOutput")).toBeNull()
+      expect(h.errors).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
   test("Thinking keeps late human transcription without releasing declined output", async () => {
     const h = harness({storage: new FakeStorage()})
     await start(h, "continuous", "", THINKING)
