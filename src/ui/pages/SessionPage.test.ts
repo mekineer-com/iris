@@ -330,6 +330,23 @@ describe("SessionPage state projection", () => {
     expect(JSON.stringify(render())).toContain("Photo sent")
   })
 
+  test.each(["Retake", "Stop"])("discarding a failed photo with %s clears its retry message", async action => {
+    const render = renderPage({configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+      connection: "listening", photoRetryPending: false, pendingPhotoIds: []}, async (channel, payload) => {
+      if (channel === "openalma:reserve-image") return {startGeneration: payload.startGeneration, imageId: "failed-photo"}
+      if (channel === "openalma:image") throw new Error("Fictional photo upload failure")
+      return {ok: true}
+    })
+    nodes(render()).find(node => node.props?.type === "file").props.onClick()
+    await nodes(render()).find(node => node.props?.type === "file").props.onChange({currentTarget: {
+      files: [new File([new Uint8Array([1, 2, 3])], "fictional.png", {type: "image/png"})], value: "",
+    }})
+    expect(JSON.stringify(render())).toContain("Photo ready to retry")
+    await nodes(render()).find(node => node.props?.children === action).props.onClick()
+    expect(nodes(render()).some(node => node.props?.children === "Retry")).toBe(false)
+    expect(JSON.stringify(render())).not.toContain("Photo ready to retry")
+  })
+
   test("caption timeline is collapsed, keeps repeated text, and marks only accepted entries", () => {
     const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
       connection: "listening", photoCaptions: [

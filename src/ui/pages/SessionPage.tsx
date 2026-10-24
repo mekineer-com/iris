@@ -170,6 +170,7 @@ export default function SessionPage() {
 
   const discardPhoto = () => {
     setPendingPhoto(null)
+    setImageStatus(null)
   }
 
   const connection = snapshot?.connection ?? "idle"
