@@ -375,6 +375,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 700): Promise<void>
 }
 
 const PHOTO_NEXT = {next: "A photo task is ready. Call nothing_to_add to receive it."}
+const PHOTO_EMPTY = {result: "If a memory arrives, reconsider continuing the conversation if the new context brings something to light. Continue the conversation only if a reserved human would have something more to add. Otherwise send one second of silent audio."}
 
 async function providerReady(socket: FakeSocket, id = `provider-ready-${++FakeSocket.readinessCalls}`, complete = true,
   interactionStatus?: "IN_PROGRESS" | "IDLE") {
@@ -824,6 +825,39 @@ describe("GeminiLiveController", () => {
     return reply
   }
 
+  test.each(["continuous", "manual"] as const)("Thinking selection accepts a later readiness packet without turn completion (%s)", async mode => {
+    let deadline = Date.now() + 5_000
+    const h = harness({...selectionOptions, storage: new FakeStorage(), getStopDeadline: () => deadline})
+    await start(h, mode, "", THINKING, {callMode: "video", maxMemorizedPhotos: 1})
+    let stopping: Promise<void> | undefined
+    try {
+      for (let i = 1; i <= 3; i++) h.controller.admitFrame(frame(i))
+      stopping = h.controller.stop(true)
+      await waitFor(() => Reflect.get(h.controller, "drainInputFlushed"))
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "settle-first", name: "nothing_to_add", args: {}},
+        {id: "settle-sibling", name: "nothing_to_add", args: {}},
+      ]}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === "settle-first"))
+      expect(functionResponses(h.sockets[0]).find(reply => reply.id === "settle-first")?.response).toEqual(PHOTO_NEXT)
+      expect(functionResponses(h.sockets[0]).find(reply => reply.id === "settle-sibling")?.parts).toBeUndefined()
+      const offer = await providerReady(h.sockets[0], "later-packet", false)
+      expect(offer.response).toEqual({task: "Keep at most 1 photo."})
+      expect(offer.parts).toHaveLength(3)
+      provisionalCaption(h.sockets[0], frame(2).imageId, "A fictional courtyard.", "later-caption")
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === "later-caption"))
+      expect(functionResponses(h.sockets[0]).find(reply => reply.id === "later-caption")?.response).toMatchObject({ok: true, durable: true})
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "later-done", name: "nothing_to_add", args: {}}]}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === "later-done"))
+      expect(functionResponses(h.sockets[0]).find(reply => reply.id === "later-done")?.response).toEqual(PHOTO_EMPTY)
+      expect(Reflect.get(h.controller, "photoJob")).not.toBeNull()
+      h.sockets[0].message({serverContent: {interactionStatus: "IDLE"}})
+      await waitFor(() => Reflect.get(h.controller, "photoJob") === null)
+      expect(Reflect.get(h.controller, "photoJob")).toBeNull()
+      expect(h.errors).toEqual([])
+    } finally { deadline = Date.now() - 1; h.controller.refreshStopDeadline(); await (stopping ?? h.controller.stop()) }
+  })
+
   test.each([LIVE, THINKING])("selection binds exact originals through the shared dispatcher (%s)", async model => {
     for (const mode of ["continuous", "manual"] as const) {
       const storage = new FakeStorage()
@@ -1128,7 +1162,7 @@ describe("GeminiLiveController", () => {
     } finally { clock.mockRestore(); await h.controller.stop() }
   })
 
-  test.each(["continuous", "manual"] as const)("Thinking selection holds intermediate readiness until separate IDLE (%s)", async mode => {
+  test.each(["continuous", "manual"] as const)("Thinking selection answers readiness but waits for separate IDLE to finish (%s)", async mode => {
     const h = harness({...selectionOptions, storage: new FakeStorage()})
     await start(h, mode, "", THINKING, {callMode: "video", maxMemorizedPhotos: 1})
     try {
@@ -1139,7 +1173,7 @@ describe("GeminiLiveController", () => {
         serverContent: {turnComplete: true, interactionStatus: "IN_PROGRESS"}})
       await new Promise(resolve => setTimeout(resolve, 0))
       expect(Reflect.get(h.controller, "photoJob")).toBe(job)
-      expect(functionResponses(h.sockets[0]).some(response => response.id === "intermediate-selection-ready")).toBe(false)
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "intermediate-selection-ready")?.response).toEqual(PHOTO_EMPTY)
       expect(h.controller.frameDeliveryOpen).toBe(false)
       h.sockets[0].message({serverContent: {turnComplete: true, interactionStatus: "IN_PROGRESS"}})
       await new Promise(resolve => setTimeout(resolve, 0))
@@ -1147,7 +1181,7 @@ describe("GeminiLiveController", () => {
       h.sockets[0].message({serverContent: {interactionStatus: "IDLE"}})
       await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "intermediate-selection-ready"))
       expect(Reflect.get(h.controller, "photoJob")).toBeNull()
-      expect(functionResponses(h.sockets[0]).find(response => response.id === "intermediate-selection-ready")?.response).toEqual({ok: true})
+      expect(functionResponses(h.sockets[0]).find(response => response.id === "intermediate-selection-ready")?.response).toEqual(PHOTO_EMPTY)
       expect(Reflect.get(h.controller, "chosenIds").size).toBe(0)
       expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
     } finally { await h.controller.stop() }
@@ -2333,16 +2367,17 @@ describe("GeminiLiveController", () => {
     }
   })
 
-  test("the empty local no-op is SILENT and does not create dialogue or a server write", async () => {
+  test.each([LIVE, THINKING])("empty local no-op uses the model's reply without dialogue or a server write (%s)", async model => {
     const history: NonNullable<Parameters<typeof harness>[0]>["history"] = []
     const h = harness({storage: new FakeStorage(), history})
-    await start(h)
+    await start(h, "continuous", "", model)
     const before = h.requests.length
     h.sockets[0].message({toolCall: {functionCalls: [{id: "quiet", name: "nothing_to_add", args: {}}]},
       serverContent: {generationComplete: true, turnComplete: true}})
     await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "quiet"))
     expect(functionResponses(h.sockets[0]).find(response => response.id === "quiet"))
-      .toEqual({id: "quiet", name: "nothing_to_add", response: {ok: true}, scheduling: "SILENT"})
+      .toEqual(model === THINKING ? {id: "quiet", name: "nothing_to_add", response: PHOTO_EMPTY}
+        : {id: "quiet", name: "nothing_to_add", response: {ok: true}, scheduling: "SILENT"})
     expect(h.requests).toHaveLength(before)
     expect(history).toEqual([])
     expect(h.audio).toEqual([])

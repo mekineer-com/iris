@@ -114,7 +114,7 @@ type ToolBatch = {
   continuationSent: boolean
   background: boolean
   started: boolean
-  photoSettling?: boolean
+  photoSettling?: Set<string>
   photoContinuation?: boolean
   photoCaption?: boolean
 }
@@ -195,6 +195,7 @@ export const SITTING_REFLECTION_PROMPT =
   "Reflect briefly in first person on the emotional tone, subtext, or meaningful shift in this sitting that the literal transcript may not preserve. Do not recap the conversation. Respond with one or two natural sentences, or exactly NO_SUMMARY if nothing worthwhile would be added."
 const PHOTO_CAPTION_REPEAT_REQUEST = "Your memory store didn't receive the photo caption. Please send it!"
 const PHOTO_SETTLING_REPLY = {next: "A photo task is ready. Call nothing_to_add to receive it."}
+const PHOTO_EMPTY_REPLY = "If a memory arrives, reconsider continuing the conversation if the new context brings something to light. Continue the conversation only if a reserved human would have something more to add. Otherwise send one second of silent audio."
 const UNCERTAIN_SPEECH_PREFIX = "[Turn timing uncertain; combined speech, text retained in received order.]\n"
 
 function selectJournalKey(keys: string[], fresh = false): string {
@@ -996,7 +997,7 @@ export class GeminiLiveController {
     this.clearPhotoJob()
     this.photoJob = {image, batch: call.batch, callId: id, phase: "settling", retryPending}
     this.settledPreviewRevision = this.previewRevision
-    call.batch.photoSettling = true
+    call.batch.photoSettling = new Set(this.pendingToolCalls.keys())
     call.parts = undefined
     call.response = PHOTO_SETTLING_REPLY
     call.scheduling = "WHEN_IDLE"
@@ -1030,12 +1031,13 @@ export class GeminiLiveController {
     if (this.settledPreviewRevision !== this.previewRevision) {
       job.phase = "settling"
       this.settledPreviewRevision = this.previewRevision
-      call.batch.photoSettling = true
+      // Thinking can request the next task before this native turn completes.
+      call.batch.photoSettling = new Set(this.pendingToolCalls.keys())
       call.response = PHOTO_SETTLING_REPLY
       call.scheduling = "WHEN_IDLE"
       return
     }
-    if (call.batch.photoSettling) { call.response = {ok: true}; return }
+    if (call.batch.photoSettling?.has(id)) { call.response = {ok: true}; return }
     job.phase = "loading"
     this.retentionPressure = false
     call.parts = job.selection.frames.map(frame => ({inlineData: {mimeType: frame.mimeType, data: frame.modelData}}))
@@ -1049,7 +1051,8 @@ export class GeminiLiveController {
     this.selectionNeedsCurrentView = true
     for (const call of this.pendingToolCalls.values()) {
       if (call.name === "nothing_to_add" && call.response === undefined) {
-        call.response = {ok: !job.selection.failed, ...(job.selection.failed ? {status: "failed"} : {})}
+        call.response = this.thinking && !job.selection.failed ? PHOTO_EMPTY_REPLY
+          : {ok: !job.selection.failed, ...(job.selection.failed ? {status: "failed"} : {})}
         call.scheduling = "SILENT"
       }
     }
@@ -1082,17 +1085,23 @@ export class GeminiLiveController {
       if (!ready) return
       const [id, call] = ready
       if (this.photoJob && "selection" in this.photoJob && this.photoJob.phase === "settling") {
-        if (call.batch === this.photoJob.batch || call.batch.photoSettling) { call.response = {ok: true}; continue }
+        if (call.batch.photoSettling?.has(id)) { call.response = {ok: true}; continue }
         if (this.pendingImages.some(image => !image.caption && !image.retryRequested && image.mediaRef)) this.clearPhotoJob()
         else { this.dispatchSelection(id, call, this.photoJob); return }
       }
       if (this.photoJob && "selection" in this.photoJob) {
         if (this.photoJob.selection.excludedReadiness?.has(id)) { call.response = {ok: true}; continue }
         this.photoJob.selection.readiness ??= call
+        // Thinking cannot reach IDLE while waiting for this tool result.
+        if (this.thinking && !this.imageUpload) call.response = this.photoJob.selection.failed
+          ? {ok: false, status: "failed"} : PHOTO_EMPTY_REPLY
         this.completeSelectionIfReady(this.photoJob)
         return
       }
-      if (this.photoJob?.batch === call.batch || call.batch.photoCaption) { call.response = {ok: true}; continue }
+      if ((this.photoJob?.phase !== "settling" && this.photoJob?.batch === call.batch) || call.batch.photoCaption) {
+        call.response = this.thinking && !this.photoJob ? PHOTO_EMPTY_REPLY : {ok: true}
+        continue
+      }
       if (this.photoJob?.phase === "loading" || this.photoJob?.phase === "filing" || this.imageFinalization ||
           [...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption" && call.response === undefined)) return
       const image = this.photoJob?.image ?? this.pendingImages.find(image => !image.caption && !image.retryRequested && image.mediaRef)
@@ -1102,7 +1111,7 @@ export class GeminiLiveController {
           this.dispatchSelection(id, call)
           return
         }
-        call.response = {ok: true}
+        call.response = this.thinking ? PHOTO_EMPTY_REPLY : {ok: true}
         continue
       }
       if (!this.draining && (this.voiceActive || this.turnActive || (this.spokenRequest && !this.spokenRequest.retired) ||
@@ -1113,7 +1122,7 @@ export class GeminiLiveController {
         continue
       }
       // Co-packet readiness calls are not a second, post-settling model decision.
-      if (call.batch.photoSettling) { call.response = {ok: true}; continue }
+      if (call.batch.photoSettling?.has(id)) { call.response = {ok: true}; continue }
       this.clearPhotoJob()
       const job: PhotoJob = {image, batch: call.batch, callId: id, phase: "loading", retryPending: missingCaption}
       this.photoJob = job
@@ -1806,7 +1815,8 @@ export class GeminiLiveController {
         photo: !interruptedTurn && (interactionComplete
           ? !this.thinking && batch.photoContinuation === true && batch.photo === true
           : batch.photo === true || batch.photoContinuation === true)}
-      if (selectionJob && "selection" in selectionJob && selectionJob.selection.completion === batch && batch === selectionJob.batch) {
+      if (selectionJob && "selection" in selectionJob && !selectionJob.selection.choices.size && !selectionJob.selection.readiness &&
+          selectionJob.selection.completion === batch && batch === selectionJob.batch) {
         // A separately delivered completion of the readiness call precedes viewing.
         selectionJob.selection.completion = this.toolBatch
       }
