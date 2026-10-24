@@ -375,7 +375,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 700): Promise<void>
 }
 
 const PHOTO_NEXT = {next: "A photo task is ready. Call nothing_to_add to receive it."}
-const PHOTO_EMPTY = {result: "If a memory arrives, reconsider continuing the conversation if the new context brings something to light. Continue the conversation only if a reserved human would have something more to add. Otherwise send one second of silent audio."}
+const PHOTO_EMPTY = {result: "No photo task is ready. Say 'Done' once to finish this private exchange."}
 
 async function providerReady(socket: FakeSocket, id = `provider-ready-${++FakeSocket.readinessCalls}`, complete = true,
   interactionStatus?: "IN_PROGRESS" | "IDLE") {
@@ -2382,6 +2382,130 @@ describe("GeminiLiveController", () => {
     expect(history).toEqual([])
     expect(h.audio).toEqual([])
     await h.controller.stop()
+  })
+
+  test.each(["continuous", "manual"] as const)("Thinking no-work suppression survives segments and ends after final IDLE (%s)", async mode => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, mode, "", THINKING)
+    try {
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "decline-output", name: "nothing_to_add", args: {}}]},
+        serverContent: {generationComplete: true, turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === "decline-output"))
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "quiet-background", name: "read_working_state", args: {}}]}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === "quiet-background"))
+      const discarded = "An unwanted response after choosing not to speak."
+      for (const status of ["IN_PROGRESS", "IDLE"] as const) {
+        h.sockets[0].message({serverContent: {
+          modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]},
+          ...(status === "IN_PROGRESS" ? {generationComplete: true, turnComplete: true}
+            : {outputTranscription: {text: discarded}}), interactionStatus: status}})
+      }
+      expect(h.audio).toEqual([])
+      expect(h.errors).toEqual([])
+      completeTurn(h, "", "A fresh proactive thought after IDLE.")
+      expect(h.audio).toEqual(["AQABAA=="])
+      await h.controller.stop()
+      const rows = h.requests.flatMap(request => request.body.events ?? [])
+      expect(rows.filter(row => row.role === "assistant" && row.event_kind === "transcript").map(row => row.content))
+        .toEqual(["A fresh proactive thought after IDLE."])
+      expect(rows.some(row => row.event_kind === "transcript_gap")).toBe(false)
+      expect(h.persistenceErrors.filter(Boolean)).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
+  test.each(["continuous", "manual"] as const)("Thinking preserves pre-choice speech and releases new human input without interruption (%s)", async mode => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, mode, "", THINKING)
+    try {
+      h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}}})
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "decline-after-speech", name: "nothing_to_add", args: {}}]},
+        serverContent: {outputTranscription: {text: "Words already heard before the choice."},
+          generationComplete: true, turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === "decline-after-speech"))
+      if (mode === "manual") admitRequest(h, mode)
+      completeTurn(h, "A new fictional question.", "An answer to the new question.")
+      expect(h.audio).toEqual(["AQABAA==", "AQABAA=="])
+      await h.controller.stop()
+      const rows = h.requests.flatMap(request => request.body.events ?? [])
+      expect(rows.filter(row => row.role === "assistant" && row.event_kind === "transcript").map(row => row.content))
+        .toEqual(["Words already heard before the choice.", "An answer to the new question."])
+      expect(rows.filter(row => row.role === "user" && row.event_kind === "transcript").map(row => row.content))
+        .toEqual(["A new fictional question."])
+      expect(rows.some(row => row.event_kind === "transcript_gap")).toBe(false)
+      expect(h.errors).toEqual([])
+      expect(h.persistenceErrors.filter(Boolean)).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
+  test("Thinking keeps late human transcription without releasing declined output", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, "continuous", "", THINKING)
+    try {
+      completeTurn(h, "An earlier question.", "An earlier answer.")
+      await providerReady(h.sockets[0], "late-asr-quiet", false)
+      const request = Reflect.get(h.controller, "spokenRequest")
+      h.sockets[0].message({serverContent: {inputTranscription: {text: "A delayed human suffix."},
+        outputTranscription: {text: "Unwanted declined words."},
+        modelTurn: {parts: [{inlineData: {data: "AgACAA=="}}]}}})
+      expect(Reflect.get(h.controller, "spokenRequest")).toBe(request)
+      expect(h.audio).toEqual(["AQABAA=="])
+      expect(Reflect.get(h.controller, "quietOutput")).not.toBeNull()
+      h.sockets[0].message({serverContent: {interactionStatus: "IDLE"}})
+      await h.controller.stop()
+      const rows = h.requests.flatMap(request => request.body.events ?? [])
+      expect(rows.some(row => row.role === "user" && row.content.includes("A delayed human suffix."))).toBe(true)
+      expect(rows.some(row => row.content.includes("Unwanted declined words."))).toBe(false)
+    } finally { await h.controller.stop() }
+  })
+
+  test("Thinking accepts a photo while declined output stays suppressed, then captions it", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, "continuous", "", THINKING)
+    try {
+      await providerReady(h.sockets[0], "photo-handover-quiet", false)
+      await h.controller.sendImage({imageId: "quiet-photo", mimeType: "image/png", data: "AQID"})
+      expect(Reflect.get(h.controller, "quietOutput")).not.toBeNull()
+      h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AgACAA=="}}]},
+        outputTranscription: {text: "Old declined words after photo upload."}, interactionStatus: "IDLE"}})
+      expect(h.audio).toEqual([])
+      expect(Reflect.get(h.controller, "quietOutput")).toBeNull()
+      const settling = await providerReady(h.sockets[0], "photo-handover-settle", true, "IDLE")
+      expect(settling.response).toEqual(PHOTO_NEXT)
+      const task = await providerReady(h.sockets[0], "photo-handover-task", true, "IDLE")
+      expect(task.response.task).toBe("please-caption-quiet-photo")
+      provisionalCaption(h.sockets[0], "quiet-photo", "A fictional blue rectangle.")
+      h.sockets[0].message({serverContent: {interactionStatus: "IDLE"}})
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+      await waitFor(() => h.controller.pendingPhotoIds.length === 0)
+      completeTurn(h, "", "A fresh response after the photo.")
+      expect(h.audio).toEqual(["AQABAA=="])
+      await h.controller.stop()
+      expect(h.requests.flatMap(request => request.body.events ?? [])
+        .some(row => row.content.includes("Old declined words"))).toBe(false)
+      expect(h.errors).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
+  test("Thinking keeps delayed text for heard speech after an empty reply but before segment completion", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, "continuous", "", THINKING)
+    try {
+      h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}}})
+      h.sockets[0].message({toolCall: {functionCalls: [{id: "decline-before-late-text", name: "nothing_to_add", args: {}}]}})
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === "decline-before-late-text"))
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "Previously heard words, delivered late as text."},
+        generationComplete: true, turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AgACAA=="}}]},
+        outputTranscription: {text: "A declined response must not join those words."}, interactionStatus: "IDLE"}})
+      expect(h.audio).toEqual(["AQABAA=="])
+      await h.controller.stop()
+      const rows = h.requests.flatMap(request => request.body.events ?? [])
+      expect(rows.filter(row => row.role === "assistant" && row.event_kind === "transcript").map(row => row.content))
+        .toEqual(["Previously heard words, delivered late as text."])
+      expect(rows.some(row => row.event_kind === "transcript_gap")).toBe(false)
+      expect(h.errors).toEqual([])
+      expect(h.persistenceErrors.filter(Boolean)).toEqual([])
+    } finally { await h.controller.stop() }
   })
 
   test("a second stored original survives the first photo's held filing and dispatches in order", async () => {

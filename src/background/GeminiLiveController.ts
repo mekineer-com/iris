@@ -129,6 +129,7 @@ type PendingToolCall = {
   response?: string | Record<string, unknown>
   scheduling?: "WHEN_IDLE" | "SILENT"
   parts?: Array<{inlineData: {mimeType: string; data: string}}>
+  quietChoice?: boolean
 }
 
 type DeliberatePhotoJob = {
@@ -195,7 +196,6 @@ export const SITTING_REFLECTION_PROMPT =
   "Reflect briefly in first person on the emotional tone, subtext, or meaningful shift in this sitting that the literal transcript may not preserve. Do not recap the conversation. Respond with one or two natural sentences, or exactly NO_SUMMARY if nothing worthwhile would be added."
 const PHOTO_CAPTION_REPEAT_REQUEST = "Your memory store didn't receive the photo caption. Please send it!"
 const PHOTO_SETTLING_REPLY = {next: "A photo task is ready. Call nothing_to_add to receive it."}
-const PHOTO_EMPTY_REPLY = "If a memory arrives, reconsider continuing the conversation if the new context brings something to light. Continue the conversation only if a reserved human would have something more to add. Otherwise send one second of silent audio."
 const UNCERTAIN_SPEECH_PREFIX = "[Turn timing uncertain; combined speech, text retained in received order.]\n"
 
 function selectJournalKey(keys: string[], fresh = false): string {
@@ -598,6 +598,7 @@ export class GeminiLiveController {
   private draining = false
   private drainInputFlushed = false
   private outputMuted = false
+  private quietOutput: {keepTranscript: boolean} | null = null
   private drainDeadlineAt = 0
   private stopDeadlineTimer: ReturnType<typeof setTimeout> | null = null
   private drainResolve: (() => void) | null = null
@@ -1051,8 +1052,7 @@ export class GeminiLiveController {
     this.selectionNeedsCurrentView = true
     for (const call of this.pendingToolCalls.values()) {
       if (call.name === "nothing_to_add" && call.response === undefined) {
-        call.response = this.thinking && !job.selection.failed ? PHOTO_EMPTY_REPLY
-          : {ok: !job.selection.failed, ...(job.selection.failed ? {status: "failed"} : {})}
+        this.answerNoWork(call, job.selection.failed)
         call.scheduling = "SILENT"
       }
     }
@@ -1093,13 +1093,13 @@ export class GeminiLiveController {
         if (this.photoJob.selection.excludedReadiness?.has(id)) { call.response = {ok: true}; continue }
         this.photoJob.selection.readiness ??= call
         // Thinking cannot reach IDLE while waiting for this tool result.
-        if (this.thinking && !this.imageUpload) call.response = this.photoJob.selection.failed
-          ? {ok: false, status: "failed"} : PHOTO_EMPTY_REPLY
+        if (this.thinking && !this.imageUpload) this.answerNoWork(call, this.photoJob.selection.failed)
         this.completeSelectionIfReady(this.photoJob)
         return
       }
       if ((this.photoJob?.phase !== "settling" && this.photoJob?.batch === call.batch) || call.batch.photoCaption) {
-        call.response = this.thinking && !this.photoJob ? PHOTO_EMPTY_REPLY : {ok: true}
+        if (this.thinking && !this.photoJob) this.answerNoWork(call)
+        else call.response = {ok: true}
         continue
       }
       if (this.photoJob?.phase === "loading" || this.photoJob?.phase === "filing" || this.imageFinalization ||
@@ -1111,7 +1111,7 @@ export class GeminiLiveController {
           this.dispatchSelection(id, call)
           return
         }
-        call.response = this.thinking ? PHOTO_EMPTY_REPLY : {ok: true}
+        this.answerNoWork(call)
         continue
       }
       if (!this.draining && (this.voiceActive || this.turnActive || (this.spokenRequest && !this.spokenRequest.retired) ||
@@ -1740,7 +1740,7 @@ export class GeminiLiveController {
       ) {
         throw new Error("Gemini returned malformed audio")
       }
-      if (!this.outputMuted || this.reflecting) {
+      if ((!this.quietOutput || this.reflecting) && (!this.outputMuted || this.reflecting)) {
         this.callbacks.onAudio(inline.data)
         // Exact zero PCM is playback, but not spoken words requiring a transcript.
         if (!this.thinking || !/^A+={0,2}$/.test(inline.data)) {
@@ -1765,7 +1765,7 @@ export class GeminiLiveController {
       return
     }
 
-    if (!this.outputMuted || this.turnAudioDelivered) this.outputTranscript += output
+    if ((!this.quietOutput || this.quietOutput.keepTranscript) && (!this.outputMuted || this.turnAudioDelivered)) this.outputTranscript += output
     if (interrupted) {
       if (!this.toolBatch.background && this.toolBatch.request) this.toolBatch.request.retired = true
       trace("provider.interrupted", {
@@ -1775,6 +1775,7 @@ export class GeminiLiveController {
       })
       this.finalizeInterruptedTurn(true)
       this.callbacks.onInterrupted()
+      this.quietOutput = null
     }
     if (content.turnComplete === true || (this.thinking && content.interactionStatus === "IDLE")) {
       const interactionComplete = !this.thinking || content.interactionStatus === "IDLE"
@@ -1826,6 +1827,10 @@ export class GeminiLiveController {
       this.materializeDrafts()
       this.callbacks.onTurnComplete(interactionComplete && !this.spokenRequest)
       if (interactionComplete) this.requestSpokenPhotoDescription()
+      if (this.quietOutput) {
+        this.quietOutput.keepTranscript = false
+        if (interactionComplete) this.quietOutput = null
+      }
       // Barge-in completes the old response before the interrupting voice turn is finished.
       if (interactionComplete && (!interruptedTurn || (!this.voiceActive && (!this.spokenRequest || this.spokenRequest.retired) &&
           this.pendingImage && !this.pendingImage.providerSent && !this.pendingImage.retryRequested))) {
@@ -2267,6 +2272,13 @@ export class GeminiLiveController {
     this.reportError(new Error(message))
   }
 
+  private answerNoWork(call: PendingToolCall, failed = false): void {
+    call.response = failed ? {ok: false, status: "failed"} : this.thinking
+      ? "No photo task is ready. Say 'Done' once to finish this private exchange."
+      : {ok: true}
+    call.quietChoice = this.thinking && !failed
+  }
+
   private flushToolResponses(): void {
     if (this.handlingMessage) return
     this.dispatchPhotoWork()
@@ -2297,6 +2309,9 @@ export class GeminiLiveController {
       const resume = needsAnswer && !pending.batch.continuationSent && !request.continuing &&
         ![...this.pendingToolCalls.values()].some(call => call !== pending &&
           call.name !== "nothing_to_add" && call.batch.request === request && !call.batch.continuationSent)
+      if (this.thinking && pending.quietChoice) {
+        this.quietOutput ??= {keepTranscript: this.turnAudioDelivered}
+      }
       this.socket.send(JSON.stringify({
         toolResponse: {
           functionResponses: [{
@@ -2390,6 +2405,7 @@ export class GeminiLiveController {
   }
 
   private admitSpokenRequest(): void {
+    this.quietOutput = null
     const job = this.photoJob
     if (job && "selection" in job && job.phase !== "dispatched") {
       const call = this.pendingToolCalls.get(job.callId)
@@ -2414,6 +2430,7 @@ export class GeminiLiveController {
   }
 
   private disconnectToolBatch(): void {
+    this.quietOutput = null
     for (const [id, call] of this.pendingToolCalls) {
       if (call.name === "nothing_to_add") this.pendingToolCalls.delete(id)
     }
