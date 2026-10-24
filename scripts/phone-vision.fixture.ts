@@ -4,7 +4,7 @@ import {usePhoneVision} from "../src/ui/hooks/usePhoneVision"
 import SessionPage from "../src/ui/pages/SessionPage"
 import {VISION_SETTINGS, type SessionSnapshot} from "../src/shared/types"
 
-declare global {interface Window {visionTest: Promise<unknown>}}
+declare global {interface Window {visionTest: Promise<unknown>; visionLayout: () => Promise<{ok: true}>}}
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
 const assert = (ok: unknown, label: string) => {if (!ok) throw new Error(label)}
 const wait = async (predicate: () => boolean) => {
@@ -74,6 +74,53 @@ let control!: ReturnType<typeof usePhoneVision>
 function Fixture() {control = usePhoneVision(snapshot, foreground); return createElement("video", {ref: control.videoRef})}
 const container = document.createElement("div"); document.body.append(container)
 const root = createRoot(container)
+window.visionLayout = async () => {
+  const panel = document.createElement("div"); document.body.append(panel)
+  const page = createRoot(panel)
+  const rect = (selector: string) => {
+    const element = panel.querySelector(selector)
+    assert(element, `missing layout element: ${selector}`)
+    return element!.getBoundingClientRect()
+  }
+  const layoutSnapshot = {configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+    soulLoading: false, connection: "idle", callMode: "audio", mode: "continuous", startGeneration: 1,
+    cameraEnabled: true, microphoneEnabled: true, frameDeliveryOpen: false, maxMemorizedPhotos: 5,
+    modelChoice: "gemini-3.8-live-extended-thinking", modelSaving: false,
+    pendingPhotoIds: [], photoCaptions: [], photoRetryPending: false, catchUpRender: null} as SessionSnapshot
+  try {
+    await act(async () => {page.render(createElement(SessionPage))})
+    await act(async () => {listeners.get("openalma:update")!(layoutSnapshot)})
+    const gear = panel.querySelector<HTMLButtonElement>(".settings-toggle")!
+    await act(async () => {gear.click()})
+    window.scrollTo(0, 0)
+    await new Promise(requestAnimationFrame)
+    const main = rect("main"), box = rect(".photo-allowance"), slider = rect("#photo-allowance")
+    assert(document.documentElement.scrollWidth <= window.innerWidth, "page overflows horizontally")
+    assert(box.left >= main.left && box.right <= main.right, "allowance box escapes page margins")
+    assert(slider.left >= box.left && slider.right <= box.right, "slider escapes allowance box")
+    const buttons = panel.querySelectorAll<HTMLButtonElement>(".sitting-start > button")
+    assert(buttons.length === 2 && Math.abs(buttons[0]!.getBoundingClientRect().width - buttons[1]!.getBoundingClientRect().width) < 0.5, "Audio/Video widths differ")
+    assert(panel.querySelector(".photo-controls")!.tagName === "SECTION", "Photos became an accordion")
+    assert(Math.abs(rect(".model-toggle input").height - 43.2) < 0.1, "toggle height differs from 2.7rem")
+    const gaps = [
+      rect(".soul-entry").top - rect(".soul-control .section-label").bottom,
+      rect(".model-toggle").top - rect('[aria-label="Model"] > .section-label').bottom,
+      rect(".sitting-controls").top - rect('[aria-label="Voice controls"] > .section-label').bottom,
+      rect(".image-actions").top - rect(".photo-controls > .section-label").bottom,
+      box.top - rect('label[for="photo-allowance"]').bottom,
+    ]
+    assert(gaps.every(gap => Math.abs(gap - 12) < 0.5), `heading/control gaps differ: ${gaps}`)
+    const headerTop = rect(".iris-header").top
+    window.scrollTo(0, 300)
+    await new Promise(requestAnimationFrame)
+    assert(window.scrollY > 0, "layout test never actually scrolled")
+    assert(Math.abs(rect(".iris-header").top - headerTop) < 0.5, "header moves during page scrolling")
+    assert(getComputedStyle(panel.querySelector(".iris-header")!, "::after").opacity === "0.5", "header backdrop is not 50%")
+    assert(rect(".settings-toggle").right <= main.right - 12, "gear lacks right padding")
+    assert(panel.querySelector(".photo-controls")!.compareDocumentPosition(panel.querySelector("#iris-settings")!) & Node.DOCUMENT_POSITION_FOLLOWING, "Settings moved above Photos")
+    return {ok: true}
+  } finally {await act(async () => {page.unmount()}); panel.remove(); window.scrollTo(0, 0)}
+}
 const render = async () => {await act(async () => {root.render(createElement(Fixture))})}
 const tick = async () => {await act(async () => {for (const fn of [...tickers.values()]) fn()})}
 const count = (channel: string) => calls.filter(call => call.channel === channel).length

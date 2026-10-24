@@ -14,9 +14,12 @@ async function check() {
     target: "browser", define: {"process.env.NODE_ENV": '"development"'}})
   if (!built.success) throw new Error(built.logs.join("\n"))
   const js = await built.outputs[0].text()
+  const css = await readFile(new URL("../src/index.css", import.meta.url), "utf8")
   const server = Bun.serve({hostname: "127.0.0.1", port: 0, fetch(req) {
-    return new URL(req.url).pathname === "/fixture.js" ? new Response(js, {headers: {"content-type": "application/javascript"}})
-      : new Response('<!doctype html><script type="module" src="/fixture.js"></script>', {headers: {"content-type": "text/html"}})
+    const path = new URL(req.url).pathname
+    if (path === "/fixture.js") return new Response(js, {headers: {"content-type": "application/javascript"}})
+    if (path === "/style.css") return new Response(css, {headers: {"content-type": "text/css"}})
+    return new Response('<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="/style.css"><script type="module" src="/fixture.js"></script>', {headers: {"content-type": "text/html"}})
   }})
   const folder = mkdtempSync(join(tmpdir(), "iris-ui-vision-"))
   const proc = Bun.spawn([chromium, "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--disable-background-networking",
@@ -63,6 +66,14 @@ async function check() {
     const result = response.result.value
     if (!result?.ok) throw new Error(JSON.stringify(result))
     assert.equal(result.checks.length, 13)
+    for (const width of [320, 360, 768]) for (const theme of ["light", "dark"]) {
+      await page("Emulation.setDeviceMetricsOverride", {width, height: 800, deviceScaleFactor: 1, mobile: true})
+      await page("Emulation.setEmulatedMedia", {features: [{name: "prefers-color-scheme", value: theme}]})
+      const layout = await page("Runtime.evaluate", {expression: "window.visionLayout()", awaitPromise: true, returnByValue: true})
+      if (layout.exceptionDetails) throw new Error(`${width}px ${theme}: ${JSON.stringify(layout.exceptionDetails)}`)
+      assert.equal(layout.result.value.ok, true)
+      console.log(`${width}px ${theme}: styled layout, scrolling and control bounds pass`)
+    }
     // Validate actual browser JPEG/wire payloads at the production admission boundary.
     const noop = () => {}
     const controller = new GeminiLiveController({baseUrl: "http://127.0.0.1:1", userId: "FictionalOwner",
