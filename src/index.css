@@ -124,18 +124,31 @@ h1 {
 }
 
 .memu-status {
-  display: flex;
-  align-items: center;
-  gap: 0.65rem;
+  display: grid;
+  grid-template-columns: 3rem minmax(0, 1fr);
+  gap: 0.4rem 0.65rem;
   margin: 0.75rem 0;
   font-weight: 700;
 }
 
 .memu-status img {
-  width: 2.25rem;
-  height: 2.25rem;
+  grid-row: 2;
+  width: 3rem;
+  height: 3rem;
   filter: grayscale(1);
   opacity: 0.65;
+}
+
+.memu-guidance,
+.memu-actions { grid-column: 2; }
+
+.memu-status img,
+.memu-actions { margin-top: -1.00em; }
+
+.memu-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
 }
 
 .spinner {
