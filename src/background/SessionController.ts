@@ -5,7 +5,7 @@ import type {Channels} from "../shared/channels"
 import type {FrameRequest, ImageReferenceRequest, ImageRequest} from "../shared/channels"
 import type {CallMode, CatchUpResult, FrameRetention} from "../shared/types"
 import {formatImageTimestamp, nextImageReference} from "../shared/imageReference"
-import {LIVE_MODELS, MIC_SOURCES, STOP_BACKGROUND_MS, STOP_FOREGROUND_MS, VISION_SETTINGS, type LiveModel, type MicSource} from "../shared/types"
+import {LIVE_MODELS, MIC_SOURCES, STOP_BACKGROUND_MS, STOP_FOREGROUND_MS, VISION_SETTINGS, type MicSource} from "../shared/types"
 import type {
   ConnectionState,
   EarconName,
@@ -53,7 +53,6 @@ const MICROPHONE_ENABLED_KEY = "openalma.microphone-enabled"
 const CAMERA_ENABLED_KEY = "openalma.camera-enabled"
 const CLOSING_THOUGHTS_KEY = "openalma.closing-thoughts"
 const SOUL_ID_KEY = "openalma.soul-id"
-const LIVE_MODEL_KEY = "openalma.live-model"
 const MAX_MEMORIZED_PHOTOS_KEY = "openalma.max-memorized-photos"
 
 function trace(event: string, detail: Record<string, unknown> = {}): void {
@@ -89,7 +88,6 @@ export class SessionController {
   private microphoneEnabled = true
   private cameraEnabled = true
   private closingThoughts = true
-  private modelChoice: LiveModel | null = null
   private configuredModel: string | null = null
   private modelSaving = false
   private closingThoughtsAtStop = true
@@ -336,8 +334,15 @@ export class SessionController {
       this.modelSaving = true
       this.pushSnapshot()
       try {
-        await this.session.storage.set(LIVE_MODEL_KEY, model)
-        this.modelChoice = model
+        const config = this.currentConfig()
+        const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/model`, {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({user_id: config.userId, model}), signal: timeoutSignal(10_000),
+        })
+        if (!response.ok) throw new Error(`Model settings failed (${response.status})`)
+        const saved = await response.json() as {configured_model?: unknown}
+        if (saved.configured_model !== model) throw new Error("Model save returned a different model")
+        this.configuredModel = model
       } finally {
         this.modelSaving = false
         this.pushSnapshot()
@@ -523,7 +528,6 @@ export class SessionController {
       callMode: this.callMode,
       maxMemorizedPhotos: this.maxMemorizedPhotos,
       catchUpRender: this.liveController?.catchUpRender ?? null,
-      modelChoice: this.modelChoice,
       model: this.liveController?.model || null,
       configuredModel: this.configuredModel,
       modelSaving: this.modelSaving,
@@ -730,7 +734,7 @@ export class SessionController {
       }
       const controller = this.liveController
       this.updateVisionAvailability()
-      await controller.start(mode, this.modelChoice ?? undefined, {callMode, maxMemorizedPhotos: this.maxMemorizedPhotos})
+      await controller.start(mode, undefined, {callMode, maxMemorizedPhotos: this.maxMemorizedPhotos})
       trace("session.provider.ready")
       if (generation !== this.startGeneration) {
         await this.stopLiveController(false, controller)
@@ -1195,23 +1199,18 @@ export class SessionController {
   ): Promise<void> {
     let storedSoul: string | null = null
     try {
-      let [storedProfile, microphone, camera, closingThoughts, savedSoul, journal, savedModel, savedMaximum] = await Promise.all([
+      let [storedProfile, microphone, camera, closingThoughts, savedSoul, journal, savedMaximum] = await Promise.all([
         this.session.storage.get(OPENALMA_PROFILE_KEY),
         this.session.storage.get(MICROPHONE_ENABLED_KEY),
         this.session.storage.get(CAMERA_ENABLED_KEY),
         this.session.storage.get(CLOSING_THOUGHTS_KEY),
         this.session.storage.get(SOUL_ID_KEY),
         this.journalOwner.read(),
-        this.session.storage.get(LIVE_MODEL_KEY).catch(() => {
-          this.lastError = "Saved model choice unavailable; using server setting"
-          return null
-        }),
         this.session.storage.get(MAX_MEMORIZED_PHOTOS_KEY).catch(() => {
           this.lastError = "Saved Maximum memorized photos unavailable; using 1"
           return null
         }),
       ])
-      this.modelChoice = LIVE_MODELS.find(model => model === savedModel) ?? null
       this.maxMemorizedPhotos = savedMaximum !== null && /^[1-5]$/.test(savedMaximum) ? Number(savedMaximum) : 1
       const host = installationHost(await this.session.storage.get(OPENALMA_HOST_KEY))
       if (!this.config && storedProfile === null && this.installationDefaults !== undefined) {
@@ -1329,7 +1328,7 @@ export class SessionController {
   }
 
   private connectionLocked(): boolean {
-    return this.soulLoading || this.soulSelecting || ACTIVE.has(this.connection) ||
+    return this.soulLoading || this.soulSelecting || this.modelSaving || ACTIVE.has(this.connection) ||
       this.connection === "stopping"
   }
 
@@ -1344,11 +1343,11 @@ export class SessionController {
   }
 
   private async refreshFailedPhotos(): Promise<void> {
-    if (!this.config || !this.soulId || this.installationPending()) return
+    if (!this.config || this.installationPending() || this.modelSaving) return
     const config = this.config
     const soulId = this.soulId
     const generation = this.startGeneration
-    const query = `user_id=${encodeURIComponent(config.userId)}&soul_id=${encodeURIComponent(soulId)}`
+    const query = soulId ? `user_id=${encodeURIComponent(config.userId)}&soul_id=${encodeURIComponent(soulId)}` : ""
     const current = () => this.soulId === soulId && this.config === config && generation === this.startGeneration
     try {
       const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/status?${query}`, {

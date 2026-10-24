@@ -29,7 +29,7 @@ function labelledCheckbox(tree: any, text: string) {
 }
 
 function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Promise<unknown>, now?: number) {
-  for (const [field, value] of Object.entries({modelChoice: LIVE_MODELS[0], model: null, configuredModel: null, modelSaving: false,
+  for (const [field, value] of Object.entries({model: null, configuredModel: LIVE_MODELS[0], modelSaving: false,
     callMode: "audio", maxMemorizedPhotos: 1, catchUpRender: null})) {
     if (!(field in snapshot)) Object.assign(snapshot, {[field]: value})
   }
@@ -103,17 +103,17 @@ describe("SessionPage state projection", () => {
   const modelSwitches = (tree: any) => nodes(nodes(tree).find(node => node.props?.["aria-label"] === "Model"))
     .filter(node => node.props?.role === "switch")
 
-  test("no saved override displays Live, independent of the old server model", () => {
+  test("reads the configured model without inventing a default", () => {
     const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"],
-      modelChoice: null, configuredModel: null as string | null}
+      configuredModel: null as string | null}
     const render = renderPage(snapshot, async () => ({ok: true}))
     for (const model of [null, "custom-server-model", ...LIVE_MODELS]) {
       snapshot.configuredModel = model
       const tree = render()
-      expect(modelSwitches(tree).map(button => button.props.checked)).toEqual([false])
+      expect(modelSwitches(tree).map(button => button.props.checked)).toEqual([model === LIVE_MODELS[1]])
       const selector = nodes(tree).find(node => node.props?.["aria-label"] === "Model")
       expect(nodes(selector).some(node => node.type === "p")).toBe(false)
-      expect(JSON.stringify(selector)).toContain(LIVE_MODELS[0])
+      expect(JSON.stringify(selector)).toContain(model ?? "Model unavailable")
       const controls = nodes(tree).find(node => node.props?.["aria-label"] === "Voice controls")
       expect(modelSwitches(controls)).toHaveLength(1)
       const settings = nodes(tree).find(node => node.props?.id === "iris-settings")
@@ -126,7 +126,7 @@ describe("SessionPage state projection", () => {
       test(`${choice} save ${fails ? "failure retains" : "success updates"} the confirmed choice and locks Start`, async () => {
         const previous = index === 0 ? LIVE_MODELS[1] : null
         const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
-          soulConfirmed: true, soulLocked: false, connection: "idle", modelChoice: previous as LiveModel | null}
+          soulConfirmed: true, soulLocked: false, connection: "idle", configuredModel: previous as LiveModel | null}
         let resolve!: () => void
         let reject!: (error: Error) => void
         const pending = new Promise<void>((res, rej) => {resolve = res; reject = rej})
@@ -150,7 +150,7 @@ describe("SessionPage state projection", () => {
         expect(start().props.disabled).toBe(true)
         if (fails) reject(new Error("Fictional model preference storage failure"))
         else {
-          snapshot.modelChoice = choice
+          snapshot.configuredModel = choice
           resolve()
         }
         await new Promise(resolve => setTimeout(resolve, 0))
@@ -162,38 +162,26 @@ describe("SessionPage state projection", () => {
     }
   }
 
-  test.each([false, true])("first Start saves displayed Live before starting (save fails=%s)", async fails => {
+  test("Start does not save or override the configured model", async () => {
     const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
-      soulConfirmed: true, soulLocked: false, connection: "idle", modelChoice: null, configuredModel: "old-server-model"}
+      soulConfirmed: true, soulLocked: false, connection: "idle", configuredModel: "custom-server-model"}
     const calls: Array<{channel: string; payload: unknown}> = []
-    let resolve!: () => void, reject!: (error: Error) => void
-    const saving = new Promise<void>((res, rej) => {resolve = res; reject = rej})
     const render = renderPage(snapshot, async (channel, payload) => {
       calls.push({channel, payload})
-      if (channel === "openalma:set-soul") return {soulId: "Quill", created: false}
-      if (channel === "openalma:set-model") return saving
-      return {ok: true}
+      return channel === "openalma:set-soul" ? {soulId: "Quill", created: false} : {ok: true}
     })
     nodes(render()).find(node => node.props?.onFocus).props.onChange({target: {value: "Quill"}})
     nodes(render()).find(node => node.props?.["aria-label"] === "Use soul").props.onClick()
     await new Promise(resolve => setTimeout(resolve, 0))
     calls.length = 0
-    const start = () => nodes(render()).find(node => node.props?.className === "sitting-button")
-    start().props.onClick()
-    expect(calls).toEqual([{channel: "openalma:set-model", payload: {model: LIVE_MODELS[0]}}])
-    expect(modelSwitches(render())[0].props.disabled).toBe(true)
-    if (fails) reject(new Error("Fictional model save failed"))
-    else resolve()
+    nodes(render()).find(node => node.props?.className === "sitting-button").props.onClick()
     await new Promise(resolve => setTimeout(resolve, 0))
-    expect(calls.filter(call => call.channel === "openalma:start")).toEqual(fails ? [] : [
-      {channel: "openalma:start", payload: {mode: "continuous", callMode: "audio"}},
-    ])
-    if (fails) expect(JSON.stringify(render())).toContain("Fictional model save failed")
+    expect(calls).toEqual([{channel: "openalma:start", payload: {mode: "continuous", callMode: "audio"}}])
   })
 
   test("model selection locks for the whole sitting and background save; active label uses actual model", () => {
     const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"], connection: "idle",
-      modelChoice: LIVE_MODELS[0], model: "actual-lease-model", configuredModel: "custom-server-model", modelSaving: false}
+      model: "actual-lease-model", configuredModel: "custom-server-model", modelSaving: false}
     const render = renderPage(snapshot, async () => ({ok: true}))
     for (const connection of ["idle", "error", "starting", "reconnecting", "listening", "speaking", "stopping"]) {
       snapshot.connection = connection

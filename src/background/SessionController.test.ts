@@ -17,12 +17,24 @@ const CONFIG: OpenAlmaConfig = {
   version: "0.1.0",
 }
 
-function withOwnerDiscovery(fetchFn: typeof fetch, userId = CONFIG.userId, failedPhotos: string[] = []): typeof fetch {
+type ModelSettings = {model: string | null; saveStatus?: number; saveGate?: Promise<void>; readStatus?: number}
+function withOwnerDiscovery(fetchFn: typeof fetch, userId = CONFIG.userId, failedPhotos: string[] = [], model: ModelSettings = {model: "custom-configured-model"}): typeof fetch {
   return (async (url, init) => {
+    if (String(url).includes("/integration/mentra/model")) {
+      if (init?.method === "POST") {
+        await model.saveGate
+        if (model.saveStatus) return Response.json({}, {status: model.saveStatus})
+        model.model = JSON.parse(String(init.body)).model
+        return Response.json({ok: true, configured_model: model.model})
+      }
+    }
     if (String(url).endsWith("/integration/mentra/owner") && !init?.method) {
       return Response.json({user_id: userId})
     }
-    if (String(url).includes("/integration/mentra/status?")) return Response.json({failed_photos: failedPhotos})
+    if (String(url).includes("/integration/mentra/status?")) {
+      if (model.readStatus) return Response.json({}, {status: model.readStatus})
+      return Response.json({failed_photos: failedPhotos, configured_model: model.model})
+    }
     return fetchFn(url, init)
   }) as typeof fetch
 }
@@ -310,6 +322,7 @@ function setup(
     unreadableJournal?: boolean
     fetchFn?: typeof fetch
     failedPhotos?: string[]
+    modelSettings?: ModelSettings
   } = {},
 ) {
   const session = new FakeSession()
@@ -337,7 +350,7 @@ function setup(
       return new Response(JSON.stringify({soul_id: body.soul_id, created: !body.use_existing}), {
         headers: {"Content-Type": "application/json"},
       })
-    }) as typeof fetch, CONFIG.userId, options.failedPhotos),
+    }) as typeof fetch, CONFIG.userId, options.failedPhotos, options.modelSettings),
     createLiveController: (config, callbacks) => {
       configs.push(config)
       live = new FakeLive(callbacks)
@@ -390,7 +403,7 @@ describe("SessionController", () => {
     await h.session.handlers["openalma:set-max-memorized-photos"]({value: 3})
     await h.session.handlers["openalma:start"]({mode: "manual", callMode: "video"})
     expect(h.live.visionStarts).toEqual([{callMode: "video", maxMemorizedPhotos: 3}])
-    expect(h.live.modelChoices).toEqual(["gemini-3.8-live-extended-thinking"])
+    expect(h.live.modelChoices).toEqual([undefined])
     await h.session.handlers["openalma:start"]({mode: "continuous", callMode: "audio"})
     expect(lastSnapshot(h.session)).toMatchObject({callMode: "video", mode: "manual"})
     expect(h.live.starts).toBe(1)
@@ -600,31 +613,74 @@ describe("SessionController", () => {
     const h = setup()
     await h.session.handlers["openalma:start"]({mode: "manual"})
     expect(h.live.modelChoices).toEqual([undefined])
-    expect(lastSnapshot(h.session)).toMatchObject({modelChoice: null, model: "custom-configured-model"})
+    expect(lastSnapshot(h.session)).toMatchObject({configuredModel: "custom-configured-model", model: "custom-configured-model"})
     await expect(h.session.handlers["openalma:set-model"]({model: "gemini-3.8-live"})).rejects.toThrow("Stop")
     await h.session.handlers["openalma:stop"]({})
     await h.session.handlers["openalma:set-model"]({model: "gemini-3.8-live-extended-thinking"})
-    expect(h.session.stored.get("openalma.live-model")).toBe("gemini-3.8-live-extended-thinking")
+    expect(h.session.stored.has("openalma.live-model")).toBe(false)
+    expect(lastSnapshot(h.session)?.configuredModel).toBe("gemini-3.8-live-extended-thinking")
     await h.session.handlers["openalma:start"]({mode: "manual"})
-    expect(h.live.modelChoices).toEqual(["gemini-3.8-live-extended-thinking"])
-    expect(lastSnapshot(h.session)?.model).toBe("gemini-3.8-live-extended-thinking")
+    expect(h.live.modelChoices).toEqual([undefined])
     await h.session.handlers["openalma:stop"]({})
   })
 
   test("pending model save blocks Start and a failed save retains the confirmed choice", async () => {
-    const h = setup({stored: {"openalma.live-model": "gemini-3.8-live"}})
-    await new Promise(resolve => setTimeout(resolve, 0))
     let release!: () => void
-    h.session.storage.set = async () => {await new Promise<void>(resolve => {release = resolve}); throw new Error("Model save failed")}
+    const h = setup({modelSettings: {model: "gemini-3.8-live", saveStatus: 500,
+      saveGate: new Promise<void>(resolve => {release = resolve})}})
+    await new Promise(resolve => setTimeout(resolve, 0))
     const saving = h.session.handlers["openalma:set-model"]({model: "gemini-3.8-live-extended-thinking"})
     const rejected = (saving as Promise<unknown>).then(() => "unexpected success", error => error.message)
     await new Promise(resolve => setTimeout(resolve, 0))
     expect(lastSnapshot(h.session)?.modelSaving).toBe(true)
     await expect(h.session.handlers["openalma:start"]({mode: "manual"})).rejects.toThrow("model selection")
     release()
-    expect(await rejected).toBe("Model save failed")
-    expect(lastSnapshot(h.session)).toMatchObject({modelChoice: "gemini-3.8-live", modelSaving: false})
+    expect(await rejected).toBe("Model settings failed (500)")
+    expect(lastSnapshot(h.session)).toMatchObject({configuredModel: "gemini-3.8-live", modelSaving: false})
     await expect(h.session.handlers["openalma:set-model"]({model: "custom"})).rejects.toThrow("Unknown Live model")
+  })
+
+  test("server model overrides abandoned phone preferences and refreshes on reopen", async () => {
+    const settings: ModelSettings = {model: "gemini-3.8-live"}
+    const h = setup({stored: {"openalma.live-model": "gemini-3.8-live-extended-thinking"}, modelSettings: settings})
+    await flush()
+    expect(lastSnapshot(h.session)?.configuredModel).toBe("gemini-3.8-live")
+    settings.model = "custom-model-from-file"
+    h.session.onOpenCb!()
+    await flush()
+    expect(lastSnapshot(h.session)).toMatchObject({configuredModel: "custom-model-from-file"})
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    expect(h.live.modelChoices).toEqual([undefined])
+    await h.session.handlers["openalma:stop"]({})
+  })
+
+  test("a failed model refresh retains the confirmed server value and recovers its error", async () => {
+    const settings: ModelSettings = {model: "gemini-3.8-live"}
+    const h = setup({modelSettings: settings})
+    await flush()
+    settings.readStatus = 503
+    h.session.onOpenCb!()
+    await flush()
+    expect(lastSnapshot(h.session)?.configuredModel).toBe("gemini-3.8-live")
+    expect(lastSnapshot(h.session)?.lastError).toContain("Photo recovery status failed (503)")
+    settings.readStatus = undefined
+    h.session.onOpenCb!()
+    await flush()
+    expect(lastSnapshot(h.session)?.lastError).toBeNull()
+  })
+
+  test("model save locks connection edits until the config ACK", async () => {
+    let release!: () => void
+    const h = setup({modelSettings: {model: "gemini-3.8-live", saveGate: new Promise<void>(resolve => {release = resolve})}})
+    await flush()
+    const saving = h.session.handlers["openalma:set-model"]({model: "gemini-3.8-live-extended-thinking"}) as Promise<unknown>
+    const result = saving.catch(error => error)
+    try {
+      await flush()
+      await expect(h.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://different.example"})).rejects.toThrow("Wait for settings")
+      expect(lastSnapshot(h.session)?.connectionProfile?.baseUrl).toBe(CONFIG.baseUrl)
+    } finally {release(); await result}
+    expect(lastSnapshot(h.session)?.configuredModel).toBe("gemini-3.8-live-extended-thinking")
   })
 
   test("Closing thoughts defaults checked, persists across controllers, and does not apply failed writes", async () => {
@@ -1481,6 +1537,7 @@ describe("SessionController", () => {
     const fetchFn = (async (url, init) => {
       const path = String(url)
       if (path.endsWith("/owner")) return Response.json({user_id: CONFIG.userId})
+      if (path.includes("/model?")) return Response.json({configured_model: "gemini-3.8-live"})
       if (path.includes("/status?")) return Response.json({detail: "fictional receipt read failure"}, {status: 503})
       if (path.endsWith("/souls")) {
         if (init?.method === "POST") return Response.json({soul_id: selected, created: false})
@@ -1686,6 +1743,10 @@ describe("SessionController", () => {
         await release
         return Response.json({ok: true})
       }
+      if (String(url).includes("/integration/mentra/status?")) {
+        expect(JSON.parse(session.stored.get("openalma.connection-profile")!).installationConfirmed).toBe(true)
+        return Response.json({configured_model: "gemini-3.8-live"})
+      }
       expect(JSON.parse(session.stored.get("openalma.connection-profile")!).installationConfirmed).toBe(reopened)
       return Response.json(String(url).endsWith("/owner") ? {user_id: CONFIG.userId} : {souls: []})
     }) as typeof fetch
@@ -1699,7 +1760,7 @@ describe("SessionController", () => {
     await session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
     const saved = session.stored.get("openalma.connection-profile")!
     expect(lastSnapshot(session)).toMatchObject({configured: true, soulLoading: false, memuAvailable: true, soulConfirmed: false})
-    expect(requests.map(({url}) => url.split("/").at(-1))).toEqual(["seen", "owner", "souls"])
+    expect(requests.map(({url}) => url.split("/").at(-1))).toEqual(["seen", "owner", "souls", "status?", "status?"])
     expect(JSON.parse(saved).installationConfirmed).toBe(true)
     reopened = true
     new SessionController(session as never, {installationDefaults, fetchFn}).start()
@@ -2910,7 +2971,6 @@ describe("SessionController", () => {
       callMode: "audio",
       maxMemorizedPhotos: 1,
       catchUpRender: null,
-      modelChoice: null,
       model: null,
       configuredModel: null,
       modelSaving: false,

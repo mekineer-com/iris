@@ -216,7 +216,7 @@ export default function SessionPage() {
   const modelSaving = modelPending || snapshot?.modelSaving === true
   const modelDisabled = active || stopping || startPending || stopPending || modelSaving
   const displayedModel = (active || stopping) && snapshot?.model
-    ? snapshot.model : snapshot?.modelChoice ?? LIVE_MODELS[0]
+    ? snapshot.model : snapshot?.configuredModel ?? "Model unavailable"
   const soulLocked = snapshot?.soulLocked ?? true
   const connectionLocked = (snapshot?.connectionLocked ?? true) || active || stopping || soulPending
   const soulReady = !soulDirty && snapshot?.soulConfirmed && soulName.trim() === snapshot.soulId
@@ -277,10 +277,6 @@ export default function SessionPage() {
         if (pendingNewSoul !== soulName.trim() || !await selectSoul(soulName.trim(), false)) return
       }
       if (owner !== startOwner.current) return
-      if (!snapshot?.modelChoice) {
-        await modelRpc({model: LIVE_MODELS[0]})
-        if (owner !== startOwner.current) return
-      }
       await startRpc({mode, callMode})
     } catch (error) {
       if (owner === startOwner.current) {

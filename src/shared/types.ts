@@ -67,7 +67,6 @@ export interface SessionSnapshot {
   configured: boolean
   connectionProfile: OpenAlmaProfile | null
   mode: SessionMode
-  modelChoice: LiveModel | null
   model: string | null
   configuredModel: string | null
   modelSaving: boolean

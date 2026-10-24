@@ -85,7 +85,7 @@ window.visionLayout = async () => {
   const layoutSnapshot = {configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
     soulLoading: false, connection: "idle", callMode: "audio", mode: "continuous", startGeneration: 1,
     cameraEnabled: true, microphoneEnabled: true, frameDeliveryOpen: false, maxMemorizedPhotos: 5,
-    modelChoice: "gemini-3.8-live-extended-thinking", modelSaving: false,
+    configuredModel: "gemini-3.8-live-extended-thinking", modelSaving: false,
     pendingPhotoIds: [], photoCaptions: [], photoRetryPending: false, catchUpRender: null} as SessionSnapshot
   try {
     await act(async () => {page.render(createElement(SessionPage))})
@@ -296,7 +296,7 @@ window.visionTest = (async () => {
     await act(async () => {root.render(createElement(SessionPage))})
     const beforePage = devices.length
     const pageSnapshot = {...snapshot, callMode: "video", configured: true,
-      soulId: "Quill", souls: ["Quill"], soulConfirmed: true, soulLoading: false, modelChoice: null,
+      soulId: "Quill", souls: ["Quill"], soulConfirmed: true, soulLoading: false,
       model: null, configuredModel: null, modelSaving: false, maxMemorizedPhotos: 1,
       pendingPhotoIds: [], photoCaptions: [], photoRetryPending: false, catchUpRender: null}
     await act(async () => {listeners.get("openalma:update")!(pageSnapshot)})
