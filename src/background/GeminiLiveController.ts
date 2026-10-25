@@ -2315,12 +2315,16 @@ export class GeminiLiveController {
         this.quietOutput = null
         // A memory supersedes quiet choices already waiting to be answered.
         for (const call of this.pendingToolCalls.values()) {
-          if (call.name !== "nothing_to_add") continue
+          if (call.name !== "nothing_to_add" && call.name !== "save_photo_caption") continue
           if (call.quietChoice) call.response = {ok: true}
           call.quietChoice = false
         }
       }
-      if (this.thinking && pending.quietChoice) {
+      // New speech/memory invalidates old photo replies' claim to private output.
+      const privatePhoto = pending.quietChoice !== false && pending.scheduling === "WHEN_IDLE" && pending.batch.background &&
+        (!this.spokenRequest || this.spokenRequest.retired) &&
+        (pending.name === "save_photo_caption" || this.photoJob?.callId === id)
+      if (this.thinking && (pending.quietChoice || privatePhoto)) {
         this.quietOutput ??= {keepTranscript: this.turnAudioDelivered}
       }
       this.socket.send(JSON.stringify({
@@ -2417,6 +2421,9 @@ export class GeminiLiveController {
 
   private admitSpokenRequest(): void {
     this.quietOutput = null
+    for (const call of this.pendingToolCalls.values()) {
+      if (call.name === "save_photo_caption") call.quietChoice = false
+    }
     const job = this.photoJob
     if (job && "selection" in job && job.phase !== "dispatched") {
       const call = this.pendingToolCalls.get(job.callId)

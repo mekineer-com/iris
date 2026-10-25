@@ -740,7 +740,38 @@ describe("GeminiLiveController", () => {
         .toMatchObject([{image_id: "thinking-photo", caption: "A fictional amber triangle.", caption_event_id: "sitting-1:photo:thinking-photo"}])
       expect(h.requests.flatMap(request => request.body.events ?? []).filter(row => row.role === "assistant"))
         .toMatchObject([{event_kind: "photo_caption", content: "A fictional amber triangle.", media_ref: "mentra_media/test-phone/thinking-photo.png"}])
-      expect(h.audio).toEqual(["AAAAAA=="])
+      expect(h.audio).toEqual([])
+      expect(h.errors).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
+  test("Thinking private photo work cannot leak a spoken preamble before its closing quiet choice", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h, "continuous", "", THINKING)
+    const socket = h.sockets[0]
+    try {
+      await h.controller.sendImage({imageId: "private-caption", mimeType: "image/png", data: "AQID"})
+      await providerReady(socket, "private-settle", true, "IN_PROGRESS")
+      await providerReady(socket, "private-job", true, "IN_PROGRESS")
+      socket.message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]},
+        outputTranscription: {text: "I'm preparing the photo."}}})
+      expect(h.audio).toEqual([])
+      provisionalCaption(socket, "private-caption", "A fictional green square.", "private-save")
+      socket.message({serverContent: {turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+      await waitFor(() => functionResponses(socket).some(reply => reply.id === "private-save"))
+      socket.message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]},
+        outputTranscription: {text: "I'm working on the caption for the latest image you sent."}}})
+      await providerReady(socket, "private-finish", true, "IN_PROGRESS")
+      socket.message({serverContent: {turnComplete: true, interactionStatus: "IDLE"}})
+      expect(h.audio).toEqual([])
+      socket.message({voiceActivity: {type: "ACTIVITY_START"}})
+      socket.message({voiceActivity: {type: "ACTIVITY_END"}})
+      completeTurn(h, "What did you notice?", "A green square.")
+      expect(h.audio).toEqual(["AQABAA=="])
+      await h.controller.stop()
+      const rows = h.requests.flatMap(request => request.body.events ?? [])
+      expect(rows.some(row => row.event_kind === "photo_caption" && row.content === "A fictional green square.")).toBe(true)
+      expect(rows.some(row => row.content.includes("I'm working") || row.content.includes("I'm preparing"))).toBe(false)
       expect(h.errors).toEqual([])
     } finally { await h.controller.stop() }
   })
@@ -768,6 +799,34 @@ describe("GeminiLiveController", () => {
       expect(functionResponses(socket).every(response => !("scheduling" in response))).toBe(true)
       expect(h.errors).toEqual([])
     } finally { await h.controller.stop() }
+  })
+
+  test.each(["memory", "human"])("a late private caption receipt cannot mute speech released by new %s input", async wake => {
+    let release!: () => void
+    const h = harness({storage: new FakeStorage(), finalizeGates: [new Promise<void>(resolve => {release = resolve})]})
+    await start(h, "continuous", "", THINKING)
+    const socket = h.sockets[0]
+    try {
+      await h.controller.sendImage({imageId: "held-caption", mimeType: "image/png", data: "AQID"})
+      await providerReady(socket, "held-settle", true, "IN_PROGRESS")
+      await providerReady(socket, "held-job", true, "IN_PROGRESS")
+      provisionalCaption(socket, "held-caption", "A fictional violet star.", "held-save")
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+      if (wake === "memory") {
+        socket.message({toolCall: {functionCalls: [{id: "fresh-memory", name: "recall_memory", args: {query: "An important new detail"}}]}})
+        await waitFor(() => functionResponses(socket).some(reply => reply.id === "fresh-memory"))
+      } else {
+        socket.message({voiceActivity: {type: "ACTIVITY_START"}})
+        socket.message({voiceActivity: {type: "ACTIVITY_END"}})
+      }
+      expect(Reflect.get(h.controller, "quietOutput")).toBeNull()
+      release()
+      await waitFor(() => functionResponses(socket).some(reply => reply.id === "held-save"))
+      expect(Reflect.get(h.controller, "quietOutput")).toBeNull()
+      completeTurn(h, wake === "human" ? "What about that earlier detail?" : "", "The memory brings something worth adding.", true)
+      expect(h.audio).toEqual(["AQABAA=="])
+      expect(h.errors).toEqual([])
+    } finally {release(); await h.controller.stop()}
   })
 
   test.each([false, true])("Thinking reflection waits for IDLE, not generation/segment completion (co-packet=%s)", async coPacket => {
@@ -2597,6 +2656,8 @@ describe("GeminiLiveController", () => {
       h.sockets[0].message({serverContent: {interactionStatus: "IDLE"}})
       await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
       await waitFor(() => h.controller.pendingPhotoIds.length === 0)
+      await providerReady(h.sockets[0], "photo-handover-finished", false)
+      h.sockets[0].message({serverContent: {interactionStatus: "IDLE"}})
       completeTurn(h, "", "A fresh response after the photo.")
       expect(h.audio).toEqual(["AQABAA=="])
       await h.controller.stop()
