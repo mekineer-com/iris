@@ -2,6 +2,7 @@ import {act, createElement} from "react"
 import {createRoot} from "react-dom/client"
 import {usePhoneVision} from "../src/ui/hooks/usePhoneVision"
 import SessionPage from "../src/ui/pages/SessionPage"
+import {prepareImage} from "../src/ui/prepareImage"
 import {VISION_SETTINGS, type SessionSnapshot} from "../src/shared/types"
 
 declare global {interface Window {visionTest: Promise<unknown>; visionLayout: () => Promise<{ok: true}>}}
@@ -144,6 +145,27 @@ async function center(data: string | Blob) {
 window.visionTest = (async () => {
   const checks: string[] = []
   try {
+    for (const type of ["image/jpeg", "image/png"]) {
+      const original = document.createElement("canvas")
+      original.width = 4096; original.height = 3072
+      const context = original.getContext("2d")!
+      context.fillStyle = "rgb(20,160,40)"
+      context.fillRect(0, 0, original.width / 2, original.height)
+      const blob = await new Promise<Blob>(resolve => original.toBlob(value => resolve(value!), type))
+      const file = new File([blob], type === "image/png" ? "alpha.png" : "photo.jpg", {type, lastModified: 1000})
+      const prepared = await prepareImage(file)
+      const image = await createImageBitmap(prepared)
+      assert(image.width === 2048 && image.height === 1536, "prepared dimensions incorrect")
+      assert(prepared.type === type && prepared.lastModified === 1000, "prepared metadata changed")
+      assert(prepared.size < file.size, "generated large photo did not become smaller")
+      const sample = document.createElement("canvas"); sample.width = image.width; sample.height = image.height
+      sample.getContext("2d")!.drawImage(image, 0, 0)
+      if (type === "image/png") assert(sample.getContext("2d")!.getImageData(2000, 100, 1, 1).data[3] === 0,
+        "PNG transparency lost")
+      assert(await prepareImage(prepared) === prepared, "prepared file was re-encoded within bounds")
+      image.close(); original.width = original.height = sample.width = sample.height = 0
+      checks.push(`${type} real decode/resize/encode preserves dimensions, format and PNG transparency`)
+    }
     await render(); await wait(() => count("openalma:frame") === 1)
     assert(control.ready && devices.length === 1, "initial camera/submit failed")
     const firstFrame = calls.find(call => call.channel === "openalma:frame")!.payload

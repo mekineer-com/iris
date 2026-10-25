@@ -1,6 +1,6 @@
 import {expect, test} from "bun:test"
 import {readFileSync} from "node:fs"
-import {readImageTime} from "./imageTime"
+import {imageTimeMillis, readImageTime} from "./imageTime"
 import {formatImageTimestamp, nextImageReference} from "../shared/imageReference"
 
 const receipt = new Date(2026, 9, 22, 13, 14, 15).getTime()
@@ -17,6 +17,14 @@ test.each(["capture.jpg", "capture.png"])("reads actual %s capture metadata with
   expect(await readImageTime(file, receipt)).toEqual({timestamp: "2026-01-08T10-17-23",
     source: "DateTimeOriginal", receivedAt: receipt, originalTime: "2026:01:08 10:17:23", offset: "-05:00"})
   expect(new Uint8Array(await file.arrayBuffer())).toEqual(before)
+})
+
+test("gallery dates use capture metadata and offset, or receipt time when absent", async () => {
+  expect(imageTimeMillis(await readImageTime(fixture("capture.jpg"), receipt)))
+    .toBe(Date.parse("2026-01-08T10:17:23-05:00"))
+  expect(imageTimeMillis(await readImageTime(fixture("no-date.png"), receipt))).toBe(receipt)
+  expect(imageTimeMillis(await readImageTime(fixture("no-zone.jpg"), receipt)))
+    .toBe(new Date(2000, 1, 29, 1, 2, 3).getTime())
 })
 
 test("preserves an original date with no supplied timezone", async () => {

@@ -21,8 +21,12 @@ independently. A temporary transcript-sync failure retries without ending voice.
 After at least two completed user turns, Stop may play and save a short reflection.
 
 During a sitting, use **Take photo** or **Choose image** to show her a JPEG or
-PNG. Photos send immediately unless you enable preview, which offers Send or
-Retake. Files over 1 MB show a dismissible cost and latency warning. Expand
+PNG. Large photos are resized on your phone before upload; source files selected
+from your gallery stay untouched. With a supporting host, Take photo also saves
+the original to your gallery (a stream-resolution still during Video). Other
+hosts show a one-time warning; a gallery-save failure never prevents sending.
+Photos send immediately unless you enable preview, which offers Send or
+Retake. Uploads over 1 MB show a dismissible transfer-size warning. Expand
 **Photo captions** to see the last five captions received while Iris is running,
 in arrival order. A green check means memU accepted the caption for filing, not
 that memory extraction has finished. Unchecked captions are unconfirmed previews
@@ -39,7 +43,7 @@ Under Settings, **Maximum memorized photos** limits photos she chooses to keep
 from Video, not deliberate photos. Slider changes apply to the next call.
 
 Unconfirmed uploads stay in phone recovery after Stop; Start Iris again to check
-the saved original. Once the server accepts a caption for filing, it owns that
+the saved photo. Once the server accepts a caption for filing, it owns that
 work. Failed server filings can be retried or discarded while Iris is idle,
 including after reopening the app. Discard does not delete the original image.
 

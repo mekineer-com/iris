@@ -3,7 +3,8 @@ import {flushSync} from "react-dom"
 import {useRpc} from "@mentra/miniapp/ui"
 
 import type {Channels, ImageRequest, SelectSoulResult} from "../../shared/channels"
-import {readImageTime, type ImageTime} from "../imageTime"
+import {imageTimeMillis, readImageTime, type ImageTime} from "../imageTime"
+import {prepareImage} from "../prepareImage"
 import {
   LIVE_MODELS,
   PHOTO_RETRY_MESSAGE,
@@ -58,6 +59,7 @@ export function visibleConnection(
 
 const LARGE_IMAGE_BYTES = 1024 * 1024
 const LARGE_IMAGE_WARNING_KEY = "openalma.dismiss-large-image-warning"
+const GALLERY_WARNING_KEY = "openalma.gallery-warning-shown"
 
 export function validateImageFile(file: Pick<File, "size" | "type">): "image/jpeg" | "image/png" {
   if (file.type !== "image/jpeg" && file.type !== "image/png") throw new Error("Choose a JPEG or PNG image")
@@ -77,12 +79,16 @@ export async function imageRequest(
   speakDescription: boolean,
 ): Promise<ImageRequest> {
   const mimeType = validateImageFile(file)
+  return {imageId, mimeType, data: await imageData(file), speakDescription}
+}
+
+async function imageData(file: File): Promise<string> {
   const bytes = new Uint8Array(await file.arrayBuffer())
   let binary = ""
   for (let offset = 0; offset < bytes.length; offset += 0x8000) {
     binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
   }
-  return {imageId, mimeType, data: btoa(binary), speakDescription}
+  return btoa(binary)
 }
 
 type PendingPhoto = {file: File; imageId: string; time: ImageTime; previewUrl: string | null}
@@ -99,6 +105,7 @@ export default function SessionPage() {
   const capabilitiesRpc = useRpc<Channels, "openalma:set-capabilities">("openalma:set-capabilities")
   const manualRpc = useRpc<Channels, "openalma:manual-action">("openalma:manual-action")
   const imageRpc = useRpc<Channels, "openalma:image">("openalma:image")
+  const savePhotoRpc = useRpc<Channels, "openalma:save-photo">("openalma:save-photo")
   const reserveImageRpc = useRpc<Channels, "openalma:reserve-image">("openalma:reserve-image")
   const pendingImageRpc = useRpc<Channels, "openalma:pending-image">("openalma:pending-image")
   const [startPending, setStartPending] = useState(false)
@@ -125,6 +132,7 @@ export default function SessionPage() {
   const [imagePending, setImagePending] = useState(false)
   const [filingPending, setFilingPending] = useState<string | null>(null)
   const [imageStatus, setImageStatus] = useState<string | null>(null)
+  const [galleryNotice, setGalleryNotice] = useState<string | null>(null)
   const [rpcError, setRpcError] = useState<string | null>(null)
   const [profilePending, setProfilePending] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -142,6 +150,7 @@ export default function SessionPage() {
   })
   const startOwner = useRef(0)
   const imageOwner = useRef(0)
+  const galleryWarningShown = useRef(false)
   const pickerGeneration = useRef<number | null>(null)
   const filingOwner = useRef(0)
 
@@ -404,11 +413,12 @@ export default function SessionPage() {
     }
   }
 
-  const preparePhoto = async (file: File, generation: number, receivedAt: number) => {
+  const preparePhoto = async (original: File, generation: number, receivedAt: number, capture = false) => {
     setRpcError(null)
     setImageStatus(null)
+    setGalleryNotice(null)
     try {
-      validateImageFile(file)
+      validateImageFile(original)
     } catch (error) {
       setRpcError(error instanceof Error ? error.message : String(error))
       return
@@ -416,7 +426,34 @@ export default function SessionPage() {
     const owner = ++imageOwner.current
     setImagePending(true)
     try {
-      const time = await readImageTime(file, receivedAt)
+      const time = await readImageTime(original, receivedAt)
+      if (owner !== imageOwner.current) return
+      if (capture) {
+        if (!window.MentraOS?.capabilities?.includes("save_image_to_gallery")) {
+          if (!galleryWarningShown.current) {
+            galleryWarningShown.current = true
+            let alreadyShown = false
+            try {alreadyShown = localStorage.getItem(GALLERY_WARNING_KEY) === "1"} catch { /* warning storage is optional */ }
+            if (!alreadyShown) {
+              setGalleryNotice("This host cannot automatically save originals to your gallery. To keep an original, use your camera app, then Choose image.")
+              try {localStorage.setItem(GALLERY_WARNING_KEY, "1")} catch { /* do not block photo sharing */ }
+            }
+          }
+        } else {
+          try {
+            const data = await imageData(original)
+            if (owner !== imageOwner.current) return
+            const result = await savePhotoRpc({startGeneration: generation, data,
+              mimeType: validateImageFile(original), filename: original.name, creationTime: imageTimeMillis(time)})
+            if (owner !== imageOwner.current) return
+            if (!result.success) setGalleryNotice("Not saved to gallery. The photo can still be sent.")
+          } catch {
+            if (owner !== imageOwner.current) return
+            setGalleryNotice("Not saved to gallery. The photo can still be sent.")
+          }
+        }
+      }
+      const file = await prepareImage(original)
       if (owner !== imageOwner.current) return
       const reference = await reserveImageRpc({startGeneration: generation, time})
       if (owner !== imageOwner.current || reference.startGeneration !== generation) return
@@ -445,7 +482,7 @@ export default function SessionPage() {
       setRpcError("Choose the photo again for this sitting.")
       return
     }
-    await preparePhoto(file, generation, Date.now())
+    await preparePhoto(file, generation, Date.now(), Boolean(input.capture))
   }
 
   const onVideoPhoto = async () => {
@@ -455,7 +492,7 @@ export default function SessionPage() {
     setRpcError(null)
     try {
       const photo = await vision.takePhoto()
-      if (owner === imageOwner.current) await preparePhoto(photo.file, generation, photo.receivedAt)
+      if (owner === imageOwner.current) await preparePhoto(photo.file, generation, photo.receivedAt, true)
     } catch (error) {
       if (owner === imageOwner.current) setRpcError(error instanceof Error ? error.message : String(error))
     } finally {
@@ -743,10 +780,11 @@ export default function SessionPage() {
         </label>
       </div>
       </section>
+      {galleryNotice ? <p role="status">{galleryNotice}</p> : null}
       {pendingPhoto?.previewUrl ? <img className="image-preview" src={pendingPhoto.previewUrl} alt="Selected photo preview" /> : null}
       {pendingPhoto && shouldWarnLargeImage(pendingPhoto.file.size, largeImageWarningDismissed) ? (
         <div role="alert">
-          <p>This photo is over 1 MB and may take longer or cost more to process.</p>
+          <p>This photo is over 1 MB and may take longer to upload.</p>
           <label>
             <input type="checkbox" onChange={(event) => event.target.checked && dismissLargeImageWarning()} />
             Don't warn again

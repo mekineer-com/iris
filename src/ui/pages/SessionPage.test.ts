@@ -1,21 +1,22 @@
-import {describe, expect, test} from "bun:test"
+import {describe, expect, mock, test} from "bun:test"
 import {readFileSync} from "node:fs"
 import {runInNewContext} from "node:vm"
 import ts from "typescript"
 import * as jsx from "react/jsx-runtime"
 import manifest from "../../../miniapp.json"
-import {readImageTime} from "../imageTime"
+import {imageTimeMillis, readImageTime} from "../imageTime"
 import {LIVE_MODELS, type LiveModel} from "../../shared/types"
 import * as sharedTypes from "../../shared/types"
 
-import {
+mock.module("../memu-icon.png", () => ({default: "memu-icon.png"}))
+const {
   imageRequest,
   shouldWarnLargeImage,
   statusText,
   stopSecondsRemaining,
   validateImageFile,
   visibleConnection,
-} from "./SessionPage"
+} = await import("./SessionPage")
 
 type Node = {props: Record<string, any>}
 const nodes = (tree: any): any[] => !tree || typeof tree !== "object" ? []
@@ -28,7 +29,8 @@ function labelledCheckbox(tree: any, text: string) {
   return nodes(label).find(node => node.type === "input" && node.props.type === "checkbox")
 }
 
-function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Promise<unknown>, now?: number) {
+function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Promise<unknown>, now?: number,
+  prepare: (file: File) => Promise<File> = async file => file, gallerySupported = true, warningStorageFails = false) {
   for (const [field, value] of Object.entries({model: null, configuredModel: LIVE_MODELS[0], modelSaving: false,
     callMode: "audio", maxMemorizedPhotos: 1, catchUpRender: null})) {
     if (!(field in snapshot)) Object.assign(snapshot, {[field]: value})
@@ -39,8 +41,17 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
   const refs: Array<{current: unknown}> = []
   let cursor = 0
   let refCursor = 0
+  const stored = new Map<string, string>()
   const context = {
-    exports: {}, btoa, document: {hidden: false}, localStorage: {getItem: () => null},
+    exports: {}, btoa, document: {hidden: false}, URL,
+    window: {MentraOS: {capabilities: gallerySupported ? ["save_image_to_gallery"] : []}},
+    localStorage: {getItem: (key: string) => {
+      if (warningStorageFails && key.includes("gallery")) throw new Error("Fictional storage unavailable")
+      return stored.get(key) ?? null
+    }, setItem: (key: string, value: string) => {
+      if (warningStorageFails) throw new Error("Fictional storage full")
+      stored.set(key, value)
+    }},
     ...(now === undefined ? {} : {Date: {now: () => now}}),
     require: (name: string) => {
       if (name === "react") return {
@@ -59,7 +70,8 @@ function renderPage(snapshot: object, rpc: (channel: string, payload: any) => Pr
         ready: true, error: null, stop() {}, takePhoto: async () => ({
           file: new File([new Uint8Array([255, 216, 255])], "video-photo.jpg", {type: "image/jpeg"}), receivedAt: 1000,
         })})}
-      if (name.endsWith("/imageTime")) return {readImageTime}
+      if (name.endsWith("/imageTime")) return {readImageTime, imageTimeMillis}
+      if (name.endsWith("/prepareImage")) return {prepareImage: prepare}
       if (name.endsWith("/shared/types")) return sharedTypes
       if (name === "@mentra/miniapp/ui") return {useRpc: (channel: string) => (payload: unknown) => rpc(channel, payload)}
       return {default: "", __esModule: true}
@@ -328,6 +340,101 @@ describe("SessionPage state projection", () => {
     expect(uploads[1].time).toEqual(uploads[0].time)
     expect(uploads[1].data).toBe(uploads[0].data)
     expect(JSON.stringify(render())).toContain("Photo sent")
+  })
+
+  test("capture saves original bytes/date once, then preview, upload and Retry use the prepared File", async () => {
+    const original = new File([readFileSync(new URL("../fixtures/imageTime/capture.jpg", import.meta.url))],
+      "capture.jpg", {type: "image/jpeg"})
+    const prepared = new File(["smaller"], original.name, {type: "image/jpeg"})
+    const calls: Array<{channel: string; payload: any}> = []
+    let preparations = 0
+    let uploads = 0
+    const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+      connection: "listening", photoRetryPending: false, pendingPhotoIds: []}
+    const render = renderPage(snapshot, async (channel, payload) => {
+      calls.push({channel, payload})
+      if (channel === "openalma:save-photo") return {supported: true, success: true}
+      if (channel === "openalma:reserve-image") return {startGeneration: 1, imageId: "captured-photo"}
+      if (channel === "openalma:image" && ++uploads === 1) throw new Error("Upload failed")
+      return {ok: true}
+    }, undefined, async file => {expect(file).toBe(original); preparations++; return prepared})
+    labelledCheckbox(render(), "Preview before send").props.onChange({target: {checked: true}})
+    const picker = () => nodes(render()).find(node => node.props?.capture === "environment")
+    picker().props.onClick()
+    await picker().props.onChange({currentTarget: {files: [original], value: "", capture: "environment"}})
+    expect(calls.map(call => call.channel)).toEqual(["openalma:save-photo", "openalma:reserve-image"])
+    expect(calls[0].payload.data).toBe(Buffer.from(await original.arrayBuffer()).toString("base64"))
+    expect(calls[0].payload.creationTime).toBe(Date.parse("2026-01-08T10:17:23-05:00"))
+    const preview = nodes(render()).find(node => node.props?.className === "image-preview")
+    expect(await (await fetch(preview.props.src)).text()).toBe("smaller")
+    await nodes(render()).find(node => node.props?.children === "Send").props.onClick()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await nodes(render()).find(node => node.props?.children === "Retry").props.onClick()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const sent = calls.filter(call => call.channel === "openalma:image")
+    expect(sent).toHaveLength(2)
+    expect(sent[0].payload).toEqual(sent[1].payload)
+    expect(sent[0].payload.data).toBe(btoa("smaller"))
+    expect(sent[0].payload.time.source).toBe("DateTimeOriginal")
+    expect(preparations).toBe(1)
+    expect(calls.filter(call => call.channel === "openalma:save-photo")).toHaveLength(1)
+    URL.revokeObjectURL(preview.props.src)
+  })
+
+  test.each(["unsupported", "storage failure", "failed", "rejected"])("gallery %s never blocks sending or loses its notice", async outcome => {
+    const unsupported = outcome === "unsupported" || outcome === "storage failure"
+    const calls: string[] = []
+    const render = renderPage({configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+      connection: "listening", photoRetryPending: false, pendingPhotoIds: []}, async (channel, payload) => {
+      calls.push(channel)
+      if (channel === "openalma:save-photo") {
+        if (outcome === "rejected") throw new Error("Gallery save failed")
+        return {supported: outcome !== "unsupported", success: false}
+      }
+      if (channel === "openalma:reserve-image") return {startGeneration: 1, imageId: "photo"}
+      return {ok: true}
+    }, undefined, async file => file, !unsupported, outcome === "storage failure")
+    const pick = async () => {
+      const picker = nodes(render()).find(node => node.props?.capture === "environment")
+      picker.props.onClick()
+      await picker.props.onChange({currentTarget: {capture: "environment", value: "",
+        files: [new File(["fictional"], "photo.png", {type: "image/png"})]}})
+    }
+    await pick()
+    expect(calls.at(-1)).toBe("openalma:image")
+    expect(JSON.stringify(render())).toContain("Photo sent")
+    expect(JSON.stringify(render())).toContain(unsupported ? "cannot automatically save" : "Not saved to gallery")
+    if (unsupported) {
+      expect(calls).not.toContain("openalma:save-photo")
+      await pick()
+      expect(JSON.stringify(render())).not.toContain("cannot automatically save")
+    }
+  })
+
+  test.each(["preparation", "gallery save"])("Stop during %s cannot attach work or errors to a replacement sitting", async stage => {
+    let finish!: (value: any) => void
+    const gate = new Promise<any>(resolve => {finish = resolve})
+    const calls: string[] = []
+    const file = new File(["fictional"], "photo.png", {type: "image/png"})
+    const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+      connection: "listening", startGeneration: 1, photoRetryPending: false, pendingPhotoIds: []}
+    const render = renderPage(snapshot, async channel => {
+      calls.push(channel)
+      if (channel === "openalma:save-photo") return gate
+      return {ok: true}
+    }, undefined, async () => stage === "preparation" ? gate : file)
+    const picker = nodes(render()).find(node => node.props?.type === "file")
+    picker.props.onClick()
+    const picking = picker.props.onChange({currentTarget: {files: [file], value: "",
+      capture: stage === "gallery save" ? "environment" : ""}})
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await nodes(render()).find(node => node.props?.children === "Stop").props.onClick()
+    snapshot.startGeneration = 3
+    finish(stage === "preparation" ? file : {supported: true, success: false})
+    await picking
+    expect(calls).not.toContain("openalma:reserve-image")
+    expect(calls).not.toContain("openalma:image")
+    expect(JSON.stringify(render())).not.toContain("Not saved to gallery")
   })
 
   test.each(["Retake", "Stop"])("discarding a failed photo with %s clears its retry message", async action => {
@@ -709,9 +816,10 @@ describe("Video UI and allowance projection", () => {
     expect(capture.props.disabled).toBe(false)
     await capture.props.onClick()
     await new Promise(resolve => setTimeout(resolve, 0))
-    expect(calls.map(call => call.channel)).toEqual(["openalma:reserve-image", "openalma:image"])
-    expect(calls[0].payload).toMatchObject({startGeneration: 1, time: {receivedAt: 1000}})
-    expect(calls[1].payload).toMatchObject({imageId: "2026-01-08T10-17-23", mimeType: "image/jpeg", data: "/9j/"})
+    expect(calls.map(call => call.channel)).toEqual(["openalma:save-photo", "openalma:reserve-image", "openalma:image"])
+    expect(calls[0].payload).toMatchObject({startGeneration: 1, creationTime: 1000, data: "/9j/"})
+    expect(calls[1].payload).toMatchObject({startGeneration: 1, time: {receivedAt: 1000}})
+    expect(calls[2].payload).toMatchObject({imageId: "2026-01-08T10-17-23", mimeType: "image/jpeg", data: "/9j/"})
     expect(JSON.stringify(render())).toContain("Photo sent")
   })
 

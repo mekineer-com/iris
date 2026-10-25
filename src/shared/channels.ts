@@ -3,6 +3,14 @@ import type {CallMode, CatchUpResult, FrameIntakeResult, ImageTime, LiveModel, M
 
 export type ImageReferenceRequest = {startGeneration: number; time: ImageTime}
 export type FrameRequest = PassiveFrame & {startGeneration: number}
+export type GalleryPhotoRequest = {
+  startGeneration: number
+  data: string
+  mimeType: "image/jpeg" | "image/png"
+  filename: string
+  creationTime: number
+}
+export type GalleryPhotoResult = {success: boolean; error?: string}
 
 export type ImageRequest = {
   imageId: string
@@ -33,6 +41,7 @@ export interface Channels {
   }, {ok: true}>
   "openalma:manual-action": Rpc<{action: ManualAction}, {ok: true}>
   "openalma:image": Rpc<ImageRequest, {ok: true} | {ok: false; conflict: true}>
+  "openalma:save-photo": Rpc<GalleryPhotoRequest, GalleryPhotoResult>
   "openalma:reserve-image": Rpc<ImageReferenceRequest, {startGeneration: number; imageId: string; reservationSequence: number}>
   "openalma:frame": Rpc<FrameRequest, FrameIntakeResult>
   "openalma:frames": Rpc<{startGeneration: number; imageIds: string[]}, {frames: Array<Pick<PassiveFrame, "imageId" | "mimeType" | "data" | "time">>}>

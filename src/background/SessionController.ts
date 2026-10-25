@@ -2,7 +2,7 @@ import type {AudioChunkData, MiniappSession, UnsubscribeFn} from "@mentra/miniap
 import {makeRequestId} from "@mentra/miniapp"
 
 import type {Channels} from "../shared/channels"
-import type {FrameRequest, ImageReferenceRequest, ImageRequest} from "../shared/channels"
+import type {FrameRequest, GalleryPhotoRequest, GalleryPhotoResult, ImageReferenceRequest, ImageRequest} from "../shared/channels"
 import type {CallMode, CatchUpResult, FrameRetention} from "../shared/types"
 import {formatImageTimestamp, nextImageReference} from "../shared/imageReference"
 import {LIVE_MODELS, MIC_SOURCES, STOP_BACKGROUND_MS, STOP_FOREGROUND_MS, VISION_SETTINGS, type MicSource} from "../shared/types"
@@ -425,6 +425,20 @@ export class SessionController {
         }
         this.handleManualAction(action)
         return {ok: true as const}
+      }),
+    )
+    this.unsubs.push(
+      ui.handle("openalma:save-photo", async (payload, ctx): Promise<GalleryPhotoResult> => {
+        checkCancellation(ctx.signal)
+        const photo = payload as GalleryPhotoRequest
+        if (photo.startGeneration !== this.startGeneration || !this.cameraEnabled ||
+            (this.connection !== "listening" && this.connection !== "speaking")) {
+          throw new Error("Photo belongs to an inactive sitting")
+        }
+        // The pinned SDK can send new host operations without a dependency upgrade.
+        // Never retry an uncertain gallery insert: it may already have succeeded.
+        return this.session.sendRequest<GalleryPhotoResult>({type: "miniapp_save_image",
+          base64: photo.data, mimeType: photo.mimeType, filename: photo.filename, creationTime: photo.creationTime})
       }),
     )
     this.unsubs.push(

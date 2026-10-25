@@ -6,6 +6,12 @@ import {formatImageTimestamp} from "../shared/imageReference"
 import type {ImageTime} from "../shared/types"
 export type {ImageTime} from "../shared/types"
 
+export function imageTimeMillis(time: ImageTime): number {
+  if (time.source === "receipt") return time.receivedAt
+  const stamp = time.timestamp
+  return Date.parse(`${stamp.slice(0, 13)}:${stamp.slice(14, 16)}:${stamp.slice(17)}${time.offset ?? ""}`)
+}
+
 export async function readImageTime(file: Pick<File, "arrayBuffer">, receivedAt: number): Promise<ImageTime> {
   const receipt: ImageTime = {timestamp: formatImageTimestamp(receivedAt), source: "receipt", receivedAt}
   const bytes = await file.arrayBuffer()

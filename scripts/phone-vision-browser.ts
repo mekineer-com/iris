@@ -65,7 +65,7 @@ async function check() {
     }
     const result = response.result.value
     if (!result?.ok) throw new Error(JSON.stringify(result))
-    assert.equal(result.checks.length, 13)
+    assert.equal(result.checks.length, 15)
     for (const width of [320, 360, 768]) for (const theme of ["light", "dark"]) {
       await page("Emulation.setDeviceMetricsOverride", {width, height: 800, deviceScaleFactor: 1, mobile: true})
       await page("Emulation.setEmulatedMedia", {features: [{name: "prefers-color-scheme", value: theme}]})
