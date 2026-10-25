@@ -4,7 +4,6 @@ import type {CallMode, CatchUpResult, FrameIntakeResult, ImageTime, LiveModel, M
 export type ImageReferenceRequest = {startGeneration: number; time: ImageTime}
 export type FrameRequest = PassiveFrame & {startGeneration: number}
 export type GalleryPhotoRequest = {
-  startGeneration: number
   data: string
   mimeType: "image/jpeg" | "image/png"
   filename: string

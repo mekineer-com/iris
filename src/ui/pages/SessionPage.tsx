@@ -413,7 +413,7 @@ export default function SessionPage() {
     }
   }
 
-  const preparePhoto = async (original: File, generation: number, receivedAt: number, capture = false) => {
+  const preparePhoto = async (original: File, generation: number | null, receivedAt: number, capture = false) => {
     setRpcError(null)
     setImageStatus(null)
     setGalleryNotice(null)
@@ -427,10 +427,10 @@ export default function SessionPage() {
     setImagePending(true)
     try {
       const time = await readImageTime(original, receivedAt)
-      if (owner !== imageOwner.current) return
+      if (!capture && owner !== imageOwner.current) return
       if (capture) {
         if (!window.MentraOS?.capabilities?.includes("save_image_to_gallery")) {
-          if (!galleryWarningShown.current) {
+          if (owner === imageOwner.current && !galleryWarningShown.current) {
             galleryWarningShown.current = true
             let alreadyShown = false
             try {alreadyShown = localStorage.getItem(GALLERY_WARNING_KEY) === "1"} catch { /* warning storage is optional */ }
@@ -442,16 +442,20 @@ export default function SessionPage() {
         } else {
           try {
             const data = await imageData(original)
-            if (owner !== imageOwner.current) return
-            const result = await savePhotoRpc({startGeneration: generation, data,
+            const result = await savePhotoRpc({data,
               mimeType: validateImageFile(original), filename: original.name, creationTime: imageTimeMillis(time)})
             if (owner !== imageOwner.current) return
             if (!result.success) setGalleryNotice("Not saved to gallery. The photo can still be sent.")
           } catch {
             if (owner !== imageOwner.current) return
-            setGalleryNotice("Not saved to gallery. The photo can still be sent.")
+            setGalleryNotice("Gallery save not confirmed. The photo can still be sent.")
           }
         }
+      }
+      if (owner !== imageOwner.current) return
+      if (generation === null || generation !== snapshot?.startGeneration) {
+        setRpcError("Choose the photo again for this sitting.")
+        return
       }
       const file = await prepareImage(original)
       if (owner !== imageOwner.current) return
@@ -472,17 +476,17 @@ export default function SessionPage() {
     }
   }
 
-  const onImagePicked = async (input: HTMLInputElement) => {
+  const onImagePicked = async (input: HTMLInputElement, capture: boolean) => {
     const file = input.files?.[0]
     input.value = ""
     const generation = pickerGeneration.current
     pickerGeneration.current = null
     if (!file) return
-    if (generation === null || generation !== snapshot?.startGeneration) {
+    if (!capture && (generation === null || generation !== snapshot?.startGeneration)) {
       setRpcError("Choose the photo again for this sitting.")
       return
     }
-    await preparePhoto(file, generation, Date.now(), Boolean(input.capture))
+    await preparePhoto(file, generation, Date.now(), capture)
   }
 
   const onVideoPhoto = async () => {
@@ -765,7 +769,7 @@ export default function SessionPage() {
             capture="environment"
             onClick={() => {pickerGeneration.current = snapshot?.startGeneration ?? null}}
             disabled={!cameraEnabled || !voiceReady || imagePending || stopping}
-            onChange={(event) => onImagePicked(event.currentTarget)}
+            onChange={(event) => onImagePicked(event.currentTarget, true)}
           />
         </label>}
         <label className="image-picker">
@@ -775,7 +779,7 @@ export default function SessionPage() {
             accept="image/*"
             onClick={() => {pickerGeneration.current = snapshot?.startGeneration ?? null}}
             disabled={!cameraEnabled || !voiceReady || imagePending || stopping}
-            onChange={(event) => onImagePicked(event.currentTarget)}
+            onChange={(event) => onImagePicked(event.currentTarget, false)}
           />
         </label>
       </div>

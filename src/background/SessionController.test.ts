@@ -398,16 +398,20 @@ function sdkSpeaker(session: FakeSession, onClose: (streamId: string) => Promise
 }
 
 describe("SessionController", () => {
-  test("gallery bridge preserves bytes/date and rejects stale saves without replaying them", async () => {
+  test("gallery saves remain independent of sitting state and never replay on Stop", async () => {
     const h = setup()
     await flush()
     await h.session.handlers["openalma:start"]({mode: "continuous"})
-    const generation = lastSnapshot(h.session)!.startGeneration
-    const photo = {startGeneration: generation, data: "AQID", mimeType: "image/jpeg",
+    const photo = {data: "AQID", mimeType: "image/jpeg",
       filename: "fictional.jpg", creationTime: 1000}
     expect(await h.session.handlers["openalma:save-photo"](photo)).toEqual({success: true})
     expect(h.session.hostRequests).toEqual([{type: "miniapp_save_image", base64: "AQID",
       mimeType: "image/jpeg", filename: "fictional.jpg", creationTime: 1000}])
+    h.live.reconnecting(true)
+    expect(lastSnapshot(h.session)!.connection).toBe("reconnecting")
+    expect(await h.session.handlers["openalma:save-photo"](photo)).toEqual({success: true})
+    await h.session.handlers["openalma:stop"]({})
+    expect(await h.session.handlers["openalma:save-photo"](photo)).toEqual({success: true})
     let finish!: (value: unknown) => void
     h.session.sendRequest = async <T>(payload: object): Promise<T> => {
       h.session.hostRequests.push(payload)
@@ -417,9 +421,7 @@ describe("SessionController", () => {
     await h.session.handlers["openalma:stop"]({})
     finish({success: false, error: "Fictional permission failure"})
     expect(await saving).toEqual({success: false, error: "Fictional permission failure"})
-    await expect(h.session.handlers["openalma:save-photo"](photo) as Promise<unknown>)
-      .rejects.toThrow("inactive sitting")
-    expect(h.session.hostRequests).toHaveLength(2)
+    expect(h.session.hostRequests).toHaveLength(4)
   })
 
   test("call mode defaults to Audio and Video works with Manual/Thinking without mid-sitting switches", async () => {

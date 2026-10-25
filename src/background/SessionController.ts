@@ -431,10 +431,7 @@ export class SessionController {
       ui.handle("openalma:save-photo", async (payload, ctx): Promise<GalleryPhotoResult> => {
         checkCancellation(ctx.signal)
         const photo = payload as GalleryPhotoRequest
-        if (photo.startGeneration !== this.startGeneration || !this.cameraEnabled ||
-            (this.connection !== "listening" && this.connection !== "speaking")) {
-          throw new Error("Photo belongs to an inactive sitting")
-        }
+        // The user's gallery copy is independent of sitting/connection state.
         // The pinned SDK can send new host operations without a dependency upgrade.
         // Never retry an uncertain gallery insert: it may already have succeeded.
         return this.session.sendRequest<GalleryPhotoResult>({type: "miniapp_save_image",

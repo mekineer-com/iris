@@ -305,13 +305,40 @@ describe("SessionPage state projection", () => {
     const snapshot = {configured: true, startGeneration: 1, soulId: "Quill", souls: ["Quill"],
       soulConfirmed: true, connection: "listening", pendingPhotoIds: []}
     const render = renderPage(snapshot, async channel => {calls.push(channel); return {ok: true}})
-    nodes(render()).find(node => node.props?.type === "file").props.onClick()
+    nodes(render()).find(node => node.props?.type === "file" && !node.props.capture).props.onClick()
     snapshot.startGeneration = 3
-    await nodes(render()).find(node => node.props?.type === "file").props.onChange({currentTarget: {
+    await nodes(render()).find(node => node.props?.type === "file" && !node.props.capture).props.onChange({currentTarget: {
       files: [new File([new Uint8Array([1, 2, 3])], "fictional.png", {type: "image/png"})], value: "",
     }})
     expect(calls).toEqual([])
     expect(JSON.stringify(render())).toContain("Choose the photo again for this sitting.")
+  })
+
+  test("a camera returning after Stop still saves its original, but cannot upload into the next sitting", async () => {
+    const calls: string[] = []
+    const snapshot = {configured: true, startGeneration: 1, soulId: "Quill", souls: ["Quill"],
+      soulConfirmed: true, connection: "listening", pendingPhotoIds: []}
+    const render = renderPage(snapshot, async channel => {calls.push(channel); return {success: true, ok: true}})
+    const picker = nodes(render()).find(node => node.props?.capture === "environment")
+    picker.props.onClick()
+    await nodes(render()).find(node => node.props?.children === "Stop").props.onClick()
+    snapshot.connection = "idle"; snapshot.startGeneration = 2
+    await picker.props.onChange({currentTarget: {files: [new File(["original"], "camera.jpg", {type: "image/jpeg"})], value: ""}})
+    expect(calls).toEqual(["openalma:stop", "openalma:save-photo"])
+    expect(JSON.stringify(render())).toContain("Choose the photo again for this sitting")
+  })
+
+  test("Choose image's actual handler never saves another gallery original", async () => {
+    const calls: string[] = []
+    const render = renderPage({configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+      connection: "listening", pendingPhotoIds: []}, async (channel, payload) => {
+      calls.push(channel)
+      return channel === "openalma:reserve-image" ? {startGeneration: payload.startGeneration, imageId: "chosen"} : {ok: true}
+    })
+    const picker = nodes(render()).find(node => node.props?.type === "file" && !node.props.capture)
+    picker.props.onClick()
+    await picker.props.onChange({currentTarget: {files: [new File(["chosen"], "chosen.jpg", {type: "image/jpeg"})], value: ""}})
+    expect(calls).toEqual(["openalma:reserve-image", "openalma:image"])
   })
 
   test("a confirmed upload conflict reserves a new reference only for explicit Retry", async () => {
@@ -328,8 +355,8 @@ describe("SessionPage state projection", () => {
       }
       return {ok: true}
     })
-    nodes(render()).find(node => node.props?.type === "file").props.onClick()
-    await nodes(render()).find(node => node.props?.type === "file").props.onChange({currentTarget: {
+    nodes(render()).find(node => node.props?.type === "file" && !node.props.capture).props.onClick()
+    await nodes(render()).find(node => node.props?.type === "file" && !node.props.capture).props.onChange({currentTarget: {
       files: [new File([new Uint8Array([1, 2, 3])], "fictional.png", {type: "image/png"})], value: "",
     }})
     expect(reservations).toBe(2)
@@ -361,7 +388,7 @@ describe("SessionPage state projection", () => {
     labelledCheckbox(render(), "Preview before send").props.onChange({target: {checked: true}})
     const picker = () => nodes(render()).find(node => node.props?.capture === "environment")
     picker().props.onClick()
-    await picker().props.onChange({currentTarget: {files: [original], value: "", capture: "environment"}})
+    await picker().props.onChange({currentTarget: {files: [original], value: ""}})
     expect(calls.map(call => call.channel)).toEqual(["openalma:save-photo", "openalma:reserve-image"])
     expect(calls[0].payload.data).toBe(Buffer.from(await original.arrayBuffer()).toString("base64"))
     expect(calls[0].payload.creationTime).toBe(Date.parse("2026-01-08T10:17:23-05:00"))
@@ -397,13 +424,14 @@ describe("SessionPage state projection", () => {
     const pick = async () => {
       const picker = nodes(render()).find(node => node.props?.capture === "environment")
       picker.props.onClick()
-      await picker.props.onChange({currentTarget: {capture: "environment", value: "",
+      await picker.props.onChange({currentTarget: {value: "",
         files: [new File(["fictional"], "photo.png", {type: "image/png"})]}})
     }
     await pick()
     expect(calls.at(-1)).toBe("openalma:image")
     expect(JSON.stringify(render())).toContain("Photo sent")
-    expect(JSON.stringify(render())).toContain(unsupported ? "cannot automatically save" : "Not saved to gallery")
+    expect(JSON.stringify(render())).toContain(unsupported ? "cannot automatically save"
+      : outcome === "rejected" ? "Gallery save not confirmed" : "Not saved to gallery")
     if (unsupported) {
       expect(calls).not.toContain("openalma:save-photo")
       await pick()
@@ -423,10 +451,10 @@ describe("SessionPage state projection", () => {
       if (channel === "openalma:save-photo") return gate
       return {ok: true}
     }, undefined, async () => stage === "preparation" ? gate : file)
-    const picker = nodes(render()).find(node => node.props?.type === "file")
+    const picker = nodes(render()).find(node => node.props?.type === "file" &&
+      Boolean(node.props.capture) === (stage === "gallery save"))
     picker.props.onClick()
-    const picking = picker.props.onChange({currentTarget: {files: [file], value: "",
-      capture: stage === "gallery save" ? "environment" : ""}})
+    const picking = picker.props.onChange({currentTarget: {files: [file], value: ""}})
     await new Promise(resolve => setTimeout(resolve, 0))
     await nodes(render()).find(node => node.props?.children === "Stop").props.onClick()
     snapshot.startGeneration = 3
@@ -444,8 +472,8 @@ describe("SessionPage state projection", () => {
       if (channel === "openalma:image") throw new Error("Fictional photo upload failure")
       return {ok: true}
     })
-    nodes(render()).find(node => node.props?.type === "file").props.onClick()
-    await nodes(render()).find(node => node.props?.type === "file").props.onChange({currentTarget: {
+    nodes(render()).find(node => node.props?.type === "file" && !node.props.capture).props.onClick()
+    await nodes(render()).find(node => node.props?.type === "file" && !node.props.capture).props.onChange({currentTarget: {
       files: [new File([new Uint8Array([1, 2, 3])], "fictional.png", {type: "image/png"})], value: "",
     }})
     expect(JSON.stringify(render())).toContain("Photo ready to retry")
@@ -675,8 +703,8 @@ describe("SessionPage state projection", () => {
         const actions = () => nodes(render()).find(node => node.props?.className === "image-review").props.children.filter((node: any) => node.type === "button")
         const flush = () => new Promise(resolve => setTimeout(resolve, 0))
         const pickPhoto = () => {
-          nodes(render()).find(node => node.props?.type === "file").props.onClick()
-          return nodes(render()).find(node => node.props?.type === "file").props.onChange({currentTarget: {
+          nodes(render()).find(node => node.props?.type === "file" && !node.props.capture).props.onClick()
+          return nodes(render()).find(node => node.props?.type === "file" && !node.props.capture).props.onChange({currentTarget: {
           files: [new File([new Uint8Array([1, 2, 3])], "fictional.png", {type: "image/png"})], value: "",
         }})}
         const settingError = () => labelledCheckbox(render(), "Microphone enabled").props.onChange({target: {checked: false}})
@@ -817,7 +845,7 @@ describe("Video UI and allowance projection", () => {
     await capture.props.onClick()
     await new Promise(resolve => setTimeout(resolve, 0))
     expect(calls.map(call => call.channel)).toEqual(["openalma:save-photo", "openalma:reserve-image", "openalma:image"])
-    expect(calls[0].payload).toMatchObject({startGeneration: 1, creationTime: 1000, data: "/9j/"})
+    expect(calls[0].payload).toMatchObject({creationTime: 1000, data: "/9j/"})
     expect(calls[1].payload).toMatchObject({startGeneration: 1, time: {receivedAt: 1000}})
     expect(calls[2].payload).toMatchObject({imageId: "2026-01-08T10-17-23", mimeType: "image/jpeg", data: "/9j/"})
     expect(JSON.stringify(render())).toContain("Photo sent")
