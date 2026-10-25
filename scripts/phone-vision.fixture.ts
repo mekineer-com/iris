@@ -87,7 +87,8 @@ window.visionLayout = async () => {
     soulLoading: false, connection: "idle", callMode: "audio", mode: "continuous", startGeneration: 1,
     cameraEnabled: true, microphoneEnabled: true, frameDeliveryOpen: false, maxMemorizedPhotos: 5,
     configuredModel: "gemini-3.8-live-extended-thinking", modelSaving: false,
-    pendingPhotoIds: [], photoCaptions: [], photoRetryPending: false, catchUpRender: null} as SessionSnapshot
+    pendingPhotoIds: [], photoCaptions: [], photoRetryPending: false, catchUpRender: null,
+    failedPhotos: ["fictional-failed-photo"]} as SessionSnapshot
   try {
     await act(async () => {page.render(createElement(SessionPage))})
     await act(async () => {listeners.get("openalma:update")!(layoutSnapshot)})
@@ -102,6 +103,16 @@ window.visionLayout = async () => {
     const buttons = panel.querySelectorAll<HTMLButtonElement>(".sitting-start > button")
     assert(buttons.length === 2 && Math.abs(buttons[0]!.getBoundingClientRect().width - buttons[1]!.getBoundingClientRect().width) < 0.5, "Audio/Video widths differ")
     assert(panel.querySelector(".photo-controls")!.tagName === "SECTION", "Photos became an accordion")
+    for (const picker of panel.querySelectorAll<HTMLElement>(".image-picker")) {
+      assert(picker.querySelector("input")!.accept === "image/jpeg,image/png",
+        "photo picker request is not restricted to JPEG/PNG")
+      assert(picker.querySelector("input")!.disabled && getComputedStyle(picker).opacity === "0.48",
+        "unavailable photo control does not look disabled")
+    }
+    const failedLabel = rect('[aria-label="Failed photo filings"] .image-review > span')
+    const retry = rect('[aria-label="Retry failed photo 1"]'), discard = rect('[aria-label="Discard failed photo 1"]')
+    assert(retry.top >= failedLabel.bottom && Math.abs(retry.top - discard.top) < 0.5,
+      "failed-photo buttons must share the row below its message")
     assert(Math.abs(rect(".model-toggle input").height - 43.2) < 0.1, "toggle height differs from 2.7rem")
     const gaps = [
       rect(".soul-entry").top - rect(".soul-control .section-label").bottom,

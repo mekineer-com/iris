@@ -765,7 +765,7 @@ export default function SessionPage() {
           <span>Take photo</span>
           <input
             type="file"
-            accept="image/*"
+            accept="image/jpeg,image/png"
             capture="environment"
             onClick={() => {pickerGeneration.current = snapshot?.startGeneration ?? null}}
             disabled={!cameraEnabled || !voiceReady || imagePending || stopping}
@@ -776,7 +776,7 @@ export default function SessionPage() {
           <span>Choose image</span>
           <input
             type="file"
-            accept="image/*"
+            accept="image/jpeg,image/png"
             onClick={() => {pickerGeneration.current = snapshot?.startGeneration ?? null}}
             disabled={!cameraEnabled || !voiceReady || imagePending || stopping}
             onChange={(event) => onImagePicked(event.currentTarget, false)}
