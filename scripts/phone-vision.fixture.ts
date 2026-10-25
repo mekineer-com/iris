@@ -166,7 +166,7 @@ window.visionTest = (async () => {
       const file = new File([blob], type === "image/png" ? "alpha.png" : "photo.jpg", {type, lastModified: 1000})
       const prepared = await prepareImage(file)
       const image = await createImageBitmap(prepared)
-      assert(image.width === 2048 && image.height === 1536, "prepared dimensions incorrect")
+      assert(image.width === 800 && image.height === 600, "prepared dimensions incorrect")
       assert(prepared.type === type && prepared.lastModified === 1000, "prepared metadata changed")
       assert(prepared.size < file.size, "generated large photo did not become smaller")
       const sample = document.createElement("canvas"); sample.width = image.width; sample.height = image.height

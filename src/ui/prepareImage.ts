@@ -1,4 +1,4 @@
-const MAX_LONG_EDGE = 2048
+const MAX_LONG_EDGE = 800
 const JPEG_QUALITY = 0.85
 
 export async function prepareImage(file: File): Promise<File> {

@@ -39,7 +39,7 @@ describe("photo preparation", () => {
     expect(h.revoked).toEqual(["blob:original"])
   })
 
-  test.each([[6000, 4000, 2048, 1365], [4000, 6000, 1365, 2048]])(
+  test.each([[6000, 4000, 800, 533], [4000, 6000, 533, 800], [801, 600, 800, 599]])(
     "scales %sx%s without changing filename, type or file date", async (width, height, outWidth, outHeight) => {
       const h = harness(width, height)
       const file = new File(["original"], "camera.jpg", {type: "image/jpeg", lastModified: 1000})
