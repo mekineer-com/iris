@@ -829,6 +829,33 @@ describe("GeminiLiveController", () => {
     } finally {release(); await h.controller.stop()}
   })
 
+  test("a caption receipt after a completed human answer stays private", async () => {
+    let release!: () => void
+    const h = harness({storage: new FakeStorage(), finalizeGates: [new Promise<void>(resolve => {release = resolve})]})
+    await start(h, "continuous", "", THINKING)
+    const socket = h.sockets[0]
+    try {
+      await h.controller.sendImage({imageId: "late-receipt", mimeType: "image/png", data: "AQID"})
+      await providerReady(socket, "late-settle", true, "IN_PROGRESS")
+      await providerReady(socket, "late-job", true, "IN_PROGRESS")
+      provisionalCaption(socket, "late-receipt", "A fictional orange circle.", "late-save")
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+      socket.message({voiceActivity: {type: "ACTIVITY_START"}})
+      socket.message({voiceActivity: {type: "ACTIVITY_END"}})
+      completeTurn(h, "How are you?", "I'm well.", true)
+      expect(h.audio).toEqual(["AQABAA=="])
+      expect(Reflect.get(h.controller, "quietOutput")).toBeNull()
+      release()
+      await waitFor(() => functionResponses(socket).some(reply => reply.id === "late-save"))
+      completeTurn(h, "", "I've saved the caption.")
+      expect(h.audio).toEqual(["AQABAA=="])
+      await h.controller.stop()
+      expect(h.requests.flatMap(request => request.body.events ?? [])
+        .some(row => row.content === "I've saved the caption.")).toBe(false)
+      expect(h.errors).toEqual([])
+    } finally {release(); await h.controller.stop()}
+  })
+
   test.each([false, true])("Thinking reflection waits for IDLE, not generation/segment completion (co-packet=%s)", async coPacket => {
     const h = harness()
     await start(h, "continuous", "", THINKING)

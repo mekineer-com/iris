@@ -2421,9 +2421,6 @@ export class GeminiLiveController {
 
   private admitSpokenRequest(): void {
     this.quietOutput = null
-    for (const call of this.pendingToolCalls.values()) {
-      if (call.name === "save_photo_caption") call.quietChoice = false
-    }
     const job = this.photoJob
     if (job && "selection" in job && job.phase !== "dispatched") {
       const call = this.pendingToolCalls.get(job.callId)

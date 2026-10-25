@@ -399,7 +399,11 @@ button {
   font-weight: 700;
 }
 
-button:disabled,
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
 .image-picker:has(input:disabled) {
   cursor: not-allowed;
   opacity: 0.48;
