@@ -6,13 +6,10 @@ documentation.
 
 Documentation snapshots and fictional-provider observations: 2026-10-20.
 
-Source migration in progress, 2026-10-20: MCP now returns `v1beta` and Iris
-requires that constrained socket; token minting stays on `v1alpha/auth_tokens`.
-The unsupported proactivity setting and its constraint-mask entry are removed.
-These seams follow the Gemini 3.8 provider checks in `PLAN_iris_gemini38.md`.
-No model/configuration cutover has occurred. Photo/tool plumbing, late-speech
-reservations and requested-answer scheduling are implemented locally.
-The current source is not a release-ready migration.
+Iris runs on Gemini 3.8 Live. MCP returns the constrained `v1beta` socket;
+token minting stays on `v1alpha/auth_tokens`. The server default is
+`gemini-3.8-live`, and configs still naming the retired 2.5 preview model are
+migrated to it with a backup.
 
 The coordinated ordinary-photo contract requires and echoes
 `photo_work_protocol: "iris-photo-work-v2"`. Iris refuses a missing/mismatched
@@ -20,15 +17,14 @@ response marker before opening Gemini and releases any acquired lease. Token
 mint/renewal expose six NON_BLOCKING tools, including argument-free
 `nothing_to_add`; Iris handles it through the local photo dispatcher, using
 SILENT on regular Live for an empty acknowledgment without taking away a pending human answer's
-continuation. The deliberate-photo startup instruction and inline-job path are
-implemented. The combined camera/selection prompt is not enabled.
-The delivery/accounting behavior below still describes the current photo sender.
+continuation. Audio Start uses the deliberate-photo startup instruction; Video
+Start sends `vision: true` and receives the combined camera/selection prompt.
 
 ## Source Contract
 
-- Phone choices: `gemini-3.8-live` / `gemini-3.8-live-extended-thinking`.
-  With no explicit phone choice, Start retains the configured server model.
-  Installed model settings stay unchanged until coordinated acceptance/cutover.
+- Models: `gemini-3.8-live` / `gemini-3.8-live-extended-thinking`. The phone's
+  Thinking switch saves the shared OpenAlma setting through
+  `POST /integration/mentra/model`; Start sends no model and uses the server's.
 - Socket API: `v1beta`; token minting: `v1alpha/auth_tokens`.
 - Method: `BidiGenerateContentConstrained`
 - Input audio: 16 kHz PCM
@@ -120,7 +116,8 @@ as standalone video over a newer preview. Captioning has one path only:
 4. `save_photo_caption` names its exact original. A valid first caption is
    journaled and handed off independently of timeline append. Its successful
    durable receipt uses WHEN_IDLE so the next readiness call can follow.
-5. An empty queue gets `{"ok":true}` / SILENT. Stop and optional spoken
+5. An empty queue gets `{"ok":true}` / SILENT (Thinking: see quiet choices
+   below). Stop and optional spoken
    descriptions wait for that real closing-readiness native completion; Iris
    never manufactures a provider completion event.
 
@@ -231,7 +228,7 @@ those originals and returns JPEG data through `openalma:catch-up-rendered`.
 Attempt, foreground/camera, socket, cadence and age are rechecked before send.
 One chronological collage has priority for one capture period, then the current
 view resumes; a missing renderer cannot hold voice or live delivery indefinitely.
-Camera/UI wiring and physical-phone qualification remain separate work.
+The UI side of frames and collages is `src/ui/hooks/usePhoneVision.ts`.
 
 Selection uses the same readiness/settling dispatcher, not another queue.
 Deliberate photos have priority. Every offer needs remaining allowance; keep-none
@@ -289,10 +286,18 @@ not survive into the next segment; original-photo/native continuation ownership
 does. The human transcription group remains open until final completion so late
 suffixes are not counted as a second turn. All-zero Thinking PCM remains playback
 but is not evidence of spoken words requiring a transcript; actual nonzero
-speech retains the existing transcription integrity checks. No muting or new
-silent-audio prompt is introduced.
+speech retains the existing transcription integrity checks.
 
-Start's returned model is authoritative and must match an explicit phone choice.
+Thinking cannot reach IDLE while a readiness call waits, so an empty readiness
+call gets the text "No photo task is ready. Say 'Done' once to finish this
+private exchange." Iris then suppresses that private reply's audio and
+transcript locally; the same applies to a background photo reply (caption
+receipt or dispatched job) with no live human request. Suppression ends at
+native activity start, spoken-request admission, interruption, disconnect or
+interaction IDLE. A memory result arriving first releases it and turns already
+queued quiet replies into plain `{"ok":true}`.
+
+Start's returned model is authoritative.
 Renewal stays pinned to the lease, not later config edits. The v3 phone journal
 records the actual model; an ordinary no-recovery handle needs matching model
 metadata to resume. Call mode is also pinned with the handle: Audio/Video changes
