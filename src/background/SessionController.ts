@@ -1169,7 +1169,9 @@ export class SessionController {
   private handleManualAction(action: ManualAction): void {
     if (this.mode !== "manual") throw new Error("Manual controls require Manual mode")
     if (this.connection !== "listening") throw new Error("Manual controls require a ready session")
-    if (this.liveController?.activityPauseReason && (action === "talk" || action === "send")) return
+    if (this.liveController?.activityPauseReason && (action === "talk" || action === "send")) {
+      throw new Error(this.liveController.activityPauseReason)
+    }
     if ((action === "talk" || action === "redo") && !this.microphoneEnabled) {
       throw new Error("Microphone is disabled")
     }

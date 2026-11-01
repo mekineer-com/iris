@@ -81,6 +81,7 @@ class FakeLive {
   pendingPhotoIds: string[] = []
   pendingImageIds: string[] = []
   activityError: Error | null = null
+  activityPauseReason: string | null = null
   startGate: Promise<void> | null = null
   stopGate: Promise<void> | null = null
   audioOnStop = false
@@ -2990,6 +2991,11 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:start"]({mode: "manual"})
     expect(harness.live.starts).toBe(1)
     expect(harness.live.startModes).toEqual(["manual"])
+    harness.live.activityPauseReason = "Memory processing is paused. Retry in the launcher."
+    expect(() => harness.session.handlers["openalma:manual-action"]({action: "talk"})).toThrow(harness.live.activityPauseReason)
+    expect(lastSnapshot(harness.session)?.manualPhase).toBe("idle")
+    expect(harness.live.activities).toEqual([])
+    harness.live.activityPauseReason = null
     expect(() => harness.session.handlers["openalma:set-mode"]({mode: "continuous"})).toThrow(
       "Stop before changing speech mode",
     )
@@ -3179,20 +3185,23 @@ describe("SessionController", () => {
     await harness.session.handlers["openalma:stop"]({})
   })
 
-  test("Manual keeps a Review draft when the provider is not ready", async () => {
+  test.each(["provider", "pause"])("Manual keeps a Review draft during %s refusal", async refusal => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "manual"})
     harness.session.handlers["openalma:manual-action"]({action: "talk"})
     harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000, source: "glasses"})
     harness.session.handlers["openalma:manual-action"]({action: "done"})
-    harness.live.activityError = new Error("Gemini socket is not ready")
+    const reason = refusal === "pause" ? "Memory processing is paused. Retry in the launcher." : "Gemini socket is not ready"
+    if (refusal === "pause") harness.live.activityPauseReason = reason
+    else harness.live.activityError = new Error(reason)
 
     expect(() => harness.session.handlers["openalma:manual-action"]({action: "send"})).toThrow(
-      "Gemini socket is not ready",
+      reason,
     )
     expect(lastSnapshot(harness.session)?.manualPhase).toBe("review")
     harness.session.micHandler?.({data: testPcm(2), format: "pcm_s16le", sampleRate: 16000, source: "phone"})
     harness.live.activityError = null
+    harness.live.activityPauseReason = null
     harness.session.handlers["openalma:manual-action"]({action: "send"})
     expect(harness.live.activities).toEqual([[testPcm(1)]])
     expect(harness.live.activitySources).toEqual(["glasses"])
