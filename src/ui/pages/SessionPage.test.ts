@@ -439,7 +439,7 @@ describe("SessionPage state projection", () => {
     }
   })
 
-  test.each(["preparation", "gallery save"])("Stop during %s cannot attach work or errors to a replacement sitting", async stage => {
+  test("Stop during image preparation cannot attach work or errors to a replacement sitting", async () => {
     let finish!: (value: any) => void
     const gate = new Promise<any>(resolve => {finish = resolve})
     const calls: string[] = []
@@ -448,21 +448,127 @@ describe("SessionPage state projection", () => {
       connection: "listening", startGeneration: 1, photoRetryPending: false, pendingPhotoIds: []}
     const render = renderPage(snapshot, async channel => {
       calls.push(channel)
-      if (channel === "openalma:save-photo") return gate
       return {ok: true}
-    }, undefined, async () => stage === "preparation" ? gate : file)
-    const picker = nodes(render()).find(node => node.props?.type === "file" &&
-      Boolean(node.props.capture) === (stage === "gallery save"))
+    }, undefined, async () => gate)
+    const picker = nodes(render()).find(node => node.props?.type === "file" && !node.props.capture)
     picker.props.onClick()
     const picking = picker.props.onChange({currentTarget: {files: [file], value: ""}})
     await new Promise(resolve => setTimeout(resolve, 0))
     await nodes(render()).find(node => node.props?.children === "Stop").props.onClick()
     snapshot.startGeneration = 3
-    finish(stage === "preparation" ? file : {supported: true, success: false})
+    finish(file)
     await picking
     expect(calls).not.toContain("openalma:reserve-image")
     expect(calls).not.toContain("openalma:image")
     expect(JSON.stringify(render())).not.toContain("Not saved to gallery")
+  })
+
+  test.each([
+    ["idle", "saved"], ["idle", "failed"], ["idle", "rejected"],
+    ["starting", "failed"], ["replacement stopped", "rejected"],
+    ["picker after replacement", "failed"], ["picker after replacement", "rejected"],
+  ] as const)("gallery save finishing after Stop while %s: %s", async (boundary, outcome) => {
+    let finish!: (value: unknown) => void
+    let reject!: (error: Error) => void
+    const save = new Promise((resolve, fail) => {finish = resolve; reject = fail})
+    let finishStart!: () => void
+    const start = new Promise<void>(resolve => {finishStart = resolve})
+    let finishUpload!: () => void
+    const upload = new Promise<void>(resolve => {finishUpload = resolve})
+    const calls: string[] = []
+    const latePicker = boundary.startsWith("picker after")
+    const snapshot = {configured: true, soulLoading: false, soulId: "Quill", souls: ["Quill"],
+      soulConfirmed: true, soulLocked: false, connection: "listening", startGeneration: 1,
+      photoRetryPending: false, pendingPhotoIds: [], callMode: "audio"}
+    const render = renderPage(snapshot, async (channel, payload) => {
+      calls.push(channel)
+      if (channel === "openalma:set-soul") return {soulId: payload.soulId, created: false}
+      if (channel === "openalma:save-photo") {
+        return payload.filename === "video-photo.jpg" ? {supported: true, success: false} : save
+      }
+      if (channel === "openalma:reserve-image") return {startGeneration: snapshot.startGeneration, imageId: "replacement-photo"}
+      if (channel === "openalma:image") await upload
+      if (channel === "openalma:set-capabilities") throw new Error("Replacement setting failed")
+      if (channel === "openalma:stop") {
+        snapshot.connection = "idle"
+        snapshot.startGeneration += 1
+      }
+      if (channel === "openalma:start") {
+        if (boundary === "starting") await start
+        snapshot.connection = "listening"
+        snapshot.startGeneration += 1
+        snapshot.callMode = payload.callMode
+      }
+      return {ok: true}
+    })
+    // The fixture skips effects; select the existing Soul through its normal controls.
+    nodes(render()).find(node => node.props?.onFocus).props.onChange({target: {value: "Quill"}})
+    nodes(render()).find(node => node.props?.["aria-label"] === "Use soul").props.onClick()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const picker = nodes(render()).find(node => node.props?.capture === "environment")
+    picker.props.onClick()
+    const pick = () => picker.props.onChange({currentTarget: {value: "",
+      files: [new File(["fictional"], "photo.png", {type: "image/png"})]}})
+    let picking: Promise<void> | undefined
+    if (!latePicker) {
+      picking = pick()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(calls.filter(channel => channel === "openalma:save-photo")).toHaveLength(1)
+    }
+    nodes(render()).find(node => node.props?.children === "Stop").props.onClick()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(snapshot.connection).toBe("idle")
+    if (boundary !== "idle") {
+      const button = nodes(render()).find(node => node.props?.children === (latePicker ? "Video" : "Audio"))
+      expect(button.props.disabled).toBe(false)
+      button.props.onClick()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(calls).toContain("openalma:start")
+      if (boundary === "replacement stopped") {
+        nodes(render()).find(node => node.props?.children === "Stop").props.onClick()
+        await new Promise(resolve => setTimeout(resolve, 0))
+        expect(snapshot.connection).toBe("idle")
+      }
+    }
+    if (latePicker) {
+      nodes(render()).find(node => node.props?.children === "Take photo").props.onClick()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(calls).toContain("openalma:image")
+      labelledCheckbox(render(), "Microphone enabled").props.onChange({target: {checked: false}})
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+    const replacement = JSON.stringify(render())
+    const before = [...calls]
+    if (latePicker) picking = pick()
+    if (outcome === "rejected") reject(new Error("Fictional gallery transport failure"))
+    else finish({supported: true, success: outcome === "saved"})
+    await picking
+    expect(calls.filter(channel => channel === "openalma:reserve-image")).toHaveLength(latePicker ? 1 : 0)
+    expect(calls.filter(channel => channel === "openalma:image")).toHaveLength(latePicker ? 1 : 0)
+    expect(calls.filter(channel => channel === "openalma:save-photo")).toHaveLength(latePicker ? 2 : 1)
+    const page = JSON.stringify(render())
+    expect(page.includes("Not saved to gallery")).toBe(latePicker || (boundary === "idle" && outcome === "failed"))
+    expect(page.includes("Gallery save not confirmed")).toBe(boundary === "idle" && outcome === "rejected")
+    expect(page).not.toContain("Fictional gallery transport failure")
+    expect(page).not.toContain("Choose the photo again")
+    if (latePicker) {
+      expect(page).toBe(replacement)
+      expect(page).toContain("Replacement setting failed")
+      expect(calls).toEqual([...before, "openalma:save-photo"])
+      expect(nodes(render()).find(node => node.props?.children === "Take photo").props.disabled).toBe(true)
+      finishUpload()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(JSON.stringify(render())).toContain("Photo sent")
+    }
+    if (boundary === "idle" && outcome !== "saved") {
+      nodes(render()).find(node => node.props?.children === "Audio").props.onClick()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(calls).toContain("openalma:start")
+      expect(JSON.stringify(render())).not.toContain("saved to gallery")
+      expect(JSON.stringify(render())).not.toContain("Gallery save not confirmed")
+    }
+    finishStart()
+    await new Promise(resolve => setTimeout(resolve, 0))
   })
 
   test.each(["Retake", "Stop"])("discarding a failed photo with %s clears its retry message", async action => {

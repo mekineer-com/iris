@@ -150,8 +150,9 @@ export default function SessionPage() {
   })
   const startOwner = useRef(0)
   const imageOwner = useRef(0)
+  const galleryOwner = useRef(0)
   const galleryWarningShown = useRef(false)
-  const pickerGeneration = useRef<number | null>(null)
+  const pickerGeneration = useRef<{startGeneration: number | null; gallery: number} | null>(null)
   const filingOwner = useRef(0)
 
   useEffect(() => {
@@ -277,6 +278,8 @@ export default function SessionPage() {
     if (maxPhotosSaving.current) return
     const owner = ++startOwner.current
     imageOwner.current += 1
+    galleryOwner.current += 1
+    setGalleryNotice(null)
     filingOwner.current += 1
     setFilingPending(null)
     setImagePending(false)
@@ -413,24 +416,28 @@ export default function SessionPage() {
     }
   }
 
-  const preparePhoto = async (original: File, generation: number | null, receivedAt: number, capture = false) => {
-    setRpcError(null)
-    setImageStatus(null)
-    setGalleryNotice(null)
+  const preparePhoto = async (original: File, generation: number | null, receivedAt: number, capture = false,
+    gallery?: number) => {
+    const current = !capture || gallery === galleryOwner.current
+    if (current) {
+      setRpcError(null)
+      setImageStatus(null)
+      setGalleryNotice(null)
+    }
     try {
       validateImageFile(original)
     } catch (error) {
-      setRpcError(error instanceof Error ? error.message : String(error))
+      if (current) setRpcError(error instanceof Error ? error.message : String(error))
       return
     }
-    const owner = ++imageOwner.current
-    setImagePending(true)
+    const owner = current ? ++imageOwner.current : null
+    if (current) setImagePending(true)
     try {
       const time = await readImageTime(original, receivedAt)
       if (!capture && owner !== imageOwner.current) return
       if (capture) {
         if (!window.MentraOS?.capabilities?.includes("save_image_to_gallery")) {
-          if (owner === imageOwner.current && !galleryWarningShown.current) {
+          if (gallery === galleryOwner.current && !galleryWarningShown.current) {
             galleryWarningShown.current = true
             let alreadyShown = false
             try {alreadyShown = localStorage.getItem(GALLERY_WARNING_KEY) === "1"} catch { /* warning storage is optional */ }
@@ -444,15 +451,18 @@ export default function SessionPage() {
             const data = await imageData(original)
             const result = await savePhotoRpc({data,
               mimeType: validateImageFile(original), filename: original.name, creationTime: imageTimeMillis(time)})
-            if (owner !== imageOwner.current) return
-            if (!result.success) setGalleryNotice("Not saved to gallery. The photo can still be sent.")
+            // Stop cancels attachment, not the independent gallery outcome.
+            if (gallery === galleryOwner.current && !result.success) {
+              setGalleryNotice("Not saved to gallery.")
+            }
           } catch {
-            if (owner !== imageOwner.current) return
-            setGalleryNotice("Gallery save not confirmed. The photo can still be sent.")
+            if (gallery === galleryOwner.current) {
+              setGalleryNotice("Gallery save not confirmed.")
+            }
           }
         }
       }
-      if (owner !== imageOwner.current) return
+      if (owner !== imageOwner.current || (capture && gallery !== galleryOwner.current)) return
       if (generation === null || generation !== snapshot?.startGeneration) {
         setRpcError("Choose the photo again for this sitting.")
         return
@@ -479,24 +489,26 @@ export default function SessionPage() {
   const onImagePicked = async (input: HTMLInputElement, capture: boolean) => {
     const file = input.files?.[0]
     input.value = ""
-    const generation = pickerGeneration.current
+    const picker = pickerGeneration.current
+    const generation = picker?.startGeneration ?? null
     pickerGeneration.current = null
     if (!file) return
     if (!capture && (generation === null || generation !== snapshot?.startGeneration)) {
       setRpcError("Choose the photo again for this sitting.")
       return
     }
-    await preparePhoto(file, generation, Date.now(), capture)
+    await preparePhoto(file, generation, Date.now(), capture, picker?.gallery)
   }
 
   const onVideoPhoto = async () => {
     const owner = ++imageOwner.current
+    const gallery = ++galleryOwner.current
     const generation = snapshot!.startGeneration
     setImagePending(true)
     setRpcError(null)
     try {
       const photo = await vision.takePhoto()
-      if (owner === imageOwner.current) await preparePhoto(photo.file, generation, photo.receivedAt, true)
+      if (owner === imageOwner.current) await preparePhoto(photo.file, generation, photo.receivedAt, true, gallery)
     } catch (error) {
       if (owner === imageOwner.current) setRpcError(error instanceof Error ? error.message : String(error))
     } finally {
@@ -767,7 +779,8 @@ export default function SessionPage() {
             type="file"
             accept="image/jpeg,image/png"
             capture="environment"
-            onClick={() => {pickerGeneration.current = snapshot?.startGeneration ?? null}}
+            onClick={() => {pickerGeneration.current = {startGeneration: snapshot?.startGeneration ?? null,
+              gallery: ++galleryOwner.current}}}
             disabled={!cameraEnabled || !voiceReady || imagePending || stopping}
             onChange={(event) => onImagePicked(event.currentTarget, true)}
           />
@@ -777,7 +790,8 @@ export default function SessionPage() {
           <input
             type="file"
             accept="image/jpeg,image/png"
-            onClick={() => {pickerGeneration.current = snapshot?.startGeneration ?? null}}
+            onClick={() => {pickerGeneration.current = {startGeneration: snapshot?.startGeneration ?? null,
+              gallery: ++galleryOwner.current}}}
             disabled={!cameraEnabled || !voiceReady || imagePending || stopping}
             onChange={(event) => onImagePicked(event.currentTarget, false)}
           />
