@@ -595,6 +595,7 @@ export class GeminiLiveController {
   private acceptedCaptions = new Map<string, string>()
   private spokenPhotos: string[] = []
   private imageUpload: Promise<void> | null = null
+  private deliberateImageUpload: Promise<void> | null = null
   private draining = false
   private drainInputFlushed = false
   private outputMuted = false
@@ -817,13 +818,23 @@ export class GeminiLiveController {
 
   sendImage(image: ImageRequest): Promise<void> {
     if (this.stopPromise || this.outputMuted) return Promise.reject(new Error("Photo send cancelled"))
-    if (this.imageUpload) return Promise.reject(new Error("Wait for the current photo upload to finish"))
-    const upload = this.performSendImage(image).finally(() => {
+    if (this.deliberateImageUpload) return Promise.reject(new Error("Wait for the current photo upload to finish"))
+    const generation = this.generation
+    const preceding = this.imageUpload
+    const work = preceding ? preceding.catch(() => {}).then(() => {
+      // This is still an unsent draft until admission; Stop must not send it into a later sitting.
+      if (this.stopPromise || this.outputMuted || generation !== this.generation) throw new Error("Photo send cancelled")
+      return this.performSendImage(image)
+    }) : this.performSendImage(image)
+    const upload = work.finally(() => {
+      // Passive promotions can own a later tail while this deliberate send finishes.
+      if (this.deliberateImageUpload === upload) this.deliberateImageUpload = null
       if (this.imageUpload === upload) {
         this.imageUpload = null
         this.resumeBackgroundWork()
       }
     })
+    this.deliberateImageUpload = upload
     this.imageUpload = upload
     this.publishFrameDelivery()
     return upload

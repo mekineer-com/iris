@@ -128,6 +128,12 @@ and conflicting captions cannot file. An image-based caption receipt ID is stabl
 across timeline replacement. Actual human speech remains audible and saved;
 internal captions are `photo_caption` events, not assistant dialogue.
 
+A deliberate photo waits behind already-reserved uploads rather than failing
+because passive work owns the lane. Only one deliberate send may wait/upload.
+Until it enters `performSendImage`, it remains an in-memory draft canceled by
+Stop; admitted photos retain the existing journal and server-original recovery.
+Later passive promotions chain behind its reserved place; running work is not preempted.
+
 A readiness call that normally returns without its caption checks existing
 filing receipts, then resends the same ID/original once with the approved prefix:
 "Your memory store didn't receive the photo caption. Please send it!" A second

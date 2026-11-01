@@ -1127,6 +1127,7 @@ describe("GeminiLiveController", () => {
     const storage = new FakeStorage()
     const set = storage.set.bind(storage)
     let failed = false, release!: () => void
+    let queued: Promise<void> | undefined
     let deadline = Date.now() + 30_000
     storage.set = async (key, value) => {
       if (!failed && (failure === "cache" ? key.endsWith(frame(2).imageId) :
@@ -1148,7 +1149,8 @@ describe("GeminiLiveController", () => {
       await waitFor(() => failed && (failure === "cache" ? h.persistenceErrors.some(error => error?.includes("Photo selection failed")) : h.photoRetryChanges.includes(true)))
       await new Promise(resolve => setTimeout(resolve, 0))
       expect(Reflect.get(h.controller, "imageUpload")).toBe(tail)
-      await expect(h.controller.sendImage({imageId: "deliberate-during-held-upload", mimeType: "image/png", data: "AQID"})).rejects.toThrow("Wait for the current photo upload")
+      queued = h.controller.sendImage({imageId: "deliberate-during-held-upload", mimeType: "image/png", data: "AQID"})
+      void queued.catch(() => {})
       expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
       const stopping = h.controller.stop(true)
       deadline = Date.now() - 1
@@ -1157,7 +1159,9 @@ describe("GeminiLiveController", () => {
       expect(JSON.parse((await readSessionJournal(storage)).raw!).pendingImages).toHaveLength(failure === "cache" ? 1 : 2)
       release()
       await tail
-    } finally { deadline = Date.now() - 1; h.controller.refreshStopDeadline(); release(); await h.controller.stop() }
+      await expect(queued).rejects.toThrow("Photo send cancelled")
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
+    } finally { deadline = Date.now() - 1; h.controller.refreshStopDeadline(); release(); await queued?.catch(() => {}); await h.controller.stop() }
   })
 
   test("a transient journal read failure is retried rather than cached", async () => {
@@ -5363,6 +5367,79 @@ describe("GeminiLiveController", () => {
     expect(h.sockets[1].sent.filter((value) => photoInput(JSON.parse(value)))).toHaveLength(1)
     expect(h.errors).toEqual([])
     await h.controller.stop()
+  })
+
+  test.each([false, true])("a deliberate photo waits for passive upload (predecessor failed=%s)", async failed => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    let release!: () => void, reject!: (error: Error) => void
+    const preceding = new Promise<void>((resolve, fail) => {release = resolve; reject = fail})
+    void preceding.catch(() => {})
+    Reflect.set(h.controller, "imageUpload", preceding)
+    let error: unknown
+    const sending = h.controller.sendImage({imageId: "deliberate-photo", mimeType: "image/png", data: "AQID"})
+    void sending.catch(value => {error = value})
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(error).toBeUndefined()
+      expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+      await expect(h.controller.sendImage({imageId: "overlapping-photo", mimeType: "image/png", data: "AQID"}))
+        .rejects.toThrow("Wait for the current photo upload to finish")
+      if (failed) reject(new Error("Fictional passive upload failure"))
+      else release()
+      await sending
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot")).map(request => request.body.image_id))
+        .toEqual(["deliberate-photo"])
+    } finally { release(); await sending.catch(() => {}); await h.controller.stop() }
+  })
+
+  test("a passive successor keeps its tail without retaining the deliberate send owner", async () => {
+    const h = harness({storage: new FakeStorage()})
+    await start(h)
+    let release!: () => void, releaseNext!: () => void
+    Reflect.set(h.controller, "imageUpload", new Promise<void>(resolve => {release = resolve}))
+    const next = new Promise<void>(resolve => {releaseNext = resolve})
+    const first = h.controller.sendImage({imageId: "first-deliberate", mimeType: "image/png", data: "AQID"})
+    const successor = first.catch(() => {}).then(() => next)
+    Reflect.set(h.controller, "imageUpload", successor)
+    let second: Promise<void> | undefined
+    try {
+      release()
+      await first
+      expect(Reflect.get(h.controller, "imageUpload")).toBe(successor)
+      second = h.controller.sendImage({imageId: "second-deliberate", mimeType: "image/png", data: "AQID"})
+      void second.catch(() => {})
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot"))).toHaveLength(1)
+      releaseNext()
+      await second
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot")).map(request => request.body.image_id))
+        .toEqual(["first-deliberate", "second-deliberate"])
+    } finally { release(); releaseNext(); await second?.catch(() => {}); await h.controller.stop() }
+  })
+
+  test("graceful Stop cancels a waiting deliberate draft before generation retirement", async () => {
+    const storage = new FakeStorage()
+    const h = harness({storage})
+    await start(h)
+    let release!: () => void
+    Reflect.set(h.controller, "imageUpload", new Promise<void>(resolve => {release = resolve}))
+    const generation = Reflect.get(h.controller, "generation")
+    let cancelledDuringDrain = false
+    const sending = h.controller.sendImage({imageId: "waiting-draft", mimeType: "image/png", data: "AQID"})
+    void sending.catch(() => {
+      cancelledDuringDrain = Reflect.get(h.controller, "draining") &&
+        Reflect.get(h.controller, "generation") === generation
+    })
+    try {
+      const stopping = h.controller.stop(true)
+      release()
+      await expect(sending).rejects.toThrow("Photo send cancelled")
+      expect(cancelledDuringDrain).toBe(true)
+      await stopping
+      expect(h.requests.some(request => request.url.endsWith("/snapshot"))).toBe(false)
+      expect(JSON.parse((await readSessionJournal(storage)).raw || "{}").pendingImages ?? []).toEqual([])
+    } finally { release(); await sending.catch(() => {}); await h.controller.stop() }
   })
 
   test("snapshot finishing after its pending photo was discarded does not resurrect it", async () => {
