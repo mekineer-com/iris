@@ -3153,6 +3153,7 @@ describe("SessionController", () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(lastSnapshot(harness.session)?.connection).toBe("error")
     expect(lastSnapshot(harness.session)?.lastError).toBe("provider failed")
+    expect(harness.live.stopArgs).toEqual([false])
   })
 
   test("temporary transcript failure is visible without stopping voice", async () => {
@@ -3610,15 +3611,20 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)?.connection).toBe("listening")
   })
 
-  test("Stop during fatal teardown awaits the same owner", async () => {
+  test.each(["provider", "disconnected cue"] as const)("Stop during fatal teardown at %s awaits the same owner", async phase => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     let release!: () => void
-    harness.live.stopGate = new Promise<void>((resolve) => {
+    const gate = new Promise<void>((resolve) => {
       release = resolve
     })
+    if (phase === "provider") harness.live.stopGate = gate
+    else harness.session.playGate = gate
     harness.live.fail("provider failed")
-    await Promise.resolve()
+    await flush()
+    if (phase === "disconnected cue") {
+      expect(harness.session.plays.at(-1)?.audioUrl).toEndWith("/disconnected.wav")
+    }
     let stopped = false
     const stop = Promise.resolve(harness.session.handlers["openalma:stop"]({})).then(() => {
       stopped = true
@@ -3632,6 +3638,7 @@ describe("SessionController", () => {
     release()
     await stop
     expect(harness.live.stops).toBe(1)
+    expect(harness.live.stopArgs).toEqual([false])
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "idle", lastError: null})
   })
 

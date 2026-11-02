@@ -890,24 +890,19 @@ export class SessionController {
     await this.refreshRecoveryLock()
     void this.refreshFailedPhotos()
 
+    try {
+      await this.playEarcon(this.teardownKind === "stop" ? "listen-stop" : "disconnected")
+    } catch {
+      /* ignore */
+    }
+    if (generation !== this.startGeneration) return
     if (this.teardownKind === "stop") {
-      try {
-        await this.playEarcon("listen-stop")
-      } catch {
-        /* ignore */
-      }
       this.connection = "idle"
       trace("session.idle")
     } else {
-      try {
-        await this.playEarcon("disconnected")
-      } catch {
-        /* ignore */
-      }
       this.connection = "error"
       trace("session.error", {error: this.lastError})
     }
-    if (generation !== this.startGeneration) return
     this.teardownKind = null
     this.stopStartedAt = null
     this.pushSnapshot()
