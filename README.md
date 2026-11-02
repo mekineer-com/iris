@@ -68,4 +68,5 @@ bun install
 bun test
 bun run test:browser # Requires Chromium; CHROMIUM can name its executable.
 bun run build
+bun run test:hosts /path/to/unpacked-glassly-sdk # Checks dist/ under both hosts; requires Chromium.
 ```

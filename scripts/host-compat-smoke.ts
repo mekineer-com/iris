@@ -46,18 +46,25 @@ for (const host of ["mentra", "glassly"]) {
       if (url.endsWith("/installation/seen")) {
         assert.equal(options?.method, "POST")
         const body = JSON.parse(String(options?.body))
-        assert.equal(body.installation_ticket, "fictional-ticket")
+        if (body.installation_ticket !== undefined) {
+          assert.equal(body.installation_ticket, "fictional-ticket")
+          ticketExchanges++
+        } else {
+          assert.equal(ticketExchanges, 1, "Only a confirmed installation may report without its ticket")
+        }
         assert.equal(body.user_id, "Fictional Tester")
         assert.equal(body.soul_id, null)
         assert.equal(body.package_name, manifest.packageName)
         assert.equal(body.version, manifest.version)
         assert.ok(typeof body.device_session_id === "string" && body.device_session_id.length > 0)
         assert.equal(body.host_package, undefined)
-        ticketExchanges++
         return Response.json({ok: true})
       }
       if (url.endsWith("/owner")) return Response.json({user_id: "Fictional Tester"})
       if (url.endsWith("/souls")) return Response.json({souls: []})
+      if (new URL(url).pathname === "/integration/mentra/status") {
+        return Response.json({failed_photos: [], configured_model: null})
+      }
       throw new Error(`Unexpected fictional request: ${url}`)
     },
     __hostError(error: string) {throw new Error(error)},
@@ -141,6 +148,9 @@ const server = Bun.serve({port: 0, hostname: "127.0.0.1", async fetch(request) {
     window.${host} = {
       ready() {document.documentElement.dataset.ready='yes'},
       on(channel, cb) {queueMicrotask(() => cb(${JSON.stringify(snapshots[host])})); return () => {}},
+      send(channel, payload) {
+        if (channel === 'openalma:visibility') document.documentElement.dataset.visible=String(payload.visible);
+      },
       request(channel, payload) {document.documentElement.dataset.rpc=channel; return Promise.resolve({ok:true})}
     };
     setTimeout(() => {
@@ -166,6 +176,7 @@ try {
         assert.equal(await child.exited, 0)
         assert.ok(html.includes('data-ready="yes"'), `${host}: UI never reached ready`)
         assert.ok(!html.includes("data-error="), `${host}: browser error`)
+        assert.ok(html.includes('data-visible="true"'), `${host}: UI visibility never reached the host bridge`)
         assert.ok(html.includes('class="dark"'), `${host}: initial host theme lost`)
         assert.ok(html.includes('data-rpc="openalma:set-mode"'), `${host}: SDK useRpc did not reach host bridge`)
         console.log(`PASS ${host}: identical built UI renders in Chromium, host theme, subscription and RPC`)

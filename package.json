@@ -7,6 +7,7 @@
     "build": "bun run build.ts",
     "test": "bun test",
     "test:browser": "bun scripts/phone-vision-browser.ts",
+    "test:hosts": "bun scripts/host-compat-smoke.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
