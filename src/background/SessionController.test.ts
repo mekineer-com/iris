@@ -3093,6 +3093,60 @@ describe("SessionController", () => {
     })
   })
 
+  test.each([
+    ["continuous", "saved"], ["continuous", "rejected"], ["manual", "saved"], ["manual", "rejected"],
+  ] as const)("microphone off stops capture before a %s preference write (%s)", async (mode, outcome) => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode})
+    if (mode === "manual") h.session.handlers["openalma:manual-action"]({action: "talk"})
+    h.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000, source: "phone"})
+    let entered!: () => void
+    let settle!: () => void
+    const writing = new Promise<void>(resolve => {entered = resolve})
+    const gate = new Promise<void>((resolve, reject) => {
+      settle = () => outcome === "rejected" ? reject(new Error("Fictional microphone preference failure")) : resolve()
+    })
+    const set = h.session.storage.set
+    h.session.storage.set = async (key, value) => {
+      if (key === "openalma.microphone-enabled") {entered(); await gate}
+      await set(key, value)
+    }
+    const muting = Promise.resolve(h.session.handlers["openalma:set-capabilities"]({microphoneEnabled: false}))
+      .then(() => null, error => error as Error)
+    try {
+      await writing
+      expect(h.session.micHandler).toBeNull()
+      expect(lastSnapshot(h.session)).toMatchObject({
+        connection: "listening", microphoneEnabled: false,
+        manualPhase: mode === "manual" ? "review" : "idle",
+      })
+      expect(h.live.stops).toBe(0)
+      h.session.micHandler?.({data: testPcm(2), format: "pcm_s16le", sampleRate: 16000, source: "phone"})
+      expect(h.live.sent).toEqual(mode === "continuous" ? [testPcm(1)] : [])
+      settle()
+      const error = await muting
+      if (outcome === "rejected") {
+        expect(error?.message).toBe("Fictional microphone preference failure")
+        expect(h.session.stored.has("openalma.microphone-enabled")).toBe(false)
+      } else {
+        expect(error).toBeNull()
+        expect(h.session.stored.get("openalma.microphone-enabled")).toBe("0")
+      }
+      expect(h.session.micHandler).toBeNull()
+      expect(lastSnapshot(h.session)?.microphoneEnabled).toBe(false)
+      if (mode === "manual") {
+        h.session.handlers["openalma:manual-action"]({action: "send"})
+        expect(h.live.activities).toEqual([[testPcm(1)]])
+        expect(h.live.activitySources).toEqual(["phone"])
+      }
+    } finally {
+      settle()
+      await muting
+      h.session.storage.set = set
+      await h.session.handlers["openalma:stop"]({})
+    }
+  })
+
   test("invitation readiness waits for actual speaker drain", async () => {
     const h = setup()
     await h.session.handlers["openalma:start"]({mode: "continuous"})

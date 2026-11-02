@@ -391,14 +391,18 @@ export class SessionController {
           this.pushSnapshot()
         }
         if (next.microphoneEnabled !== undefined) {
+          if (next.microphoneEnabled === false) {
+            this.microphoneEnabled = false
+            this.holdManualTake()
+            if (this.micUnsub) this.stopMic()
+            this.pushSnapshot()
+          }
           await this.session.storage.set(
             MICROPHONE_ENABLED_KEY,
             next.microphoneEnabled ? "1" : "0",
           )
           this.microphoneEnabled = next.microphoneEnabled
-          if (!this.microphoneEnabled) this.holdManualTake()
-          if (!this.microphoneEnabled && this.micUnsub) this.stopMic()
-          else if (
+          if (
             this.microphoneEnabled &&
             (this.connection === "listening" ||
               this.connection === "speaking" ||
