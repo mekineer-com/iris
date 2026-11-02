@@ -331,7 +331,9 @@ Offline source checks are not live-provider/phone qualification of Thinking.
   not acceptance/storage of that next original. A missing caption at a provider
   boundary exposes logged Retry/Discard; an eventual valid caption can still
   complete its original task. Failed filing itself still requires explicit Retry.
-- A reply cut by Stop is saved as interrupted. Late transcription of that reply
+- Partial reply text accompanying delivered audio is journaled as it arrives;
+  recovery after a process kill saves it as interrupted. A reply cut by Stop is
+  also saved as interrupted. Late transcription of that reply
   is retained while its pre-Stop audio is still being settled; this does not
   establish an exact heard-word cutoff. Missing text for heard audio records a
   nonfatal gap during Stop, without canceling photo calls. Muted-only output

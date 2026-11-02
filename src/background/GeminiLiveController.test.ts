@@ -746,7 +746,8 @@ describe("GeminiLiveController", () => {
   })
 
   test("Thinking private photo work cannot leak a spoken preamble before its closing quiet choice", async () => {
-    const h = harness({storage: new FakeStorage()})
+    const storage = new FakeStorage()
+    const h = harness({storage})
     await start(h, "continuous", "", THINKING)
     const socket = h.sockets[0]
     try {
@@ -756,6 +757,9 @@ describe("GeminiLiveController", () => {
       socket.message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]},
         outputTranscription: {text: "I'm preparing the photo."}}})
       expect(h.audio).toEqual([])
+      socket.message({sessionResumptionUpdate: {resumable: true, newHandle: "private-photo-handle"}})
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").resumption?.handle === "private-photo-handle")
+      expect(storage.values.get(JOURNAL_KEY)).not.toContain("I'm preparing the photo.")
       provisionalCaption(socket, "private-caption", "A fictional green square.", "private-save")
       socket.message({serverContent: {turnComplete: true, interactionStatus: "IN_PROGRESS"}})
       await waitFor(() => functionResponses(socket).some(reply => reply.id === "private-save"))
@@ -2388,6 +2392,9 @@ describe("GeminiLiveController", () => {
       await waitFor(() => h.sockets[0].sent.some(value => value.includes("Reflect briefly")))
       h.sockets[0].message({serverContent: {outputTranscription: {text: "I enjoyed our fictional walk"},
         modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
+      h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "reflection-handle"}})
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").resumption?.handle === "reflection-handle")
+      expect(storage.values.get(JOURNAL_KEY)).not.toContain("I enjoyed our fictional walk")
       if (expiry === "shared") {
         deadline = Date.now() - 1
         h.controller.refreshStopDeadline()
@@ -4353,7 +4360,7 @@ describe("GeminiLiveController", () => {
     expect(h.errors).toEqual([])
   })
 
-  test.each(["reservation", "partial-text"] as const)("cold recovery seals a crashed %s before admitting new speech", async crash => {
+  test.each(["reservation", "partial-text", "partial-reply"] as const)("cold recovery seals a crashed %s before admitting new speech", async crash => {
     const storage = new FakeStorage()
     const old = harness({storage})
     await start(old)
@@ -4362,7 +4369,7 @@ describe("GeminiLiveController", () => {
       old.sockets[0].message({serverContent: {inputTranscription: {text: "Retained unfinished words."}}})
     } else {
       old.sockets[0].message({serverContent: {outputTranscription: {text: "An answer before the crash."},
-        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: true}})
+        modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}, turnComplete: crash !== "partial-reply"}})
     }
     await waitFor(() => {
       const drafts = JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").draftTranscripts
@@ -4386,12 +4393,102 @@ describe("GeminiLiveController", () => {
     const rows = [...recovery.events, ...next.requests.flatMap(request => request.body.events ?? [])]
     expect(rows.filter(row => row.role === "user" && row.event_kind === "transcript").map(row => row.content))
       .toEqual(crash === "partial-text" ? ["Retained unfinished words.", "Entirely new speech."] : ["Entirely new speech."])
-    if (crash === "reservation") {
+    if (crash !== "partial-text") {
       expect(rows.some(row => row.event_kind === "transcript_gap" && row.role === "user")).toBe(true)
+      expect(rows.find(row => row.role === "assistant").status).toBe(crash === "partial-reply" ? "interrupted" : "complete")
       expect(next.persistenceErrors).toContain("Some spoken words could not be transcribed")
       expect(next.persistenceErrors.at(-1)).toBe("Some spoken words could not be transcribed")
     } else expect(rows.find(row => row.content === "Retained unfinished words.").status).toBe("interrupted")
     expect(next.errors).toEqual([])
+  })
+
+  test.each([
+    ["continuous", false], ["continuous", true], ["manual", false], ["manual", true],
+  ] as const)("a crashed %s reply recovers behind its question (text first=%s)", async (mode, textFirst) => {
+    const storage = new FakeStorage()
+    const old = harness({storage})
+    await start(old, mode)
+    if (mode === "manual") old.controller.sendActivity(["AAAAAA=="])
+    else {
+      old.sockets[0].message({voiceActivity: {type: "ACTIVITY_START"}})
+      old.sockets[0].message({voiceActivity: {type: "ACTIVITY_END"}})
+    }
+    old.sockets[0].message({serverContent: {inputTranscription: {text: "A fictional question."}}})
+    const text = {serverContent: {outputTranscription: {text: "A partial answer"}}}
+    const audio = {serverContent: {modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}}}
+    old.sockets[0].message(textFirst ? text : audio)
+    old.sockets[0].message(textFirst ? audio : text)
+    old.sockets[0].message({serverContent: {outputTranscription: {text: " received so far."}}})
+    try {
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").draftTranscripts?.at(-1)?.content ===
+        "A partial answer received so far.")
+      expect(old.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+      // Capture only the durable state: the killed process cannot run Stop or socket-close handlers.
+      const restored = new FakeStorage()
+      restored.values.set(JOURNAL_KEY, storage.values.get(JOURNAL_KEY)!)
+      const next = harness({storage: restored})
+      try {
+        await start(next)
+        const recovery = next.requests.find(request => request.url.endsWith("/session/start"))!.body.recovery
+        expect(recovery).toMatchObject({sitting_id: "sitting-1", events: [
+          {event_id: "sitting-1:41", role: "user", content: "A fictional question."},
+          {event_id: "sitting-1:42", role: "assistant", content: "A partial answer received so far.", status: "interrupted"},
+        ]})
+        expect(next.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+        expect(next.errors).toEqual([])
+      } finally { await next.controller.stop() }
+    } finally { await old.controller.stop() }
+  })
+
+  test.each([false, true])("an unfinished reply draft becomes one final row (Stop=%s)", async stop => {
+    const storage = new FakeStorage()
+    const h = harness({storage})
+    await start(h)
+    h.sockets[0].message({serverContent: {inputTranscription: {text: "A fictional question."},
+      outputTranscription: {text: "A partial answer"}, modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}}})
+    try {
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").draftTranscripts?.at(-1)?.role === "assistant")
+      if (!stop) h.sockets[0].message({serverContent: {outputTranscription: {text: " now complete."}, turnComplete: true}})
+      await h.controller.stop()
+      const replies = h.requests.flatMap(request => request.body.events ?? []).filter(row => row.role === "assistant")
+      expect(replies).toHaveLength(1)
+      expect(replies).toMatchObject([{content: stop ? "A partial answer" : "A partial answer now complete.",
+        status: stop ? "interrupted" : "complete"}])
+      expect(storage.values.get(JOURNAL_KEY)).toBe("")
+      expect(h.errors).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
+  test("reply-only recovery saves audible text without inventing an owner turn", async () => {
+    const storage = new FakeStorage()
+    const h = harness({storage})
+    await start(h)
+    try {
+      h.sockets[0].message({serverContent: {outputTranscription: {text: "An unsolicited greeting."}}})
+      // Force a snapshot while text has no corresponding playback yet.
+      h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "greeting-handle"}})
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").resumption?.handle === "greeting-handle")
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).draftTranscripts).toEqual([])
+      // No input, resumption handle or other events can keep this journal nonempty.
+      h.sockets[0].message({sessionResumptionUpdate: {resumable: false}})
+      h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}}})
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").draftTranscripts?.length === 1)
+      const writes = storage.setCalls
+      h.sockets[0].message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]}}})
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(storage.setCalls).toBe(writes)
+      const restored = new FakeStorage()
+      restored.values.set(JOURNAL_KEY, storage.values.get(JOURNAL_KEY)!)
+      const next = harness({storage: restored})
+      try {
+        await start(next)
+        expect(next.requests[0].body.recovery.events).toHaveLength(1)
+        expect(next.requests[0].body.recovery.events).toMatchObject([
+          {role: "assistant", content: "An unsolicited greeting.", status: "interrupted"},
+        ])
+        expect(next.errors).toEqual([])
+      } finally { await next.controller.stop() }
+    } finally { await h.controller.stop() }
   })
 
   test.each([false, true])("a legacy draft-only backup without a sitting identity is archived (reset=%s)", async reset => {

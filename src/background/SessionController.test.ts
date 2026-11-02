@@ -3076,12 +3076,14 @@ describe("SessionController", () => {
     expect(harness.session.plays).toHaveLength(2)
   })
 
-  test.each(["speech", "reconnect"])("microphone frames during %s prove capture without forwarding human audio", async state => {
+  test.each([
+    ["speech", false], ["speech", true], ["reconnect", false], ["reconnect", true],
+  ] as const)("microphone frames during %s prove capture without forwarding human audio (malformed=%s)", async (state, malformed) => {
     const harness = setup({watchdogMs: 15})
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
     if (state === "speech") harness.live.audio()
     else harness.live.reconnecting(true)
-    harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})
+    harness.session.micHandler?.({data: silentPcm(), format: malformed ? "aac" : "pcm_s16le", sampleRate: 16000})
     if (state === "speech") harness.live.turnComplete()
     else harness.live.reconnecting(false)
     await new Promise((resolve) => setTimeout(resolve, 40))

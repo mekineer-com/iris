@@ -1741,6 +1741,7 @@ export class GeminiLiveController {
         void this.persistJournal()
       }
     }
+    const wasAudible = this.turnAudioDelivered
     for (const part of interrupted ? [] : (parts ?? [])) {
       const inline = part?.inlineData
       if (inline === undefined) continue
@@ -1779,6 +1780,7 @@ export class GeminiLiveController {
     }
 
     if ((!this.quietOutput || this.quietOutput.keepTranscript) && (!this.outputMuted || this.turnAudioDelivered)) this.outputTranscript += output
+    if (this.turnAudioDelivered && this.outputTranscript.trim() && (output || !wasAudible)) void this.persistJournal()
     if (interrupted) {
       if (!this.toolBatch.background && this.toolBatch.request) this.toolBatch.request.retired = true
       trace("provider.interrupted", {
@@ -2450,7 +2452,7 @@ export class GeminiLiveController {
         (this.toolBatch.request.settled && !this.toolBatch.request.continuing))) {
       this.toolBatch = {request, completed: false, continuationSent: false, background: false,
         started: false, photo: this.toolBatch.photo}
-    } else if (!this.toolBatch.request && !this.toolBatch.completed) {
+    } else if (!this.toolBatch.request) {
       this.toolBatch.request = request
     }
   }
@@ -3094,7 +3096,8 @@ export class GeminiLiveController {
 
   private persistJournal(): Promise<boolean> {
     if (!this.journalOwner || !this.journalLoaded || !this.journalOwner.active(this.journalProducer)) return Promise.resolve(false)
-    const empty = !this.resumptionHandle && !this.pendingEvents.length && !this.draftEvents.length && !this.pendingImages.length
+    const empty = !this.resumptionHandle && !this.pendingEvents.length && !this.draftEvents.length && !this.pendingImages.length &&
+      !(!this.reflecting && this.turnAudioDelivered && this.outputTranscript.trim())
     const write = this.journalOwner.write(empty ? "" : this.journalSnapshot(), this.journalProducer).then(saved => {
       if (!this.journalOwner!.active(this.journalProducer)) return false
       this.journalUnavailable = !saved
@@ -3105,6 +3108,13 @@ export class GeminiLiveController {
   }
 
   private journalSnapshot(): string {
+    const drafts = [...this.draftEvents]
+    // Snapshot the live reply without sequencing it or adding a second mutable draft.
+    if (!this.reflecting && this.turnAudioDelivered && this.outputTranscript.trim()) {
+      const photo = drafts.findIndex(event => event.event_kind === "image" || event.event_kind === "photo_caption")
+      drafts.splice(photo < 0 ? drafts.length : photo, 0, {event_kind: "transcript", role: "assistant",
+        content: this.outputTranscript.trim(), status: "interrupted"})
+    }
     const journal: SessionJournal = {
       version: 3,
       callMode: this.vision.callMode,
@@ -3119,7 +3129,7 @@ export class GeminiLiveController {
         ? {handle: this.resumptionHandle, updatedAt: this.resumptionUpdatedAt}
         : null,
       pendingTranscripts: this.pendingEvents,
-      draftTranscripts: this.draftEvents,
+      draftTranscripts: drafts,
       nextTranscriptSequence: this.nextTranscriptSequence,
       pendingImages: this.pendingImages,
     }

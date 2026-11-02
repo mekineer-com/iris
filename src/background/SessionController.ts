@@ -1022,13 +1022,13 @@ export class SessionController {
   private handlePcmFrame(chunk: AudioChunkData & {source?: string}): void {
     if (!ACTIVE.has(this.connection)) return
     try {
-      const normalized = normalizePcm16Audio(chunk)
       if (!this.sawMicFrame) {
         this.sawMicFrame = true
         trace("session.microphone.first_frame")
         this.clearFirstPcmTimeout()
       }
       if (this.connection === "speaking" || this.connection === "reconnecting") return
+      const normalized = normalizePcm16Audio(chunk)
       if (this.mode === "continuous") {
         this.liveController?.sendAudio(normalized, MIC_SOURCES.find(source => source === chunk.source))
         return
