@@ -1032,7 +1032,7 @@ export class SessionController {
         trace("session.microphone.first_frame")
         this.clearFirstPcmTimeout()
       }
-      if (this.connection === "speaking") return
+      if (this.connection === "speaking" || this.connection === "reconnecting") return
       if (this.mode === "continuous") {
         this.liveController?.sendAudio(normalized, MIC_SOURCES.find(source => source === chunk.source))
         return

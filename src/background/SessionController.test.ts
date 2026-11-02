@@ -2720,11 +2720,20 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)?.connectionLocked).toBe(true)
     await expect(harness.session.handlers["openalma:set-profile"]({...CONFIG, baseUrl: "http://changed.example"}))
       .rejects.toThrow("Wait for settings or stop")
+    let release!: () => void
+    harness.session.playGate = new Promise<void>(resolve => {release = resolve})
     harness.live.reconnecting(false)
+    await new Promise((resolve) => setTimeout(resolve, 0))
     expect(lastSnapshot(harness.session)?.connection).toBe("reconnecting")
+    harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})
+    expect(harness.live.sent).toEqual([])
+    release()
+    harness.session.playGate = null
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(lastSnapshot(harness.session)?.connection).toBe("listening")
     expect(harness.session.plays.at(-1)?.audioUrl).toEndWith("/earcons/listen-start.wav")
+    harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})
+    expect(harness.live.sent).toEqual([silentPcm()])
     await harness.session.handlers["openalma:stop"]({})
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "idle", startGeneration: 2, pendingPhotoIds: []})
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
@@ -3067,12 +3076,14 @@ describe("SessionController", () => {
     expect(harness.session.plays).toHaveLength(2)
   })
 
-  test("microphone frames during playback prove capture without forwarding human audio", async () => {
+  test.each(["speech", "reconnect"])("microphone frames during %s prove capture without forwarding human audio", async state => {
     const harness = setup({watchdogMs: 15})
     await harness.session.handlers["openalma:start"]({mode: "continuous"})
-    harness.live.audio()
+    if (state === "speech") harness.live.audio()
+    else harness.live.reconnecting(true)
     harness.session.micHandler?.({data: silentPcm(), format: "pcm_s16le", sampleRate: 16000})
-    harness.live.turnComplete()
+    if (state === "speech") harness.live.turnComplete()
+    else harness.live.reconnecting(false)
     await new Promise((resolve) => setTimeout(resolve, 40))
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", lastError: null})
     expect(harness.live.sent).toEqual([])
