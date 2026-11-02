@@ -2769,6 +2769,102 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)?.connection).toBe("listening")
   })
 
+  test.each(["uninterrupted", "startup interruption", "later interruption"])("provider interruption retires queued speech (%s)", async phase => {
+    const session = new FakeSession()
+    session.stored.set("openalma.soul-id", CONFIG.soulId)
+    session.stored.set("openalma.closing-thoughts", "0")
+    const events = new EventTarget()
+    const socket = Object.assign(events, {
+      readyState: 0,
+      send(_data: string) {},
+      close() { this.readyState = 3; events.dispatchEvent(new Event("close")) },
+    })
+    const message = (value: unknown) => events.dispatchEvent(new MessageEvent("message", {data: JSON.stringify(value)}))
+    const audio = (data: string, complete = false) => message({serverContent: {
+      modelTurn: {parts: [{inlineData: {mimeType: "audio/pcm;rate=24000", data}}]},
+      outputTranscription: {text: "Fictional speech."}, ...(complete ? {turnComplete: true} : {}),
+    }})
+    const fetchFn = withOwnerDiscovery((async (url, init) => {
+      if (!init?.method) return Response.json({souls: [CONFIG.soulId]})
+      if (String(url).endsWith("/session/start")) return Response.json({
+        model: "gemini-3.8-live", photo_work_protocol: "iris-photo-work-v2",
+        session_id: "fictional-sitting", next_transcript_sequence: 1, ephemeral_token: "fictional-token",
+        websocket: {api_version: "v1beta", method: "BidiGenerateContentConstrained", input_audio_rate_hz: 16000, output_audio_rate_hz: 24000},
+        lease_seconds: 90, session_warning_seconds: 0,
+      })
+      if (String(url).endsWith("/transcripts/append")) {
+        const body = JSON.parse(String(init.body))
+        return Response.json({ok: true, ack_sequence: body.events.at(-1).sequence})
+      }
+      return Response.json({ok: true})
+    }) as typeof fetch)
+    let live!: GeminiLiveController
+    const controller = new SessionController(session as never, {
+      config: CONFIG, fetchFn,
+      createLiveController: (config, callbacks, journalOwner) => live = new GeminiLiveController(config, callbacks, {
+        fetchFn, journalOwner, openSocket: () => {
+          queueMicrotask(() => {
+            socket.readyState = 1
+            events.dispatchEvent(new Event("open"))
+            message({setupComplete: {}})
+          })
+          return socket
+        },
+      }),
+    })
+    let releaseCue!: () => void
+    session.playGate = new Promise<void>(resolve => {releaseCue = resolve})
+    let cueEntered!: () => void
+    const cue = new Promise<void>(resolve => {cueEntered = resolve})
+    const play = session.speaker.play
+    session.speaker.play = async options => {cueEntered(); await play(options)}
+    let releaseAbort!: () => void
+    controller.start()
+    const starting = session.handlers["openalma:start"]({mode: "manual"})
+    try {
+      await cue
+      if (phase === "later interruption") {releaseCue(); await starting}
+      audio(testPcm(1), phase !== "later interruption")
+      if (phase === "later interruption") {
+        await flush()
+        session.abortGate = new Promise<void>(resolve => {releaseAbort = resolve})
+      }
+      if (phase !== "uninterrupted") {
+        message({serverContent: {interrupted: true}})
+        if (phase === "startup interruption") audio(testPcm(2))
+      }
+      releaseCue()
+      await starting
+      await flush()
+      if (phase === "later interruption") {
+        expect(session.streams[0]?.aborted).toBe(true)
+        expect(session.streams.flatMap(stream => stream.writes)).toEqual([testPcm(1)])
+        releaseAbort()
+        await flush()
+        audio(testPcm(2))
+        await flush()
+      }
+      expect(session.streams.flatMap(stream => stream.writes)).toEqual(
+        phase === "uninterrupted" ? [testPcm(1)] : phase === "startup interruption" ? [testPcm(2)] : [testPcm(1), testPcm(2)],
+      )
+      expect(session.streams.at(-1)?.closed).toBe(phase === "uninterrupted")
+      if (phase !== "uninterrupted") {
+        expect(lastSnapshot(session)?.connection).toBe("speaking")
+        message({serverContent: {turnComplete: true}})
+        await flush()
+      }
+      expect(session.streams.at(-1)?.closed).toBe(true)
+      expect(lastSnapshot(session)?.connection).toBe("listening")
+    } finally {
+      releaseCue()
+      releaseAbort?.()
+      session.playGate = null
+      await starting
+      await live.stop(false)
+      await session.handlers["openalma:stop"]({})
+    }
+  })
+
   test("a hung start earcon is stopped and does not block listening", async () => {
     const harness = setup({earconTimeoutMs: 5})
     harness.session.playGate = new Promise<void>(() => {})

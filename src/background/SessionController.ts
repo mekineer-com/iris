@@ -492,6 +492,8 @@ export class SessionController {
 
   async interrupt(): Promise<void> {
     this.speakerEpoch += 1
+    this.startupAudio = []
+    this.startupTurnComplete = false
     await this.abortCurrentWriter()
     const manualFinished = this.completeManualResponse()
     if (this.connection === "speaking") {
