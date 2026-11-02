@@ -3255,6 +3255,40 @@ describe("SessionController", () => {
     }
   })
 
+  test("microphone Off stops an earlier On write admitted across a UI reopen", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    await h.session.handlers["openalma:set-capabilities"]({microphoneEnabled: false})
+    const set = h.session.storage.set
+    const writes: Array<() => void> = []
+    h.session.storage.set = async (key, value) => {
+      if (key === "openalma.microphone-enabled") await new Promise<void>(resolve => writes.push(resolve))
+      await set(key, value)
+    }
+    const firstOn = h.session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+    await Promise.resolve()
+    h.session.onCloseCb?.()
+    h.session.onOpenCb?.()
+    expect(lastSnapshot(h.session)?.microphoneEnabled).toBe(false)
+    const secondOn = h.session.handlers["openalma:set-capabilities"]({microphoneEnabled: true})
+    await Promise.resolve()
+    writes[0]()
+    await firstOn
+    expect(lastSnapshot(h.session)?.microphoneEnabled).toBe(true)
+    const off = h.session.handlers["openalma:set-capabilities"]({microphoneEnabled: false})
+    await Promise.resolve()
+    expect(h.session.micHandler).toBeNull()
+    writes[1]()
+    await secondOn
+    writes[2]()
+    await off
+    expect(lastSnapshot(h.session)?.microphoneEnabled).toBe(false)
+    expect(h.session.stored.get("openalma.microphone-enabled")).toBe("0")
+    expect(h.session.micHandler).toBeNull()
+    h.session.storage.set = set
+    await h.session.handlers["openalma:stop"]({})
+  })
+
   test("invitation readiness waits for actual speaker drain", async () => {
     const h = setup()
     await h.session.handlers["openalma:start"]({mode: "continuous"})

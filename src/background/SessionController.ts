@@ -402,6 +402,7 @@ export class SessionController {
             next.microphoneEnabled ? "1" : "0",
           )
           this.microphoneEnabled = next.microphoneEnabled
+          if (!this.microphoneEnabled && this.micUnsub) this.stopMic()
           if (
             this.microphoneEnabled &&
             (this.connection === "listening" ||
