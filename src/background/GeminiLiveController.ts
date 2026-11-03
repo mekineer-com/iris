@@ -971,13 +971,14 @@ export class GeminiLiveController {
     const saved = await this.persistJournal()
     if (!this.ownsJournal()) return
     if (image.selected && !image.selected.uploadIssued) this.chosenIds.delete(image.imageId)
-    if (saved && image.selected && this.ownsJournal()) await this.deleteCachedOriginal(image)
-    else if (!saved && image.selected) this.callbacks.onPersistenceError("Discard not saved; the photo may return after reopening Iris")
+    const cleanupFailed = saved && image.selected && !await this.deleteCachedOriginal(image)
+    if (!saved && image.selected) this.callbacks.onPersistenceError("Discard not saved; the photo may return after reopening Iris")
     this.publishPhotoRetry()
     this.clearPersistenceErrorIfSynced()
     if (this.pendingImages.some(image => !image.retryRequested && !image.caption)) this.invitationPending = true
     void this.retryPendingImage()
     this.resumeBackgroundWork()
+    if (cleanupFailed) throw new Error("Photo discarded; temporary original cleanup failed")
   }
 
   private async sendImagePreview(socket: SocketLike, mimeType: "image/jpeg" | "image/png", data: string, image: PendingImage): Promise<boolean> {
@@ -2686,12 +2687,13 @@ export class GeminiLiveController {
       .map(encodeURIComponent).join(":")}`
   }
 
-  private async deleteCachedOriginal(image: PendingImage): Promise<void> {
+  private async deleteCachedOriginal(image: PendingImage): Promise<boolean> {
     try {
       if (!this.storage?.delete) throw new Error("Local cache deletion unavailable")
       await this.storage.delete(image.selected!.cacheKey)
+      return true
     }
-    catch { if (this.ownsJournal()) this.callbacks.onPersistenceError("Photo saved; temporary original cleanup failed") }
+    catch { return false }
   }
 
   private async promoteSelected(image: PendingImage): Promise<void> {
@@ -2734,7 +2736,9 @@ export class GeminiLiveController {
     if (!this.ownsImage(image) || image.mediaRef !== mediaRef) return
     if (!saved) { await this.requestPhotoRetry(image); return }
     this.selectedMediaCommitted.add(image)
-    await this.deleteCachedOriginal(image)
+    if (!await this.deleteCachedOriginal(image) && this.ownsJournal()) {
+      this.callbacks.onPersistenceError("Photo saved; temporary original cleanup failed")
+    }
     if (!this.ownsImage(image)) return
     this.scheduleAppend()
     await this.scheduleImageFinalize(true, image)

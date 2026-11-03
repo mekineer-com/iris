@@ -17,9 +17,9 @@ import {
   writeReleaseStatus,
 } from "./release-private.mjs"
 
-async function waitForFile(path) {
+async function waitForFile(path, content) {
   const deadline = Date.now() + 3000
-  while (!existsSync(path)) {
+  while (!existsSync(path) || (content !== undefined && readFileSync(path, "utf8") !== content)) {
     if (Date.now() > deadline) throw new Error(`Timed out waiting for ${path}`)
     await Bun.sleep(10)
   }
@@ -318,7 +318,7 @@ writeFileSync("returned", "done")
             })
             expect(response.status).toBe(200)
           } else child.kill(mode)
-          await waitForFile(join(root, "draining"))
+          await waitForFile(join(root, "draining"), "false")
           expect(readFileSync(join(root, "draining"), "utf8")).toBe("false")
           expect(child.exitCode).toBeNull()
           expect(existsSync(join(root, "returned"))).toBe(false)

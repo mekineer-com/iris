@@ -251,8 +251,7 @@ export class SessionController {
             method: "POST",
             signal: timeoutSignal(10_000),
             headers: {"Content-Type": "application/json"},
-            // Released v0.1.12 servers need the owner name; newer servers derive it themselves.
-            body: JSON.stringify({soul_id: soulId, use_existing: value.useExisting, user_name: config.userId}),
+            body: JSON.stringify({soul_id: soulId, use_existing: value.useExisting}),
           })
           if (!response.ok) {
             const error = await response.json().catch(() => null) as {detail?: string | {reason?: unknown; message?: unknown}} | null
@@ -571,6 +570,7 @@ export class SessionController {
       soulLoading: this.soulLoading,
       soulConfirmed: this.soulConfirmed,
       soulLocked: this.soulLocked(),
+      recoveryPending: this.recoverySoulId !== null,
       connectionLocked: this.connectionLocked(),
       memuAvailable: this.memuAvailable,
       manualPhase: this.manualPhase,
@@ -1045,7 +1045,7 @@ export class SessionController {
       const bytes = approxBase64ByteLength(normalized)
       if (this.manualAudioBytes + bytes > MAX_MANUAL_AUDIO_BYTES) {
         this.manualPhase = "review"
-        this.lastError = MANUAL_LIMIT_MESSAGE
+        this.lastError ??= MANUAL_LIMIT_MESSAGE
         this.pushSnapshot()
         return
       }
@@ -1188,7 +1188,7 @@ export class SessionController {
     if (action === "talk") {
       if (this.manualPhase !== "idle") throw new Error("Manual recording is already active")
       this.clearManualAudio()
-      this.lastError = null
+      if (this.lastError === MANUAL_LIMIT_MESSAGE) this.lastError = null
       this.manualPhase = "recording"
     } else if (action === "done") {
       if (this.manualPhase !== "recording") throw new Error("No Manual recording is active")
@@ -1197,14 +1197,14 @@ export class SessionController {
     } else if (action === "redo") {
       if (this.manualPhase !== "review") throw new Error("Redo requires a recording in Review")
       this.clearManualAudio()
-      this.lastError = null
+      if (this.lastError === MANUAL_LIMIT_MESSAGE) this.lastError = null
       this.manualPhase = "recording"
     } else {
       if (this.manualPhase !== "review") throw new Error("Send requires a recording in Review")
       if (!this.liveController) throw new Error("Gemini controller is not available")
       this.liveController.sendActivity(this.manualAudio, this.manualMicSource)
       this.clearManualAudio()
-      this.lastError = null
+      if (this.lastError === MANUAL_LIMIT_MESSAGE) this.lastError = null
       this.manualPhase = "submitted"
       this.beginManualResponse()
     }
@@ -1221,6 +1221,7 @@ export class SessionController {
     resolvedIdentity?: {config: OpenAlmaConfig; souls: string[]},
   ): Promise<void> {
     let storedSoul: string | null = null
+    let installationReported = false
     try {
       let [storedProfile, microphone, camera, closingThoughts, savedSoul, journal, savedMaximum] = await Promise.all([
         this.session.storage.get(OPENALMA_PROFILE_KEY),
@@ -1276,6 +1277,7 @@ export class SessionController {
         }
         try {
           await reportInstallation({...config, soulId: this.soulId}, this.fetchFn, host)
+          installationReported = true
         } catch (error) {
           const reportError = error as Error & {status?: number; detail?: string}
           if (!(error instanceof Error) || reportError.status !== 409 || ![
@@ -1305,7 +1307,7 @@ export class SessionController {
     this.soulConfirmed = !this.installationPending() && Boolean(this.recoverySoulId || (storedSoul?.trim() && this.souls.includes(this.soulId)))
     this.soulLoading = false
     this.pushSnapshot()
-    await this.reportSelectedSoul()
+    if (!installationReported) await this.reportSelectedSoul()
   }
 
   private currentConfig(): OpenAlmaConfig {

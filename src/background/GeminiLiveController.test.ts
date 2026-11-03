@@ -1495,18 +1495,23 @@ describe("GeminiLiveController", () => {
     } finally { await h.controller.stop() }
   })
 
-  test.each([false, true])("Discard commits before cache deletion (commit fails=%s)", async fail => {
+  test.each(["none", "commit", "delete"])("Discard commits before cache deletion (failure=%s)", async failure => {
     const {storage, journal} = recoveryBackup({pendingTranscripts: [], draftTranscripts: [], resumption: null})
     const image = cachedSelection(storage)
     storage.values.set(JOURNAL_KEY, JSON.stringify({...journal, pendingImages: [image]}))
     const h = harness({storage})
     await start(h)
     try {
-      if (fail) storage.setGate = Promise.reject(new Error("Native timeout"))
-      await h.controller.discardImage(image.imageId)
+      if (failure === "commit") storage.setGate = Promise.reject(new Error("Native timeout"))
+      if (failure === "delete") storage.delete = async () => {throw new Error("Fictional cache deletion failed")}
+      const discard = h.controller.discardImage(image.imageId)
+      if (failure === "delete") {
+        await expect(discard).rejects.toThrow("Photo discarded; temporary original cleanup failed")
+        expect(h.persistenceErrors).not.toContain("Photo saved; temporary original cleanup failed")
+      } else await discard
       expect(h.controller.pendingImageIds).toEqual([])
-      expect(storage.values.has(image.selected.cacheKey)).toBe(fail)
-      if (fail) expect(h.persistenceErrors.at(-1)).toContain("may return")
+      expect(storage.values.has(image.selected.cacheKey)).toBe(failure !== "none")
+      if (failure === "commit") expect(h.persistenceErrors.at(-1)).toContain("may return")
     } finally { storage.setGate = null; await h.controller.stop() }
   })
 

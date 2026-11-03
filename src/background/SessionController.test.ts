@@ -1929,8 +1929,7 @@ describe("SessionController", () => {
       expect(JSON.parse(session.stored.get("openalma.connection-profile")!)).toEqual({...pending,
         baseUrl: "http://repaired.example", installationConfirmed: true})
       expect(reports[1]).toMatchObject({device_session_id: pending.deviceSessionId, installation_ticket: "ticket-repair"})
-      expect(reports[2]).toMatchObject({device_session_id: pending.deviceSessionId})
-      expect(reports[2]).not.toHaveProperty("installation_ticket")
+      expect(reports).toHaveLength(2)
       expect(lastSnapshot(session)).toMatchObject({memuAvailable: true, soulLocked: false})
     } finally {
       process.env.NODE_ENV = previous
@@ -2262,6 +2261,7 @@ describe("SessionController", () => {
         connectionProfile: {baseUrl: stale.baseUrl, userId: stale.userId, deviceSessionId: stale.deviceSessionId},
         soulId: recovering ? "Recovery Soul" : stale.soulId,
         soulLocked: recovering,
+        recoveryPending: recovering,
         connectionLocked: false,
         souls: [],
         memuAvailable: false,
@@ -2395,7 +2395,6 @@ describe("SessionController", () => {
     expect(JSON.parse(String(requests.at(-1)?.init?.body))).toEqual({
       soul_id: "Existing Soul",
       use_existing: true,
-      user_name: CONFIG.userId,
     })
     expect(requests.at(-1)?.init?.headers).toEqual({
       "Content-Type": "application/json",
@@ -2409,7 +2408,7 @@ describe("SessionController", () => {
     })
   })
 
-  test("creation uses the owner name for released servers without prompting or starting voice", async () => {
+  test("creation leaves the owner name to the server without prompting or starting voice", async () => {
     let body: unknown
     const h = setup({fetchFn: (async (_url: string, init?: RequestInit) => {
       if (!init?.method) return Response.json({souls: [CONFIG.soulId]})
@@ -2418,7 +2417,7 @@ describe("SessionController", () => {
     }) as typeof fetch})
     await expect(h.session.handlers["openalma:set-soul"]({soulId: "Fable", useExisting: false}))
       .resolves.toEqual({soulId: "Fable", created: true})
-    expect(body).toEqual({soul_id: "Fable", use_existing: false, user_name: CONFIG.userId})
+    expect(body).toEqual({soul_id: "Fable", use_existing: false})
     expect(h.configs).toEqual([])
     expect(h.session.stored.get("openalma.soul-id")).toBe("Fable")
   })
@@ -3205,6 +3204,7 @@ describe("SessionController", () => {
       soulLoading: true,
       soulConfirmed: false,
       soulLocked: true,
+      recoveryPending: false,
       connectionLocked: true,
       memuAvailable: null,
       manualPhase: "idle",
@@ -3405,6 +3405,26 @@ describe("SessionController", () => {
     await h.session.handlers["openalma:stop"]({})
   })
 
+  test.each(["Transcript sync failed; retrying", "Local transcript backup unavailable"])(
+    "Manual preserves %s through Talk, Redo and Send", async warning => {
+      const h = setup()
+      await h.session.handlers["openalma:start"]({mode: "manual"})
+      try {
+        h.live.persistence(warning)
+        for (const action of ["talk", "redo"] as const) {
+          h.session.handlers["openalma:manual-action"]({action})
+          expect(lastSnapshot(h.session)?.lastError).toBe(warning)
+          h.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000})
+          h.session.handlers["openalma:manual-action"]({action: "done"})
+        }
+        h.session.handlers["openalma:manual-action"]({action: "send"})
+        expect(lastSnapshot(h.session)?.lastError).toBe(warning)
+        h.live.persistence(null)
+        expect(lastSnapshot(h.session)?.lastError).toBeNull()
+      } finally { await h.session.handlers["openalma:stop"]({}) }
+    },
+  )
+
   test("Manual records, reviews, redoes, and sends only the replacement", async () => {
     const harness = setup({watchdogMs: 15})
     await harness.session.handlers["openalma:start"]({mode: "manual"})
@@ -3554,9 +3574,10 @@ describe("SessionController", () => {
     expect(lastSnapshot(harness.session)).toMatchObject({connection: "listening", manualPhase: "idle"})
   })
 
-  test("Manual recording uses a 120-second PCM byte bound and clears its warning on Send", async () => {
+  test.each([null, "Local transcript backup unavailable"])("Manual PCM limit preserves other warnings (%s)", async warning => {
     const harness = setup()
     await harness.session.handlers["openalma:start"]({mode: "manual"})
+    harness.live.persistence(warning)
     harness.session.handlers["openalma:manual-action"]({action: "talk"})
     harness.session.micHandler?.({
       data: Buffer.alloc(16000 * 2 * 120).toString("base64"),
@@ -3564,21 +3585,22 @@ describe("SessionController", () => {
       sampleRate: 16000,
       source: "glasses",
     })
-    expect(lastSnapshot(harness.session)).toMatchObject({manualPhase: "recording", lastError: null})
+    expect(lastSnapshot(harness.session)).toMatchObject({manualPhase: "recording", lastError: warning})
 
     harness.session.micHandler?.({data: testPcm(1), format: "pcm_s16le", sampleRate: 16000, source: "phone"})
     expect(lastSnapshot(harness.session)).toMatchObject({
       manualPhase: "review",
-      lastError: "Manual recording reached 120-second limit",
+      lastError: warning ?? "Manual recording reached 120-second limit",
     })
     harness.live.persistence(null)
     expect(lastSnapshot(harness.session)).toMatchObject({
       manualPhase: "review",
-      lastError: "Manual recording reached 120-second limit",
+      lastError: warning ? null : "Manual recording reached 120-second limit",
     })
     harness.session.handlers["openalma:manual-action"]({action: "send"})
     expect(lastSnapshot(harness.session)).toMatchObject({manualPhase: "submitted", lastError: null})
     expect(harness.live.activitySources).toEqual(["glasses"])
+    await harness.session.handlers["openalma:stop"]({})
   })
 
   test("tool boundary and interrupted abort cannot release Manual early", async () => {

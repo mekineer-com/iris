@@ -50,8 +50,8 @@ owner through the private-network `/integration/mentra/owner` contract; a
 saved profile whose user does not match that owner is kept for address repair,
 but Soul selection and Start refuse the mismatched owner.
 Existing soul suggestions come from
-`GET /integration/mentra/souls?user_id=...`. Selection or creation uses `POST`
-on the same route with `user_id`, `soul_id`, and `use_existing`. Only a 409
+`GET /integration/mentra/souls`. Selection or creation uses `POST`
+on the same route with `soul_id` and `use_existing`; the server supplies the saved owner name. Only a 409
 with `detail.reason: existing_exact` offers consent to reuse; sanitized-name
 collisions remain errors. Start waits for local preferences and discovery.
 A saved name missing from discovery requires explicit selection or creation.

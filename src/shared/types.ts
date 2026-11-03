@@ -76,6 +76,7 @@ export interface SessionSnapshot {
   soulLoading: boolean
   soulConfirmed: boolean
   soulLocked: boolean
+  recoveryPending: boolean
   connectionLocked: boolean
   memuAvailable: boolean | null
   manualPhase: ManualPhase

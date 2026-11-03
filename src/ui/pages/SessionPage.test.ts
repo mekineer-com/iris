@@ -724,6 +724,26 @@ describe("SessionPage state projection", () => {
     expect(calls.at(-1)).toEqual({channel: "openalma:set-soul", payload: {soulId: "Quill", useExisting: true}})
   })
 
+  test("Soul controls wait for discovery without claiming setup is an unfinished sitting", () => {
+    const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"], connection: "idle",
+      soulLocked: false, recoveryPending: false, memuAvailable: true}
+    const render = renderPage(snapshot, async () => ({ok: true}))
+    const input = () => nodes(render()).find(node => node.props?.onFocus)
+    input().props.onFocus()
+    expect(nodes(render()).some(node => node.props?.role === "listbox")).toBe(true)
+    snapshot.memuAvailable = false
+    expect(input().props.disabled).toBe(true)
+    expect(nodes(render()).find(node => node.props?.["aria-label"] === "Use soul").props.disabled).toBe(true)
+    expect(nodes(render()).some(node => node.props?.role === "listbox")).toBe(false)
+    for (const reason of ["loading", "selecting", "ticket", "sitting", "recovery"]) {
+      snapshot.soulLocked = true
+      snapshot.connection = reason === "sitting" ? "listening" : "idle"
+      snapshot.recoveryPending = reason === "recovery"
+      expect(JSON.stringify(render()).includes("Finish this sitting before changing souls."))
+        .toBe(reason === "sitting" || reason === "recovery")
+    }
+  })
+
   test("Stop projection overrides a pending Start", () => {
     expect(visibleConnection("idle", true, true)).toBe("stopping")
     expect(visibleConnection("error", true, false)).toBe("starting")

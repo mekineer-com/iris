@@ -228,7 +228,7 @@ export default function SessionPage() {
   const modelDisabled = active || stopping || modelSaving
   const displayedModel = (active || stopping) && snapshot?.model
     ? snapshot.model : snapshot?.configuredModel ?? "Model unavailable"
-  const soulLocked = snapshot?.soulLocked ?? true
+  const soulLocked = (snapshot?.soulLocked ?? true) || snapshot?.memuAvailable === false
   const connectionLocked = (snapshot?.connectionLocked ?? true) || active || stopping || soulPending
   const soulReady = !soulDirty && snapshot?.soulConfirmed && soulName.trim() === snapshot.soulId
   const knownSoul = snapshot?.souls.includes(soulName.trim()) ?? false
@@ -665,7 +665,7 @@ export default function SessionPage() {
                   setSoulMenuOpen(true)
                 }}
               />
-              {soulMenuOpen && snapshot?.souls.length ? (
+              {soulMenuOpen && !soulLocked && !soulPending && snapshot?.souls.length ? (
                 <span className="soul-options" role="listbox">
                   {snapshot.souls.map((soul) => (
                     <button key={soul} type="button" role="option" aria-selected={soul === soulName}
@@ -704,7 +704,7 @@ export default function SessionPage() {
             </button>
           </div>
         ) : null}
-        {soulLocked ? <p>Finish this sitting before changing souls.</p> : null}
+        {active || stopping || snapshot?.recoveryPending ? <p>Finish this sitting before changing souls.</p> : null}
       </section>
       <section className="controls" aria-label="Voice controls">
         <section className="mode-control" aria-label="Model">
