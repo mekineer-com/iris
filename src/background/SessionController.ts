@@ -285,7 +285,7 @@ export class SessionController {
     )
     this.unsubs.push(
       ui.handle("openalma:stop", async () => {
-        await this.stopSession("user")
+        await this.stopSession()
         return {ok: true as const}
       }),
     )
@@ -845,33 +845,32 @@ export class SessionController {
     }
   }
 
-  private async stopSession(_reason: "user" | "error"): Promise<void> {
+  private async stopSession(): Promise<void> {
     if (this.connection === "idle") return
     if (this.teardownPromise) {
-      if (_reason === "user" && this.teardownKind === "fail") {
+      if (this.teardownKind === "fail") {
         this.teardownKind = "stop"
         this.lastError = null
       }
       await this.teardownPromise
       return
     }
-    this.teardownKind = "stop"
-    this.teardownPromise = this.runTeardown().finally(() => {
-      this.clearStopPlaybackDeadline()
-      this.teardownPromise = null
-    })
-    await this.teardownPromise
+    await this.teardown("stop")
   }
 
   private async fail(error: unknown): Promise<void> {
     if (this.connection === "idle" || this.connection === "error" || this.teardownPromise) return
     this.lastError = error instanceof Error ? error.message : String(error)
-    this.teardownKind = "fail"
+    await this.teardown("fail")
+  }
+
+  private teardown(kind: "stop" | "fail"): Promise<void> {
+    this.teardownKind = kind
     this.teardownPromise = this.runTeardown().finally(() => {
       this.clearStopPlaybackDeadline()
       this.teardownPromise = null
     })
-    await this.teardownPromise
+    return this.teardownPromise
   }
 
   private async runTeardown(): Promise<void> {

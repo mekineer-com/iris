@@ -182,6 +182,8 @@ writer is settled). Neither late completion nor a later visibility change may
 reopen an expired budget or affect the next sitting. Actual reflection text
 available at expiry is retained through `sitting_summary`, without the
 transcript-only `status` field.
+Arriving reflection text is backed up as an unsequenced `sitting_summary` draft,
+not dialogue, even without playback; recovery keeps its original sitting IDs.
 Continuous Stop flushes existing
 audio with 1.8 seconds of real-time-paced silence and `audioStreamEnd`, then
 waits for the preceding response's native completion before a new photo

@@ -223,9 +223,9 @@ export default function SessionPage() {
   const reconnecting = visible === "reconnecting"
   const active = starting || reconnecting || visible === "listening" || visible === "speaking"
   const videoCall = callMode === "video" && (active || stopping)
-  const modeDisabled = active || stopping || startPending || stopPending || modePending
+  const modeDisabled = active || stopping || modePending
   const modelSaving = modelPending || snapshot?.modelSaving === true
-  const modelDisabled = active || stopping || startPending || stopPending || modelSaving
+  const modelDisabled = active || stopping || modelSaving
   const displayedModel = (active || stopping) && snapshot?.model
     ? snapshot.model : snapshot?.configuredModel ?? "Model unavailable"
   const soulLocked = snapshot?.soulLocked ?? true
@@ -577,8 +577,8 @@ export default function SessionPage() {
       ? "Cancel"
       : "Stop"
   const soulSubmitted = soulReady || pendingNewSoul === soulName.trim()
-  const sittingDisabled = stopping || stopPending || modePending || soulPending || snapshot?.soulLoading !== false ||
-    (!active && (startPending || modelSaving || maxPhotosPending || !soulSubmitted))
+  const sittingDisabled = stopping || modePending || soulPending || snapshot?.soulLoading !== false ||
+    (!active && (modelSaving || maxPhotosPending || !soulSubmitted))
   const showSpinner = starting || reconnecting || stopping
   const manualDisabled = manualPending || visible === "speaking"
   const voiceReady = visible === "listening" || visible === "speaking"

@@ -461,7 +461,7 @@ export class GeminiLiveController {
       return {retained: true, delivery: "not-sent"}
     }
     if (this.pendingImages.some(image => image.imageId === frame.imageId)) throw new Error("Frame reference is already in use")
-    if (!allowNew || !this.ready || this.reconnecting || this.goAwayPending || this.stopping || this.stopPromise ||
+    if (!allowNew || !this.ready || this.reconnecting || this.goAwayPending || this.stopping ||
         this.reflecting || this.outputMuted || this.errorReported || this.activityPauseReason || this.socket?.readyState !== WS_OPEN) {
       return {retained: false, delivery: "not-sent", reason: "unavailable"}
     }
@@ -552,7 +552,7 @@ export class GeminiLiveController {
 
   // Opportunity only: vision activation, cadence and catch-up ownership remain separate.
   get frameDeliveryOpen(): boolean {
-    return this.ready && !this.stopping && !this.stopPromise && !this.outputMuted && !this.errorReported &&
+    return this.ready && !this.stopping && !this.outputMuted && !this.errorReported &&
       !this.reconnecting && !this.goAwayPending && !this.reflecting && !this.activityPauseReason &&
       !this.photoJob && !this.imageUpload && !this.imageFinalization && !this.imageRetrying &&
       !this.pendingImages.some(image => !image.retryRequested) &&
@@ -762,7 +762,7 @@ export class GeminiLiveController {
     this.requestSpokenPhotoDescription()
     if (this.selectionDemand(true)) this.invitationPending = true
     if (this.draining && Date.now() >= this.drainDeadlineAt) { this.refreshStopDeadline(); return }
-    if (!this.invitationPending || this.handlingMessage || !this.ready || this.stopping || (this.stopPromise && !this.draining) || (this.outputMuted && !this.draining) ||
+    if (!this.invitationPending || this.handlingMessage || !this.ready || (this.outputMuted && !this.draining) ||
         this.reconnecting || this.goAwayPending || this.reflecting || this.activityPauseReason ||
         this.voiceActive || this.turnActive || this.toolBatch.started || (this.spokenRequest && !this.spokenRequest.retired) || this.photoJob ||
         this.imageUpload || this.imageFinalization || (this.draining && !this.drainInputFlushed) ||
@@ -1083,8 +1083,8 @@ export class GeminiLiveController {
 
   private dispatchPhotoWork(): void {
     if (this.draining && Date.now() >= this.drainDeadlineAt) { this.refreshStopDeadline(); return }
-    if (!this.ready || this.stopping || this.reflecting || this.activityPauseReason || this.imageRetrying || (this.outputMuted && !this.draining) ||
-        (this.stopPromise && !this.draining) || (this.draining && !this.drainInputFlushed)) return
+    if (!this.ready || this.reflecting || this.activityPauseReason || this.imageRetrying || (this.outputMuted && !this.draining) ||
+        (this.draining && !this.drainInputFlushed)) return
     while (true) {
       const ready = [...this.pendingToolCalls].find(([id, call]) => id !== this.photoJob?.callId && call.name === "nothing_to_add" &&
         call.dispatched && call.response === undefined)
@@ -1297,14 +1297,13 @@ export class GeminiLiveController {
       const drainAttempted = graceful && Boolean(
         this.selectionDemand() || this.imageUpload || this.pendingImages.some(image => !image.retryRequested) ||
         this.photoJob || this.toolBatch.photo || (this.toolBatch.started && (this.toolBatch.background || this.thinking)))
-      const stoppedMidTurn = this.turnActive && (!this.toolBatch.invitation || this.turnAudioDelivered ||
-        Boolean(this.spokenRequest && !this.spokenRequest.retired))
+      const stoppedMidTurn = this.turnActive && (!this.toolBatch.invitation || this.turnAudioDelivered)
       if (drainAttempted) await this.drainPhoto()
       if (stoppedMidTurn || this.outputTranscript.trim()) {
         this.finalizeInterruptedTurn()
         this.interruptionFinalized = false
       }
-      if (graceful && (!drainAttempted || !this.pendingImages.some(image => !image.retryRequested)) && !this.toolBatch.started && !this.toolBatch.photo &&
+      if (graceful && !this.toolBatch.started && !this.toolBatch.photo &&
           !this.activityPauseReason && !stoppedMidTurn && this.ready && this.completeUserTurns >= 2) {
         trace("provider.reflection.begin")
         const reflection = await this.requestReflection()
@@ -1328,7 +1327,9 @@ export class GeminiLiveController {
       if (this.pendingEvents.length) {
         this.callbacks.onPersistenceError(!this.storage || this.journalUnavailable
           ? "Transcript sync failed; local transcript backup unavailable"
-          : "Transcript sync failed; pending turns remain saved on this device")
+          : this.stopExpired()
+            ? "Pending turns saved on this device; they will sync at the next Start"
+            : "Transcript sync failed; pending turns remain saved on this device")
       }
     } catch (error) {
       this.persistenceFatal = true
@@ -1777,6 +1778,7 @@ export class GeminiLiveController {
 
     if (this.reflecting) {
       this.outputTranscript += output
+      if (output) void this.persistJournal()
       if (interrupted) {
         trace("provider.reflection.interrupted")
         this.callbacks.onInterrupted()
@@ -3116,7 +3118,7 @@ export class GeminiLiveController {
   private persistJournal(): Promise<boolean> {
     if (!this.journalOwner || !this.journalLoaded || !this.journalOwner.active(this.journalProducer)) return Promise.resolve(false)
     const empty = !this.resumptionHandle && !this.pendingEvents.length && !this.draftEvents.length && !this.pendingImages.length &&
-      !(!this.reflecting && this.turnAudioDelivered && this.outputTranscript.trim())
+      !((this.reflecting || this.turnAudioDelivered) && this.outputTranscript.trim())
     const write = this.journalOwner.write(empty ? "" : this.journalSnapshot(), this.journalProducer).then(saved => {
       if (!this.journalOwner!.active(this.journalProducer)) return false
       this.journalUnavailable = !saved
@@ -3128,6 +3130,9 @@ export class GeminiLiveController {
 
   private journalSnapshot(): string {
     const drafts = [...this.draftEvents]
+    if (this.reflecting && this.outputTranscript.trim() && this.outputTranscript.trim() !== "NO_SUMMARY") {
+      drafts.push({event_kind: "sitting_summary", role: "assistant", content: this.outputTranscript.trim()})
+    }
     // Snapshot the live reply without sequencing it or adding a second mutable draft.
     if (!this.reflecting && this.turnAudioDelivered && this.outputTranscript.trim()) {
       const photo = drafts.findIndex(event => event.event_kind === "image" || event.event_kind === "photo_caption")
@@ -3171,8 +3176,6 @@ export class GeminiLiveController {
   }
 
   private requestReflection(): Promise<string | null> {
-    const deadline = this.callbacks.getStopDeadline?.()
-    if (deadline !== null && deadline !== undefined && deadline <= Date.now()) return Promise.resolve(null)
     this.reflecting = true
     this.clearTurn()
     return new Promise((resolve) => {

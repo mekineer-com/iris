@@ -2458,7 +2458,9 @@ describe("GeminiLiveController", () => {
         modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]}}})
       h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "reflection-handle"}})
       await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").resumption?.handle === "reflection-handle")
-      expect(storage.values.get(JOURNAL_KEY)).not.toContain("I enjoyed our fictional walk")
+      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).draftTranscripts).toContainEqual({
+        event_kind: "sitting_summary", role: "assistant", content: "I enjoyed our fictional walk",
+      })
       if (expiry === "shared") {
         deadline = Date.now() - 1
         h.controller.refreshStopDeadline()
@@ -2470,9 +2472,49 @@ describe("GeminiLiveController", () => {
       expect(summaries).toHaveLength(1)
       expect(summaries[0]).toMatchObject({role: "assistant", content: "I enjoyed our fictional walk"})
       expect(summaries[0]).not.toHaveProperty("status")
+      if (expiry === "shared") expect(h.persistenceErrors.at(-1))
+        .toBe("Pending turns saved on this device; they will sync at the next Start")
       expect(h.errors).toEqual([])
     } finally { deadline = Date.now() - 1; h.controller.refreshStopDeadline(); await stopping }
   }, 15_000)
+
+  test.each([LIVE, THINKING])("a killed %s reflection recovers once as a summary, not dialogue", async model => {
+    let deadline = Date.now() + 30_000
+    const storage = new FakeStorage()
+    const old = harness({storage, getStopDeadline: () => deadline})
+    await start(old, "continuous", "", model)
+    completeTurn(old, "First fictional question.", "First answer.")
+    completeTurn(old, "Second fictional question.", "Second answer.")
+    const stopping = old.controller.stop(true)
+    try {
+      await waitFor(() => old.sockets[0].sent.some(value => value.includes("Reflect briefly")))
+      old.sockets[0].message({serverContent: {outputTranscription: {text: "A fictional reflection"}}})
+      old.sockets[0].message({serverContent: {outputTranscription: {text: " received so far."}}})
+      await waitFor(() => JSON.parse(storage.values.get(JOURNAL_KEY) || "{}").draftTranscripts?.at(-1)?.content ===
+        "A fictional reflection received so far.")
+      // A killed process cannot run completion, timeout or Stop cleanup.
+      const restored = new FakeStorage()
+      restored.values.set(JOURNAL_KEY, storage.values.get(JOURNAL_KEY)!)
+      const next = harness({storage: restored})
+      try {
+        await start(next)
+        const recovery = next.requests.find(request => request.url.endsWith("/session/start"))!.body.recovery
+        expect(recovery.sitting_id).toBe("sitting-1")
+        expect(recovery.events.filter((event: any) => event.event_kind === "sitting_summary")).toEqual([{
+          event_id: "sitting-1:45", sequence: 45, event_kind: "sitting_summary", role: "assistant",
+          content: "A fictional reflection received so far.",
+        }])
+        expect(recovery.events.filter((event: any) => event.event_kind === "transcript")
+          .some((event: any) => event.content.includes("reflection"))).toBe(false)
+        expect(next.requests.some(request => request.url.endsWith("/transcripts/append"))).toBe(false)
+        expect(next.errors).toEqual([])
+      } finally { await next.controller.stop() }
+    } finally {
+      deadline = Date.now() - 1
+      old.controller.refreshStopDeadline()
+      await stopping
+    }
+  })
 
   test.each(["Snapshot image id conflicts", "Soul is paused"])("only a confirmed original conflict permits a new reference (%s)", async detail => {
     const h = harness({storage: new FakeStorage(), snapshotResponse: Response.json({detail}, {status: 409})})
@@ -8710,7 +8752,8 @@ describe("GeminiLiveController", () => {
   })
 
   test("graceful Stop may speak NO_SUMMARY without persisting it", async () => {
-    const h = harness()
+    const storage = new FakeStorage()
+    const h = harness({storage})
     await start(h)
     completeTurn(h, "one", "answer one")
     completeTurn(h, "two", "answer two")
@@ -8718,13 +8761,16 @@ describe("GeminiLiveController", () => {
 
     const stopping = h.controller.stop(true)
     await waitFor(() => h.sockets[0].sent.some((value) => textTurn(JSON.parse(value))))
+    const writes = storage.setCalls
     h.sockets[0].message({
       serverContent: {
         modelTurn: {parts: [{inlineData: {data: "AAAAAA=="}}]},
         outputTranscription: {text: "NO_SUMMARY"},
-        turnComplete: true,
       },
     })
+    await waitFor(() => storage.setCalls > writes)
+    expect(storage.values.get(JOURNAL_KEY)).not.toContain("NO_SUMMARY")
+    h.sockets[0].message({serverContent: {turnComplete: true}})
     await stopping
 
     const events = h.requests
