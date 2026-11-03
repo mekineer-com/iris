@@ -4,16 +4,9 @@ import type {Channels} from "../../shared/channels"
 import {VISION_SETTINGS as settings, type SessionSnapshot} from "../../shared/types"
 import {formatImageTimestamp} from "../../shared/imageReference"
 import {compareSamples, type FrameSample} from "../../shared/frameComparison"
-import {PhoneCamera, cameraShouldRun} from "../phoneCamera"
+import {PhoneCamera, cameraShouldRun, jpeg} from "../phoneCamera"
 import {stampImage} from "../stampImage"
 import {renderCatchUpCollage} from "../catchUpCollage"
-
-function jpeg(canvas: HTMLCanvasElement): string {
-  const data = canvas.toDataURL("image/jpeg", settings.jpegQuality)
-  const prefix = "data:image/jpeg;base64,"
-  if (!data.startsWith(prefix) || data.length === prefix.length) throw new Error("Camera produced no JPEG")
-  return data.slice(prefix.length)
-}
 
 const message = (error: unknown) => error instanceof Error ? error.message : String(error)
 const canceled = (error: unknown) => !!error && typeof error === "object" && "name" in error && error.name === "AbortError"
@@ -66,10 +59,10 @@ export function usePhoneVision(snapshot: SessionSnapshot | undefined, foreground
         snapshot.startGeneration === generation && snapshot.callMode === "video" &&
         snapshot.cameraEnabled && connected(snapshot)
     }
-    const camera = new PhoneCamera(videoRef.current, reason => {
+    const camera = new PhoneCamera(videoRef.current, () => {
       if (ownerRef.current !== owner) return
       stop()
-      if (reason !== "stopped") setError("Camera stopped. Turn Camera enabled off and on to retry.")
+      setError("Camera stopped. Turn Camera enabled off and on to retry.")
     })
     cameraRef.current = camera
     const sample = async () => {
@@ -77,13 +70,13 @@ export function usePhoneVision(snapshot: SessionSnapshot | undefined, foreground
       busy = true
       try {
         const video = videoRef.current!
-        const maxWidth = Math.min(video.videoWidth, Math.floor(settings.maxWidth * video.videoWidth /
-          Math.max(video.videoWidth, video.videoHeight)))
+        const maxWidth = Math.floor(settings.maxWidth * video.videoWidth /
+          Math.max(video.videoWidth, video.videoHeight))
         const frame = camera.sample({...settings, maxWidth})
         if (!frame) return
         const refreshRequest = refresh.current
         const difference = baseline ? compareSamples(baseline, frame) : null
-        if (difference && difference.wholeMean === 0 && difference.peakBlockMean === 0 &&
+        if (difference && difference.wholeMean === 0 &&
             !(refresh.current && latest.current.snapshot?.frameDeliveryOpen)) return
         const time = {timestamp: formatImageTimestamp(frame.receivedAt), source: "receipt" as const,
           receivedAt: frame.receivedAt}
@@ -91,7 +84,7 @@ export function usePhoneVision(snapshot: SessionSnapshot | undefined, foreground
         if (!current() || reference.startGeneration !== generation) return
         // Sampling is serial; deliberate stills use another canvas while this one awaits reservation.
         const model = stampImage(frame.canvas, reference.imageId, settings.maxWidth)
-        const modelData = jpeg(model)
+        const modelData = jpeg(model, settings.jpegQuality)
         model.width = model.height = 0
         const result = await intake({...reference, time,
           mimeType: frame.mimeType, data: frame.data, modelData}, {timeout: settings.capturePeriodMs})
@@ -112,8 +105,8 @@ export function usePhoneVision(snapshot: SessionSnapshot | undefined, foreground
     void camera.start().then(started => {
       if (!alive || ownerRef.current !== owner || !started) return
       setReady(true)
-      void sample()
       timerRef.current = setInterval(() => void sample(), settings.capturePeriodMs)
+      void sample()
     }).catch(error => {if (alive) setError(message(error))})
     return () => {alive = false; stop()}
   }, [run, generation, reserve, intake, stop])
@@ -150,7 +143,7 @@ export function usePhoneVision(snapshot: SessionSnapshot | undefined, foreground
         }
         const canvas = renderCatchUpCollage(decoded, {width: settings.collageWidth,
           height: settings.collageHeight, columns: settings.collageColumns, gap: settings.collageGap})
-        const data = jpeg(canvas)
+        const data = jpeg(canvas, settings.jpegQuality)
         canvas.width = canvas.height = 0
         if (!current()) return
         submitted = true

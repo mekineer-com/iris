@@ -20,7 +20,7 @@ export interface CameraSample extends FrameSample {
   receivedAt: number
 }
 
-export type PhoneCameraStopReason = "stopped" | "ended" | "error"
+export type PhoneCameraStopReason = "ended" | "error"
 
 export interface CameraSampleOptions {
   maxWidth: number
@@ -29,10 +29,16 @@ export interface CameraSampleOptions {
   comparisonHeight: number
 }
 
+export function jpeg(canvas: HTMLCanvasElement, quality: number): string {
+  const data = canvas.toDataURL("image/jpeg", quality)
+  const prefix = "data:image/jpeg;base64,"
+  if (!data.startsWith(prefix) || data.length === prefix.length) throw new Error("Camera produced no JPEG")
+  return data.slice(prefix.length)
+}
+
 // Adapted from the tested phone-camera-probe. The caller owns cadence, naming and delivery.
 export class PhoneCamera {
   private generation = 0
-  private starting = false
   private stream: MediaStream | null = null
   private ended: (() => void) | null = null
   private readonly canvas: HTMLCanvasElement
@@ -53,7 +59,6 @@ export class PhoneCamera {
   // False means this attempt was canceled/superseded; actual startup failures reject.
   async start(): Promise<boolean> {
     this.release()
-    this.starting = true
     const owner = this.generation
     try {
       const stream = await this.mediaDevices.getUserMedia({audio: false,
@@ -72,8 +77,6 @@ export class PhoneCamera {
       if (owner !== this.generation) return false
       this.stop("error")
       throw error
-    } finally {
-      if (owner === this.generation) this.starting = false
     }
   }
 
@@ -98,10 +101,7 @@ export class PhoneCamera {
         rgb[pixel * 3 + 1] = rgba[pixel * 4 + 1]
         rgb[pixel * 3 + 2] = rgba[pixel * 4 + 2]
       }
-      const dataUrl = this.canvas.toDataURL("image/jpeg", options.jpegQuality)
-      const prefix = "data:image/jpeg;base64,"
-      if (!dataUrl.startsWith(prefix) || dataUrl.length === prefix.length) throw new Error("Camera produced no JPEG")
-      return {canvas: this.canvas, mimeType: "image/jpeg", data: dataUrl.slice(prefix.length),
+      return {canvas: this.canvas, mimeType: "image/jpeg", data: jpeg(this.canvas, options.jpegQuality),
         width: this.canvas.width, height: this.canvas.height, receivedAt,
         comparison: {width: options.comparisonWidth, height: options.comparisonHeight, data: rgb}}
     } catch (error) {
@@ -110,9 +110,7 @@ export class PhoneCamera {
     }
   }
 
-  private release(): boolean {
-    const active = this.starting || this.stream !== null
-    this.starting = false
+  private release(): void {
     this.generation++
     const stream = this.stream
     const ended = this.ended
@@ -123,10 +121,10 @@ export class PhoneCamera {
       stream.getTracks().forEach(track => track.stop())
     }
     this.video.srcObject = null
-    return active
   }
 
-  stop(reason: PhoneCameraStopReason = "stopped"): void {
-    if (this.release()) this.onStopped(reason)
+  stop(reason?: PhoneCameraStopReason): void {
+    this.release()
+    if (reason) this.onStopped(reason)
   }
 }

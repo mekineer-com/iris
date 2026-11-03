@@ -94,17 +94,14 @@ test("rotation resets comparison even when the normalized thumbnail is unchanged
   h.camera.stop()
 })
 
-test("stopped notification follows resource release and is emitted only once", async () => {
+test("explicit Stop releases the camera without an unsolicited failure notification", async () => {
   const h = harness()
-  h.onStopped.mockImplementation(() => {
-    expect(h.video.srcObject).toBeNull()
-    expect(h.active.track.readyState).toBe("ended")
-  })
   await h.camera.start()
   h.camera.stop()
   h.camera.stop()
-  expect(h.onStopped).toHaveBeenCalledTimes(1)
-  expect(h.onStopped).toHaveBeenCalledWith("stopped")
+  expect(h.video.srcObject).toBeNull()
+  expect(h.active.track.stop).toHaveBeenCalledTimes(1)
+  expect(h.onStopped).not.toHaveBeenCalled()
 })
 
 test("permission refusal leaves no active camera and reports the error", async () => {
@@ -123,8 +120,7 @@ test("stop during permission wait closes the late stream", async () => {
   expect(await starting).toBe(false)
   expect(h.active.track.stop).toHaveBeenCalledTimes(1)
   expect(h.video.srcObject).toBeNull()
-  expect(h.onStopped).toHaveBeenCalledTimes(1)
-  expect(h.onStopped).toHaveBeenCalledWith("stopped")
+  expect(h.onStopped).not.toHaveBeenCalled()
   h.camera.stop()
 })
 
