@@ -3582,8 +3582,8 @@ describe("GeminiLiveController", () => {
     }
   })
 
-  test("background-only recall stays SILENT without inventing a spoken request", async () => {
-    const h = harness()
+  test.each([undefined, 123, "unused"])("background-only recall ignores unused timing metadata (timing=%s)", async timing => {
+    const h = harness({recallBody: {ok: true, context: "A compact fictional memory.", retrieve_ms: timing}})
     await start(h)
     try {
       h.sockets[0].message({toolCall: {functionCalls: [
@@ -9554,7 +9554,7 @@ describe("GeminiLiveController", () => {
   test("heartbeat clears a background image-memory failure without hiding failed speech sync", async () => {
     const message = "Photo memory processing failed; the original remains saved."
     const heartbeatBody: {ok: boolean; background_error?: string} = {ok: true, background_error: message}
-    const h = harness({heartbeatMs: 60_000, heartbeatBody, appendStatuses: [503]})
+    const h = harness({heartbeatMs: 60_000, heartbeatBody, appendStatuses: [503, 503]})
     await start(h)
     const heartbeat = () => Reflect.get(h.controller, "heartbeat").call(h.controller)
     await heartbeat()
@@ -9569,10 +9569,65 @@ describe("GeminiLiveController", () => {
     await waitFor(() => h.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
     delete heartbeatBody.background_error
     await heartbeat()
+    await Reflect.get(h.controller, "appendTail")
     expect(h.persistenceErrors.at(-1)).toBe("Transcript sync failed; retrying")
     completeTurn(h)
     await waitFor(() => h.persistenceErrors.at(-1) === null)
     await h.controller.stop()
+  })
+
+  test.each(["network", "server", "body"] as const)("healthy heartbeat retries a %s append failure without another turn", async failure => {
+    const options = {storage: new FakeStorage(), heartbeatMs: 60_000,
+      appendStatuses: failure === "server" ? [503] : [], appendAckLost: failure === "network",
+      stalledBodyPath: failure === "body" ? "/transcripts/append" : undefined, bodyTransportFailure: true}
+    const h = harness(options)
+    await start(h)
+    try {
+      completeTurn(h, "A fictional question.", "A fictional answer.")
+      await waitFor(() => h.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
+      const first = h.requests.find(request => request.url.endsWith("/transcripts/append"))!.body.events
+      options.appendAckLost = false
+      options.stalledBodyPath = undefined
+      await Reflect.get(h.controller, "heartbeat").call(h.controller)
+      await Reflect.get(h.controller, "appendTail")
+      expect(h.requests.filter(request => request.url.endsWith("/transcripts/append")).map(request => request.body.events))
+        .toEqual([first, first])
+      expect(h.persistenceErrors.at(-1)).toBeNull()
+      expect(h.errors).toEqual([])
+      await Reflect.get(h.controller, "heartbeat").call(h.controller)
+      await Reflect.get(h.controller, "appendTail")
+      expect(h.requests.filter(request => request.url.endsWith("/transcripts/append"))).toHaveLength(2)
+    } finally { await h.controller.stop() }
+  })
+
+  test.each(["pause", "photo"] as const)("heartbeat transcript recovery preserves the current %s warning", async warning => {
+    const heartbeatBody = warning === "pause" ? {ok: true, pause_reason: "Fictional failed memory work"}
+      : {ok: true, background_error: "Photo memory processing failed; the original remains saved."}
+    const h = harness({storage: new FakeStorage(), heartbeatMs: 60_000, heartbeatBody, appendStatuses: [503]})
+    await start(h)
+    try {
+      completeTurn(h)
+      await waitFor(() => h.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
+      await Reflect.get(h.controller, "heartbeat").call(h.controller)
+      await Reflect.get(h.controller, "appendTail")
+      expect(h.requests.filter(request => request.url.endsWith("/transcripts/append"))).toHaveLength(2)
+      expect(h.persistenceErrors.at(-1)).toBe(warning === "pause"
+        ? `${CONFIG.soulId} is paused. Retry in OpenAlma launcher.` : heartbeatBody.background_error)
+      expect(h.errors).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
+  test("heartbeat cannot start transcript recovery after the initial Stop mute", async () => {
+    const h = harness({storage: new FakeStorage(), heartbeatMs: 60_000, appendStatuses: [503]})
+    await start(h)
+    try {
+      completeTurn(h)
+      await waitFor(() => h.persistenceErrors.at(-1) === "Transcript sync failed; retrying")
+      h.controller.muteForStop()
+      await Reflect.get(h.controller, "heartbeat").call(h.controller)
+      await Reflect.get(h.controller, "appendTail")
+      expect(h.requests.filter(request => request.url.endsWith("/transcripts/append"))).toHaveLength(1)
+    } finally { await h.controller.stop() }
   })
 
   test("pause blocks new input without cutting output and heartbeat recovery unblocks it", async () => {

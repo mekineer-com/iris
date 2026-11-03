@@ -383,6 +383,8 @@ Offline source checks are not live-provider/phone qualification of Thinking.
   `mentra_recovery_conflict` or422 on a recovery Start preserves/warns and
   retries once without recovery; another422 fails normally. Photo originals,
   stable filing receipts and original times retain independent recovery.
+- Successful heartbeats retry pending transcripts outside Stop without clearing
+  current pause/photo-filing warnings.
 - Phone-storage failure warns but never disables server transcript saving or
   imposes a new Start blockade. Freeze/retirement writes use the existing
   journal tail; a failed write moves subsequent writes to a fresh key, retaining

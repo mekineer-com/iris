@@ -2057,7 +2057,7 @@ export class GeminiLiveController {
       this.completeToolCall(id, pending, "Memory recall is temporarily unavailable.", true)
       return
     }
-    let body: {context?: unknown; retrieve_ms?: unknown} | null
+    let body: {context?: unknown} | null
     try {
       body = await response.json()
     } catch (error) {
@@ -2070,9 +2070,7 @@ export class GeminiLiveController {
     if (
       !body ||
       typeof body.context !== "string" ||
-      !body.context.trim() ||
-      (body.retrieve_ms !== null && body.retrieve_ms !== undefined &&
-        (typeof body.retrieve_ms !== "number" || !Number.isFinite(body.retrieve_ms)))
+      !body.context.trim()
     ) {
       this.failToolCall(id, pending, "OpenAlma memory recall returned an invalid response")
       return
@@ -2663,7 +2661,7 @@ export class GeminiLiveController {
   }
 
   private clearPersistenceErrorIfSynced(): void {
-    if (!this.ownsJournal()) return
+    if (!this.ownsJournal() || this.activityPauseReason || this.backgroundImageErrorVisible) return
     if (!this.pendingEvents.length && !this.missingSpeech && !this.journalUnavailable &&
         !this.pendingImages.some(image => image.retryRequested)) this.callbacks.onPersistenceError(null)
   }
@@ -3420,6 +3418,7 @@ export class GeminiLiveController {
           this.clearPersistenceErrorIfSynced()
         }
         this.resumeBackgroundWork()
+        if (this.pendingEvents.length && !this.outputMuted && !this.persistenceFatal) this.scheduleAppend()
       }
     } catch (error) {
       if (!this.reconnectOwned(generation, sessionId)) return
