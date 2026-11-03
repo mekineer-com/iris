@@ -64,7 +64,6 @@ type PendingImage = {
   mediaRef: string
   providerSent: boolean
   captionRequested?: boolean
-  generation: number
   sessionId: string
   imageSequence?: number
   caption?: string
@@ -765,7 +764,7 @@ export class GeminiLiveController {
     if (this.draining && Date.now() >= this.drainDeadlineAt) { this.refreshStopDeadline(); return }
     if (!this.invitationPending || this.handlingMessage || !this.ready || this.stopping || (this.stopPromise && !this.draining) || (this.outputMuted && !this.draining) ||
         this.reconnecting || this.goAwayPending || this.reflecting || this.activityPauseReason ||
-        this.voiceActive || this.turnActive || this.toolBatch.started || this.spokenRequest || this.photoJob ||
+        this.voiceActive || this.turnActive || this.toolBatch.started || (this.spokenRequest && !this.spokenRequest.retired) || this.photoJob ||
         this.imageUpload || this.imageFinalization || (this.draining && !this.drainInputFlushed) ||
         (!this.draining && this.callbacks.canInvite?.() === false) ||
         !this.socket || this.socket.readyState !== WS_OPEN) return
@@ -854,7 +853,7 @@ export class GeminiLiveController {
     if (pendingBeforeUpload?.providerSent) return
     const pending: PendingImage = pendingBeforeUpload ?? {
       imageId: image.imageId, mediaRef: "", providerSent: false, captionRequested: false,
-      generation, sessionId, ...(image.time ? {time: image.time} : {}),
+      sessionId, ...(image.time ? {time: image.time} : {}),
     }
     pending.speakDescription = image.speakDescription === true
     pending.retryRequested = true
@@ -896,7 +895,6 @@ export class GeminiLiveController {
 
     if (pending.mediaRef && pending.mediaRef !== mediaRef) throw new Error("OpenAlma snapshot media reference changed")
     pending.mediaRef = mediaRef
-    pending.generation = this.generation
     pending.sessionId = this.sessionId
     await this.persistJournal()
     if (this.journalUnavailable) throw new Error("Local image journal unavailable")
@@ -1116,7 +1114,7 @@ export class GeminiLiveController {
           [...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption" && call.response === undefined)) return
       if (!image) {
         if (this.selectionDemand() && !this.imageUpload && (this.draining ||
-            (!this.voiceActive && !this.turnActive && !this.spokenRequest && this.callbacks.canInvite?.() !== false))) {
+            (!this.voiceActive && !this.turnActive && (!this.spokenRequest || this.spokenRequest.retired) && this.callbacks.canInvite?.() !== false))) {
           this.dispatchSelection(id, call)
           return
         }
@@ -1298,7 +1296,7 @@ export class GeminiLiveController {
       this.flushToolResponses()
       const drainAttempted = graceful && Boolean(
         this.selectionDemand() || this.imageUpload || this.pendingImages.some(image => !image.retryRequested) ||
-        this.photoJob || (this.toolBatch.started && (this.toolBatch.background || this.thinking)))
+        this.photoJob || this.toolBatch.photo || (this.toolBatch.started && (this.toolBatch.background || this.thinking)))
       const stoppedMidTurn = this.turnActive && (!this.toolBatch.invitation || this.turnAudioDelivered ||
         Boolean(this.spokenRequest && !this.spokenRequest.retired))
       if (drainAttempted) await this.drainPhoto()
@@ -1306,7 +1304,7 @@ export class GeminiLiveController {
         this.finalizeInterruptedTurn()
         this.interruptionFinalized = false
       }
-      if (graceful && (!drainAttempted || !this.pendingImages.some(image => !image.retryRequested)) && !this.toolBatch.started &&
+      if (graceful && (!drainAttempted || !this.pendingImages.some(image => !image.retryRequested)) && !this.toolBatch.started && !this.toolBatch.photo &&
           !this.activityPauseReason && !stoppedMidTurn && this.ready && this.completeUserTurns >= 2) {
         trace("provider.reflection.begin")
         const reflection = await this.requestReflection()
@@ -1436,16 +1434,17 @@ export class GeminiLiveController {
       this.clearPhotoJob()
       this.drainResolve?.()
       this.drainResolve = null
-      if (this.pendingImages.length) {
+      const unfinished = this.pendingImages.filter(image => !image.retryRequested)
+      if (unfinished.length) {
         console.error("[OpenAlma] Photo caption drain ended before durable handoff; retaining pending work")
-        for (const image of this.pendingImages) await this.awaitStopWork(this.requestPhotoRetry(image))
+        for (const image of unfinished) await this.awaitStopWork(this.requestPhotoRetry(image))
       }
     }
   }
 
   private finishPhotoDrainIfAcknowledged(): void {
     if (!this.selectionDemand() && !this.pendingImages.some(image => !image.retryRequested) && !this.imageFinalization &&
-        !this.toolBatch.started && !this.turnActive && !this.photoJob && !this.imageUpload &&
+        !this.toolBatch.started && !this.toolBatch.photo && !this.turnActive && !this.photoJob && !this.imageUpload &&
         ![...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption")) {
       this.drainResolve?.()
     }
@@ -2102,7 +2101,7 @@ export class GeminiLiveController {
         this.chosenIds.add(imageId)
         const cacheKey = this.selectedCacheKey(imageId)
         const image: PendingImage = {imageId, mediaRef: "", caption, time: {...frame.time},
-          captionEventId: `${this.sessionId}:photo:${imageId}`, providerSent: false, generation: this.generation,
+          captionEventId: `${this.sessionId}:photo:${imageId}`, providerSent: false,
           sessionId: this.sessionId, selected: {cacheKey, mimeType: frame.mimeType, rowEnqueued: false, uploadIssued: false}}
         // Reserve synchronously; use the existing upload lane, not a selection queue.
         const preceding = this.imageUpload
@@ -2200,7 +2199,6 @@ export class GeminiLiveController {
           readiness.response = {ok: true}
           readiness.scheduling = "SILENT"
         }
-        if (job.retryReserved && job.phase !== "dispatched") image.retryUsed = false
         this.photoJob.phase = "filing"
         if (this.photoTimer) clearTimeout(this.photoTimer)
         this.photoTimer = null
@@ -2470,7 +2468,7 @@ export class GeminiLiveController {
   }
 
   private disconnectToolBatch(): void {
-    this.quietOutput = null
+    if (!this.toolBatch.photo) this.quietOutput = null
     for (const [id, call] of this.pendingToolCalls) {
       if (call.name === "nothing_to_add") this.pendingToolCalls.delete(id)
     }
@@ -2839,8 +2837,6 @@ export class GeminiLiveController {
     await this.persistJournal()
     this.publishPhotoRetry()
     this.clearPersistenceErrorIfSynced()
-    if (![...this.pendingToolCalls.values()].some(call => call.name === "save_photo_caption")) this.requestSpokenPhotoDescription()
-    this.finishPhotoDrainIfAcknowledged()
   }
 
   private requestSpokenPhotoDescription(): void {
@@ -3028,7 +3024,7 @@ export class GeminiLiveController {
         (image.caption === undefined || (selected !== undefined && selected.rowEnqueued === false)) && image.assistantSequence === undefined) ||
         (parts.length === 3 && parts[0] === "mentra_media" && !parts.includes(".."))) &&
       typeof image.providerSent === "boolean" &&
-      Number.isSafeInteger(image.generation) && typeof image.sessionId === "string" &&
+      typeof image.sessionId === "string" &&
       (image.imageSequence === undefined || (Number.isSafeInteger(image.imageSequence) && image.imageSequence > 0)) &&
       (image.caption === undefined || (typeof image.caption === "string" && image.caption.length > 0)) &&
       (image.assistantSequence === undefined || (Number.isSafeInteger(image.assistantSequence) && image.assistantSequence > 0)) &&
@@ -3104,7 +3100,6 @@ export class GeminiLiveController {
     for (const image of this.pendingImages) {
       if (!image.caption) {
         image.providerSent = false
-        image.generation = this.generation
         image.sessionId = this.sessionId
       }
     }

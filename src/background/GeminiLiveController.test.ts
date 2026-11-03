@@ -752,7 +752,7 @@ describe("GeminiLiveController", () => {
     } finally { await h.controller.stop() }
   })
 
-  test("Thinking private photo work cannot leak a spoken preamble before its closing quiet choice", async () => {
+  test.each(["none", "close", "goAway"] as const)("Thinking private photo work stays private through %s", async cause => {
     const storage = new FakeStorage()
     const h = harness({storage})
     await start(h, "continuous", "", THINKING)
@@ -770,13 +770,23 @@ describe("GeminiLiveController", () => {
       provisionalCaption(socket, "private-caption", "A fictional green square.", "private-save")
       socket.message({serverContent: {turnComplete: true, interactionStatus: "IN_PROGRESS"}})
       await waitFor(() => functionResponses(socket).some(reply => reply.id === "private-save"))
-      socket.message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]},
+      let continuation = socket
+      if (cause !== "none") {
+        if (cause === "close") socket.close()
+        else socket.message({goAway: {timeLeft: "0.1s"}})
+        await waitFor(() => h.sockets.length === 2)
+        continuation = h.sockets[1]
+        continuation.open()
+        continuation.message({setupComplete: {}})
+        await waitFor(() => h.reconnecting.at(-1) === false)
+      }
+      continuation.message({serverContent: {modelTurn: {parts: [{inlineData: {data: "AQABAA=="}}]},
         outputTranscription: {text: "I'm working on the caption for the latest image you sent."}}})
-      await providerReady(socket, "private-finish", true, "IN_PROGRESS")
-      socket.message({serverContent: {turnComplete: true, interactionStatus: "IDLE"}})
+      await providerReady(continuation, "private-finish", true, "IN_PROGRESS")
+      continuation.message({serverContent: {turnComplete: true, interactionStatus: "IDLE"}})
       expect(h.audio).toEqual([])
-      socket.message({voiceActivity: {type: "ACTIVITY_START"}})
-      socket.message({voiceActivity: {type: "ACTIVITY_END"}})
+      continuation.message({voiceActivity: {type: "ACTIVITY_START"}})
+      continuation.message({voiceActivity: {type: "ACTIVITY_END"}})
       completeTurn(h, "What did you notice?", "A green square.")
       expect(h.audio).toEqual(["AQABAA=="])
       await h.controller.stop()
@@ -2122,6 +2132,54 @@ describe("GeminiLiveController", () => {
     expect(h.errors).toEqual([])
   })
 
+  for (const model of [LIVE, THINKING]) {
+    test.each([false, true])(`Stop fences a reconnected photo continuation (${model}, native completion=%s)`, async completes => {
+      let deadline = Date.now() + 30_000
+      const h = harness({storage: new FakeStorage(), getStopDeadline: () => deadline})
+      await start(h, "continuous", "", model)
+      let stopping: Promise<void> | undefined
+      try {
+        completeTurn(h, "First fictional question.", "First answer.")
+        completeTurn(h, "Second fictional question.", "Second answer.")
+        await h.controller.sendImage({imageId: "resumed-caption", mimeType: "image/png", data: "AQID"})
+        await providerReady(h.sockets[0], "resumed-settle", true, "IN_PROGRESS")
+        await providerReady(h.sockets[0], "resumed-job", true, "IN_PROGRESS")
+        provisionalCaption(h.sockets[0], "resumed-caption", "A fictional green square.")
+        h.sockets[0].message({serverContent: {turnComplete: true, interactionStatus: "IN_PROGRESS"}})
+        await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === "caption-resumed-caption"))
+        h.sockets[0].message({sessionResumptionUpdate: {resumable: true, newHandle: "resumed-caption-handle"}})
+        h.sockets[0].close()
+        await waitFor(() => h.sockets.length === 2)
+        const socket = h.sockets[1]
+        socket.open()
+        socket.message({setupComplete: {}})
+        await waitFor(() => h.reconnecting.at(-1) === false)
+        stopping = h.controller.stop(true)
+        await new Promise(resolve => setTimeout(resolve, 0))
+        expect(socket.sent.some(value => value.includes("Reflect briefly"))).toBe(false)
+        expect(h.requests.some(request => request.url.endsWith("/end"))).toBe(false)
+        if (completes) {
+          socket.message({serverContent: {turnComplete: true, ...(model === THINKING ? {interactionStatus: "IDLE"} : {})}})
+          await waitFor(() => socket.sent.some(value => value.includes("Reflect briefly")))
+          socket.message({serverContent: {outputTranscription: {text: "NO_SUMMARY"}, turnComplete: true,
+            ...(model === THINKING ? {interactionStatus: "IDLE"} : {})}})
+        } else {
+          deadline = Date.now() - 1
+          h.controller.refreshStopDeadline()
+        }
+        await stopping
+        expect(h.finalizations).toHaveLength(1)
+        expect(h.errors).toEqual([])
+        expect(h.requests.filter(request => request.url.endsWith("/end"))).toHaveLength(1)
+        if (!completes) expect(socket.sent.some(value => value.includes("Reflect briefly"))).toBe(false)
+      } finally {
+        deadline = Date.now() - 1
+        h.controller.refreshStopDeadline()
+        await (stopping ?? h.controller.stop())
+      }
+    })
+  }
+
   test.each(["lookup", "prepared"] as const)("a late caption supersedes a retry held at %s", async phase => {
     let releaseLookup!: () => void
     let releaseFiling!: () => void
@@ -2150,7 +2208,6 @@ describe("GeminiLiveController", () => {
       h.controller.resumeBackgroundWork()
       await waitFor(() => functionResponses(h.sockets[0]).some(response => response.id === "retry-ready"))
       expect(h.sockets[0].sent.filter(value => photoTask(JSON.parse(value)))).toHaveLength(1)
-      expect(JSON.parse(storage.values.get(JOURNAL_KEY)!).pendingImages[0].retryUsed).not.toBe(true)
       expect(functionResponses(h.sockets[0]).find(response => response.id === "retry-ready"))
         .toMatchObject({response: {ok: true}, scheduling: "SILENT"})
       releaseFiling()
@@ -4048,6 +4105,42 @@ describe("GeminiLiveController", () => {
     } finally {
       release()
       await h.controller.stop()
+    }
+  })
+
+  test.each(["continuous", "manual"] as const)("Stop drains a photo after retiring an unanswered recall (%s)", async mode => {
+    let release!: () => void
+    let deadline = Date.now() + 30_000
+    const h = harness({storage: new FakeStorage(), recallGate: new Promise<void>(resolve => {release = resolve}),
+      getStopDeadline: () => deadline})
+    await start(h, mode)
+    let stopping: Promise<void> | undefined
+    try {
+      admitRequest(h, mode)
+      h.sockets[0].message({toolCall: {functionCalls: [
+        {id: "photo-stop-recall", name: "recall_memory", args: {query: "a fictional question"}},
+      ]}, serverContent: {inputTranscription: {text: "A fictional question."}, turnComplete: true}})
+      await h.controller.sendImage({imageId: "retired-request-photo", mimeType: "image/png", data: "AQID"})
+      const invited = () => h.sockets[0].sent.some(value => value.includes("nokoru"))
+      expect(invited()).toBe(false)
+      stopping = h.controller.stop(true)
+      release()
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === "photo-stop-recall"))
+      expect(functionResponses(h.sockets[0]).find(reply => reply.id === "photo-stop-recall")?.scheduling).toBe("SILENT")
+      await waitFor(invited, 3_000)
+      await completePhotoCaption(h.sockets[0], "retired-request-photo", "A fictional amber circle.")
+      await waitFor(() => functionResponses(h.sockets[0]).some(reply => reply.id === "caption-retired-request-photo"))
+      await finishPhotoQueue(h.sockets[0])
+      await stopping
+      expect(h.finalizations).toHaveLength(1)
+      expect(h.controller.pendingPhotoIds).toEqual([])
+      expect(h.audio).toEqual([])
+      expect(h.errors).toEqual([])
+    } finally {
+      release()
+      deadline = Date.now() - 1
+      h.controller.refreshStopDeadline()
+      await (stopping ?? h.controller.stop())
     }
   })
 
@@ -8501,6 +8594,7 @@ describe("GeminiLiveController", () => {
   })
 
   test("an unrelated failed photo does not suppress graceful Stop reflection", async () => {
+    const errors = spyOn(console, "error").mockImplementation(() => {})
     const storage = new FakeStorage()
     storage.values.set(JOURNAL_KEY, JSON.stringify({version: 1,
       scope: {userId: CONFIG.userId, soulId: CONFIG.soulId, deviceSessionId: CONFIG.deviceSessionId},
@@ -8513,8 +8607,13 @@ describe("GeminiLiveController", () => {
     expect(h.photoRetryChanges.at(-1)).toBe(true)
     completeTurn(h, "one", "answer one")
     completeTurn(h, "two", "answer two")
+    h.sockets[0].message({toolCall: {functionCalls: [
+      {id: "parked-photo-recall", name: "recall_memory", args: {query: "a fictional memory"}},
+    ]}, serverContent: {turnComplete: true}})
+    await waitFor(() => h.sockets[0].sent.some(value => value.includes("nokoru")))
     const stopping = h.controller.stop(true)
     try {
+      h.sockets[0].message({serverContent: {turnComplete: true}})
       await waitFor(() => h.sockets[0].sent.some(value => textTurn(JSON.parse(value))))
       h.sockets[0].message({serverContent: {
         outputTranscription: {text: "A reflection despite the failed upload."},
@@ -8530,9 +8629,11 @@ describe("GeminiLiveController", () => {
       expect(h.requests.some(request => request.url.endsWith("/snapshot/replay"))).toBe(false)
       expect(h.requests.some(request => request.url.endsWith("/snapshot/finalize"))).toBe(false)
       expect(h.errors).toEqual([])
+      expect(errors.mock.calls.some(args => String(args[0]).includes("Photo caption drain ended"))).toBe(false)
     } finally {
       h.sockets[0].message({serverContent: {turnComplete: true}})
       await stopping
+      errors.mockRestore()
     }
   })
 

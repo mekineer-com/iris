@@ -184,8 +184,8 @@ available at expiry is retained through `sitting_summary`, without the
 transcript-only `status` field.
 Continuous Stop flushes existing
 audio with 1.8 seconds of real-time-paced silence and `audioStreamEnd`, then
-waits for the preceding response's native completion before a new image
-turn. `audioStreamEnd` alone cannot release that fence. The existing flush owner
+waits for the preceding response's native completion before a new photo
+task. `audioStreamEnd` alone cannot release that fence. The existing flush owner
 can wait for replacement readiness within the same drain cap. Manual
 Stop does not send an unsent take. Replay cannot deliver a task mid-flush or
 after the drain closes. An already-delivered task is not resent merely
@@ -299,8 +299,10 @@ call gets the text "No photo task is ready. Say 'Done' once to finish this
 private exchange." Iris then suppresses that private reply's audio and
 transcript locally; the same applies to a background photo reply (caption
 receipt or dispatched job) with no live human request. Suppression ends at
-native activity start, spoken-request admission, interruption, disconnect or
-interaction IDLE. A memory result arriving first releases it and turns already
+native activity start, spoken-request admission, interruption or interaction
+IDLE; disconnect preserves it for an outstanding photo continuation. Stop waits
+for that continuation within its existing deadline, even after reconnect.
+A memory result arriving first releases it and turns already
 queued quiet replies into plain `{"ok":true}`.
 
 Start's returned model is authoritative.
