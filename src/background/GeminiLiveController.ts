@@ -36,6 +36,7 @@ export type GeminiCallbacks = {
   onUsage: (totalTokens: number) => void
   onDurationWarning: () => void
   onPhotoRetryChange: (pending: boolean) => void
+  onPhotoFilingChange?: () => void
   onPhotoCaption?: (caption: PhotoCaption, acknowledgmentOnly: boolean) => void
   onPersistenceError: (message: string | null) => void
   onError: (error: Error) => void
@@ -895,7 +896,6 @@ export class GeminiLiveController {
 
     if (pending.mediaRef && pending.mediaRef !== mediaRef) throw new Error("OpenAlma snapshot media reference changed")
     pending.mediaRef = mediaRef
-    pending.speakDescription = image.speakDescription === true
     pending.generation = this.generation
     pending.sessionId = this.sessionId
     await this.persistJournal()
@@ -925,7 +925,6 @@ export class GeminiLiveController {
       throw new Error(this.activityPauseReason || "Photo send cancelled")
     }
     pending.providerSent = true
-    pending.retryRequested = false
     this.publishPhotoRetry()
     this.enqueueImageMarker(pending)
     await this.persistJournal()
@@ -933,6 +932,7 @@ export class GeminiLiveController {
   }
 
   async retryImage(imageId: string): Promise<void> {
+    if (this.activityPauseReason) throw new Error(this.activityPauseReason)
     const image = this.pendingImages.find(image => image.imageId === imageId)
     if (!image) throw new Error("No photo is waiting to retry")
     if (this.photoJob && this.photoJob.image !== image) throw new Error("Wait for the current photo to finish before retrying")
@@ -948,9 +948,6 @@ export class GeminiLiveController {
       }
       await this.scheduleImageFinalize(true, image)
       return
-    }
-    if (image.providerSent && !image.retryRequested) {
-      throw new Error("No photo is waiting to retry")
     }
     image.providerSent = false
     image.retryUsed = false
@@ -1161,6 +1158,7 @@ export class GeminiLiveController {
     if (this.activityPauseReason) throw new Error(this.activityPauseReason)
     const filed = this.filingCaption(replay.filing)
     if (filed !== null) {
+      if (replay.filing.status === "failed") this.callbacks.onPhotoFilingChange?.()
       this.acceptedCaptions.set(image.imageId, filed)
       this.callbacks.onPhotoCaption?.({imageId: image.imageId, caption: filed, durable: true}, false)
       this.removePendingImage(image)
@@ -1226,11 +1224,24 @@ export class GeminiLiveController {
         user_id: this.config.userId, soul_id: this.config.soulId, image_id: pending.imageId,
       }, SNAPSHOT_TIMEOUT_MS).catch(() => null)
       if (generation !== this.generation || !this.pendingImages.includes(pending) || this.stopping) return
+      if (response?.status === 404 && (await response.clone().json().catch(() => null))?.detail === "Mentra snapshot not found") {
+        if (generation !== this.generation || !this.pendingImages.includes(pending) || this.stopping) return
+        this.removePendingImage(pending)
+        await this.persistJournal()
+        this.publishPhotoRetry()
+        throw new Error("Photo did not reach OpenAlma. Choose the photo again.")
+      }
       if (!response?.ok) { await this.requestPhotoRetry(pending); return }
       const replay = await response.json().catch(() => null)
       if (generation !== this.generation || !this.pendingImages.includes(pending) || this.stopping) return
       const filing = this.filingCaption(replay?.filing)
       if (filing !== null) {
+        if (replay.filing.status === "failed") {
+          this.callbacks.onPhotoFilingChange?.()
+          const retried = await this.retryFailedFiling(pending.imageId)
+          if (generation !== this.generation || !this.pendingImages.includes(pending) || this.stopping) return
+          if (!retried) { await this.requestPhotoRetry(pending); return }
+        }
         this.acceptedCaptions.set(pending.imageId, filing)
         this.callbacks.onPhotoCaption?.({imageId: pending.imageId, caption: filing, durable: true}, false)
         this.removePendingImage(pending)
@@ -2149,11 +2160,12 @@ export class GeminiLiveController {
         this.failToolCall(id, call, `OpenAlma photo filing lookup failed (${response.status})`)
         return
       }
-      if (response?.ok) {
+      if (response.ok) {
         const replay = await response.json()
         if (!this.isCurrentToolCall(id, call)) return
         const caption = this.filingCaption(replay.filing)
         if (caption !== null) {
+          if (replay.filing.status === "failed") this.callbacks.onPhotoFilingChange?.()
           accepted = caption
           this.acceptedCaptions.set(imageId, caption)
         }
@@ -2166,7 +2178,7 @@ export class GeminiLiveController {
       return
     }
     const image = this.pendingImages.find(image => image.imageId === imageId)
-    if (!image?.mediaRef || image.imageId !== imageId || (!image.captionRequested && !image.caption) ||
+    if (!image?.mediaRef || (!image.captionRequested && !image.caption) ||
         (image.caption !== undefined && image.caption !== caption)) {
       this.completeToolCall(id, call, {ok: false, status: "invalid", message: "Photo does not match the pending original."}, false)
       return
@@ -2751,11 +2763,9 @@ export class GeminiLiveController {
     if (pending.selected && !this.selectedMediaCommitted.has(pending)) {
       return this.imageUpload ? Promise.resolve() : this.startSelectedPromotion(pending)
     }
-    if (this.imageFinalization) return this.imageFinalization.image === pending
-      ? this.imageFinalization.promise
-      : this.imageFinalization.promise.then(() => this.scheduleImageFinalize(userRequested, pending))
+    if (this.imageFinalization) return this.imageFinalization.promise.then(() => this.scheduleImageFinalize(userRequested, pending))
     this.imageFinalizationExplicit = userRequested
-    const finalization = this.finalizePendingImage(pending).finally(() => {
+    const finalization = this.finalizePendingImage(pending, userRequested).finally(() => {
       if (this.imageFinalization?.promise === finalization) {
         this.imageFinalization = null
         this.imageFinalizationExplicit = false
@@ -2770,7 +2780,19 @@ export class GeminiLiveController {
     return finalization
   }
 
-  private async finalizePendingImage(pending: PendingImage): Promise<void> {
+  private async retryFailedFiling(imageId: string): Promise<boolean> {
+    try {
+      const response = await this.request(`/integration/mentra/photos/${encodeURIComponent(imageId)}/retry`, {
+        user_id: this.config.userId, soul_id: this.config.soulId,
+      })
+      const result = await response.json()
+      const retried = response.ok && result?.ok === true && result.durable === true && result.failed !== true
+      if (retried) this.callbacks.onPhotoFilingChange?.()
+      return retried
+    } catch { return false }
+  }
+
+  private async finalizePendingImage(pending: PendingImage, userRequested: boolean): Promise<void> {
     const generation = this.generation
     if (this.photoJob?.image !== pending) {
       this.callbacks.onPhotoCaption?.({imageId: pending.imageId, caption: pending.caption!, durable: false}, false)
@@ -2798,15 +2820,17 @@ export class GeminiLiveController {
       await this.requestPhotoRetry(pending)
       return
     }
-    const result = await response.json().catch(() => null) as {ok?: boolean; durable?: boolean} | null
+    const result = await response.json().catch(() => null) as {ok?: boolean; durable?: boolean; failed?: boolean} | null
     if (generation !== this.generation || !this.pendingImages.includes(pending)) return
-    if (result?.ok !== true) {
+    if (result?.ok !== true || result.durable !== true) {
       await this.requestPhotoRetry(pending)
       return
     }
-    if (result.durable !== true) {
-      await this.requestPhotoRetry(pending)
-      return
+    if (result.failed === true) {
+      this.callbacks.onPhotoFilingChange?.()
+      const retried = userRequested && await this.retryFailedFiling(pending.imageId)
+      if (generation !== this.generation || !this.pendingImages.includes(pending)) return
+      if (!retried) { await this.requestPhotoRetry(pending); return }
     }
     this.acceptedCaptions.set(pending.imageId, pending.caption!)
     this.callbacks.onPhotoCaption?.({imageId: pending.imageId, caption: pending.caption!, durable: true}, true)
@@ -3387,6 +3411,7 @@ export class GeminiLiveController {
         const previousPause = this.activityPauseReason
         this.activityPauseReason = typeof body?.pause_reason === "string" && body.pause_reason
           ? `${this.config.soulId} is paused. Retry in OpenAlma launcher.` : null
+        if (typeof body?.background_error === "string" && body.background_error) this.callbacks.onPhotoFilingChange?.()
         if (this.activityPauseReason) {
           this.callbacks.onPersistenceError(this.activityPauseReason)
         } else if (typeof body?.background_error === "string" && body.background_error) {

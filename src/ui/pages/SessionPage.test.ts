@@ -571,11 +571,48 @@ describe("SessionPage state projection", () => {
     await new Promise(resolve => setTimeout(resolve, 0))
   })
 
+  test.each([false, true])("an unrelated parked photo does not hide new preview actions (preview=%s)", async preview => {
+    const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+      connection: "listening", photoRetryPending: true, pendingPhotoIds: ["older-photo"]}
+    const uploads: unknown[] = []
+    const render = renderPage(snapshot, async (channel, payload) => {
+      if (channel === "openalma:reserve-image") return {startGeneration: payload.startGeneration, imageId: "new-photo"}
+      if (channel === "openalma:image") uploads.push(payload)
+      return {ok: true}
+    })
+    if (preview) labelledCheckbox(render(), "Preview before send").props.onChange({target: {checked: true}})
+    const picker = () => nodes(render()).find(node => node.props?.type === "file" && !node.props.capture)
+    picker().props.onClick()
+    await picker().props.onChange({currentTarget: {files: [
+      new File([preview ? "small" : "x".repeat(1_048_577)], "fictional.jpg", {type: "image/jpeg"}),
+    ], value: ""}})
+    const button = (text: string) => nodes(render()).find(node => node.type === "button" && node.props.children === text)
+    expect(button("Send")).toBeDefined()
+    expect(button("Retake")).toBeDefined()
+    snapshot.pendingPhotoIds.push("new-photo")
+    expect(button("Send")).toBeUndefined()
+    expect(button("Retake")).toBeUndefined()
+    snapshot.photoRetryPending = false
+    expect(button("Send")).toBeDefined()
+    expect(button("Retake")).toBeDefined()
+    snapshot.photoRetryPending = true
+    snapshot.pendingPhotoIds.pop()
+    await button("Send").props.onClick()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(uploads).toHaveLength(1)
+  })
+
   test.each(["Retake", "Stop"])("discarding a failed photo with %s clears its retry message", async action => {
-    const render = renderPage({configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
-      connection: "listening", photoRetryPending: false, pendingPhotoIds: []}, async (channel, payload) => {
+    const snapshot = {configured: true, soulId: "Quill", souls: ["Quill"], soulConfirmed: true,
+      connection: "listening", photoRetryPending: false, pendingPhotoIds: [] as string[]}
+    const discards: unknown[] = []
+    const render = renderPage(snapshot, async (channel, payload) => {
       if (channel === "openalma:reserve-image") return {startGeneration: payload.startGeneration, imageId: "failed-photo"}
-      if (channel === "openalma:image") throw new Error("Fictional photo upload failure")
+      if (channel === "openalma:image") {
+        snapshot.pendingPhotoIds = [payload.imageId]
+        throw new Error("Fictional photo upload failure")
+      }
+      if (channel === "openalma:pending-image") discards.push(payload)
       return {ok: true}
     })
     nodes(render()).find(node => node.props?.type === "file" && !node.props.capture).props.onClick()
@@ -584,6 +621,7 @@ describe("SessionPage state projection", () => {
     }})
     expect(JSON.stringify(render())).toContain("Photo ready to retry")
     await nodes(render()).find(node => node.props?.children === action).props.onClick()
+    expect(discards).toEqual(action === "Retake" ? [{action: "discard", imageId: "failed-photo"}] : [])
     expect(nodes(render()).some(node => node.props?.children === "Retry")).toBe(false)
     expect(JSON.stringify(render())).not.toContain("Photo ready to retry")
   })

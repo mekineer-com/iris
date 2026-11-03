@@ -809,12 +809,15 @@ export default function SessionPage() {
           </label>
         </div>
       ) : null}
-      {pendingPhoto && !photoRetryPending ? (
+      {pendingPhoto && !(photoRetryPending && snapshot?.pendingPhotoIds.includes(pendingPhoto.imageId)) ? (
         <div className="image-review">
           <button type="button" disabled={!cameraEnabled || imagePending || !voiceReady} onClick={() => void submitPhoto(pendingPhoto)}>
             {imagePending ? "Sending..." : imageStatus ? "Retry" : "Send"}
           </button>
-          <button type="button" disabled={imagePending} onClick={() => discardPhoto()}>Retake</button>
+          <button type="button" disabled={imagePending} onClick={() => {
+            if (snapshot?.pendingPhotoIds.includes(pendingPhoto.imageId)) void handleStoredPhoto("discard", pendingPhoto.imageId)
+            discardPhoto()
+          }}>Retake</button>
         </div>
       ) : null}
       {imageStatus ? <p role="status">{imageStatus}</p> : null}

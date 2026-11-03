@@ -1588,7 +1588,7 @@ describe("SessionController", () => {
   })
 
   test.each(["retry", "discard"])("local parked photo %s targets its ID without touching another photo or server recovery", async action => {
-    const failedPhotos = ["parked-a", "server-c"]
+    const failedPhotos = ["server-c"]
     const actions: Array<{url: string; body: unknown}> = []
     const h = setup({failedPhotos, fetchFn: (async (url, init) => {
       if (String(url).includes("/photos/")) {
@@ -1602,7 +1602,7 @@ describe("SessionController", () => {
     h.live.pendingPhotoIds = ["parked-a", "local-b"]
     h.live.photoRetry(true)
     expect(lastSnapshot(h.session)).toMatchObject({
-      photoRetryPending: true, pendingPhotoIds: ["parked-a", "local-b"], failedPhotos: ["parked-a", "server-c"],
+      photoRetryPending: true, pendingPhotoIds: ["parked-a", "local-b"], failedPhotos: ["server-c"],
     })
     await h.session.handlers["openalma:pending-image"]({action, imageId: "parked-a"})
     expect(h.live.imageRetryIds).toEqual(action === "retry" ? ["parked-a"] : [])
@@ -1615,8 +1615,80 @@ describe("SessionController", () => {
       body: {user_id: CONFIG.userId, soul_id: CONFIG.soulId}}])
     expect(h.live.imageRetryIds).toEqual(action === "retry" ? ["parked-a"] : [])
     expect(h.live.imageDiscardIds).toEqual(action === "discard" ? ["parked-a"] : [])
-    expect(lastSnapshot(h.session)).toMatchObject({pendingPhotoIds: ["parked-a", "local-b"], failedPhotos: ["parked-a"]})
+    expect(lastSnapshot(h.session)).toMatchObject({pendingPhotoIds: ["parked-a", "local-b"], failedPhotos: []})
     await h.session.handlers["openalma:stop"]({})
+  })
+
+  test.each([["retry", 200], ["retry", 503], ["discard", 200], ["discard", 503]] as const)(
+    "one %s handles an overlapping local and server failure (status=%s)", async (action, status) => {
+    const failedPhotos = ["shared-photo"]
+    const actions: string[] = []
+    const h = setup({failedPhotos, fetchFn: (async url => {
+      if (String(url).includes("/photos/")) {
+        actions.push(String(url))
+        if (status === 200) failedPhotos.splice(0)
+        return Response.json({ok: status === 200}, {status})
+      }
+      return Response.json({ok: true, souls: [CONFIG.soulId]})
+    }) as typeof fetch})
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    try {
+      h.live.pendingPhotoIds = ["shared-photo", "another-photo"]
+      h.live.activityPauseReason = "Memory processing is paused."
+      const acting = h.session.handlers["openalma:pending-image"]({action, imageId: "shared-photo"})
+      if (status === 200) await acting
+      else await expect(acting).rejects.toThrow(`Photo ${action} failed (${status})`)
+      expect(actions).toEqual([`${CONFIG.baseUrl}/integration/mentra/photos/shared-photo/${action}`])
+      expect(h.live.imageRetryIds).toEqual([])
+      expect(h.live.imageDiscardIds).toEqual(status === 200 ? ["shared-photo"] : [])
+      expect(lastSnapshot(h.session)?.failedPhotos).toEqual(status === 200 ? [] : ["shared-photo"])
+    } finally { await h.session.handlers["openalma:stop"]({}) }
+  })
+
+  test("a live filing error refreshes the failed-photo controls without reopening Iris", async () => {
+    const failedPhotos: string[] = []
+    const h = setup({failedPhotos})
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    try {
+      failedPhotos.push("late-failure")
+      h.live.callbacks.onPhotoFilingChange?.()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(lastSnapshot(h.session)?.failedPhotos).toEqual(["late-failure"])
+    } finally { await h.session.handlers["openalma:stop"]({}) }
+  })
+
+  test("a failed upload exposes its journal ID without hiding the draft's byte resend", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    h.live.sendImage = async () => {
+      h.live.pendingPhotoIds = ["unconfirmed-photo"]
+      throw new Error("Fictional lost upload response")
+    }
+    try {
+      await expect(h.session.handlers["openalma:image"]({imageId: "unconfirmed-photo", mimeType: "image/png", data: "AQID"}))
+        .rejects.toThrow("Fictional lost upload response")
+      expect(lastSnapshot(h.session)).toMatchObject({pendingPhotoIds: ["unconfirmed-photo"], photoRetryPending: false})
+    } finally { await h.session.handlers["openalma:stop"]({}) }
+  })
+
+  test("an older photo-status response cannot restore a cleared failed filing", async () => {
+    const h = setup()
+    await h.session.handlers["openalma:start"]({mode: "continuous"})
+    const pending: Array<(value: Response) => void> = []
+    Reflect.set(h.controller, "fetchFn", () => new Promise<Response>(resolve => pending.push(resolve)))
+    try {
+      h.live.callbacks.onPhotoFilingChange?.()
+      h.live.callbacks.onPhotoFilingChange?.()
+      expect(pending).toHaveLength(2)
+      pending[1](Response.json({failed_photos: []}))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      pending[0](Response.json({failed_photos: ["obsolete-failure"]}))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(lastSnapshot(h.session)?.failedPhotos).toEqual([])
+    } finally {
+      Reflect.set(h.controller, "fetchFn", async () => Response.json({failed_photos: []}))
+      await h.session.handlers["openalma:stop"]({})
+    }
   })
   test("does no network work until a phone-local profile is saved", async () => {
     const session = new FakeSession()

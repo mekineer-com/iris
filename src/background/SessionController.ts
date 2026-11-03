@@ -96,6 +96,7 @@ export class SessionController {
   private photoCaptions: SessionSnapshot["photoCaptions"] = []
   private failedPhotos: string[] = []
   private photoStatusError: string | null = null
+  private photoStatusGeneration = 0
   private manualAudio: string[] = []
   private manualAudioBytes = 0
   private manualMicSource: MicSource | undefined
@@ -295,19 +296,24 @@ export class SessionController {
         await this.preferencesLoaded
         if (action !== "retry" && action !== "discard") throw new Error("Unknown pending photo action")
         if (typeof imageId !== "string" || !imageId) throw new Error("Choose a photo to retry or discard")
-        if (this.liveController?.pendingPhotoIds.includes(imageId)) {
-          if (action === "retry") await this.liveController.retryImage(imageId)
-          else await this.liveController.discardImage(imageId)
+        const controller = this.liveController
+        if (controller?.pendingPhotoIds.includes(imageId) && !this.failedPhotos.includes(imageId)) {
+          if (action === "retry") await controller.retryImage(imageId)
+          else await controller.discardImage(imageId)
           return {ok: true as const}
         }
         if (!this.failedPhotos.includes(imageId)) throw new Error("Unknown failed photo")
         const config = this.currentConfig()
         const soulId = this.soulId
+        const generation = this.startGeneration
         const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/photos/${encodeURIComponent(imageId)}/${action}`, {
           method: "POST", signal: timeoutSignal(10_000), headers: {"Content-Type": "application/json"},
           body: JSON.stringify({user_id: config.userId, soul_id: soulId}),
         })
         if (!response.ok) throw new Error(`Photo ${action} failed (${response.status})`)
+        if (generation === this.startGeneration && controller && controller === this.liveController && controller.pendingPhotoIds.includes(imageId)) {
+          await controller.discardImage(imageId)
+        }
         if (this.soulId === soulId && this.config?.baseUrl === config.baseUrl) await this.refreshFailedPhotos()
         return {ok: true as const}
       }),
@@ -485,7 +491,7 @@ export class SessionController {
         catch (error) {
           if (error instanceof PhotoUploadConflict) return {ok: false as const, conflict: true as const}
           throw error
-        }
+        } finally { this.pushSnapshot() }
         return {ok: true as const}
       }),
     )
@@ -726,6 +732,9 @@ export class SessionController {
           onPhotoRetryChange: (pending) => {
             this.photoRetryPending = pending
             this.pushSnapshot()
+          },
+          onPhotoFilingChange: () => {
+            if (generation === this.startGeneration) void this.refreshFailedPhotos()
           },
           onPhotoCaption: (caption, acknowledgmentOnly) => {
             // Stop advances the generation before its still-owned caption drain.
@@ -1362,8 +1371,10 @@ export class SessionController {
     const config = this.config
     const soulId = this.soulId
     const generation = this.startGeneration
+    const statusGeneration = ++this.photoStatusGeneration
     const query = soulId ? `user_id=${encodeURIComponent(config.userId)}&soul_id=${encodeURIComponent(soulId)}` : ""
-    const current = () => this.soulId === soulId && this.config === config && generation === this.startGeneration
+    const current = () => this.soulId === soulId && this.config === config && generation === this.startGeneration &&
+      statusGeneration === this.photoStatusGeneration
     try {
       const response = await this.fetchFn(`${config.baseUrl}/integration/mentra/status?${query}`, {
         signal: timeoutSignal(10_000),

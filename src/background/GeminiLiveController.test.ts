@@ -174,6 +174,8 @@ function harness(
     replayStatuses?: number[]
     replayBodies?: unknown[]
     finalizeStatuses?: number[]
+    finalizeBodies?: Array<{ok: boolean; durable: boolean; queued: boolean; failed?: boolean}>
+    filingRetryStatus?: number
     finalizeGates?: Promise<void>[]
     recallGate?: Promise<void>
     recallStatus?: number
@@ -282,9 +284,13 @@ function harness(
     if (url.endsWith("/snapshot/finalize")) {
       if (finalizeGates.length) await finalizeGates.shift()
       const status = finalizeStatuses.shift() ?? 200
-      const result = {ok: status === 200, durable: status === 200, queued: status === 200}
+      const result = options.finalizeBodies?.shift() ?? {ok: status === 200, durable: status === 200, queued: status === 200}
       finalizations.push(result)
       return Response.json(result, {status})
+    }
+    if (url.includes("/photos/") && url.endsWith("/retry")) {
+      const status = options.filingRetryStatus ?? 200
+      return Response.json({ok: status === 200, durable: status === 200, queued: status === 200}, {status})
     }
     if (url.endsWith("/snapshot/replay")) {
       await replayGates.shift()
@@ -325,6 +331,7 @@ function harness(
         durationWarnings += 1
       },
       onPhotoRetryChange: (pending) => photoRetryChanges.push(pending),
+      onPhotoFilingChange: () => events.push("photoFilingChange"),
       onPhotoCaption: (caption, acknowledgmentOnly) => photoCaptions.push({...caption, acknowledgmentOnly}),
       onPersistenceError: (message) => persistenceErrors.push(message),
       onError: (error) => { errors.push(error.message); options.onError?.() },
@@ -5711,6 +5718,102 @@ describe("GeminiLiveController", () => {
     await h.controller.stop()
   })
 
+  test.each([200, 503])("an explicit Retry restarts a failed server filing once (status=%s)", async filingRetryStatus => {
+    const h = harness({storage: new FakeStorage(), filingRetryStatus,
+      finalizeBodies: Array.from({length: 2}, () => ({ok: true, durable: true, queued: false, failed: true}))})
+    await start(h)
+    try {
+      await h.controller.sendImage({imageId: "failed-filing", mimeType: "image/png", data: "AQID"})
+      await completePhotoCaption(h.sockets[0], "failed-filing", "A fictional paper kite.")
+      await waitFor(() => h.photoRetryChanges.at(-1) === true)
+      expect(h.requests.some(request => request.url.includes("/photos/"))).toBe(false)
+      expect(h.events).toContain("photoFilingChange")
+      await h.controller.retryImage("failed-filing")
+      expect(h.requests.filter(request => request.url.endsWith("/photos/failed-filing/retry")).map(request => request.body))
+        .toEqual([{user_id: CONFIG.userId, soul_id: CONFIG.soulId}])
+      expect(h.controller.pendingPhotoIds).toEqual(filingRetryStatus === 200 ? [] : ["failed-filing"])
+    } finally { await h.controller.stop() }
+  })
+
+  test("Retry during the previous failure's journal write waits, then actually retries", async () => {
+    let releaseResponse!: () => void
+    let releaseJournal!: () => void
+    const responseGate = new Promise<void>(resolve => { releaseResponse = resolve })
+    const journalGate = new Promise<void>(resolve => { releaseJournal = resolve })
+    const storage = new FakeStorage()
+    const h = harness({storage, finalizeGates: [responseGate], finalizeStatuses: [503, 200]})
+    await start(h)
+    try {
+      await h.controller.sendImage({imageId: "retry-during-write", mimeType: "image/png", data: "AQID"})
+      await waitPhotoTask(h.sockets[0], "retry-during-write")
+      provisionalCaption(h.sockets[0], "retry-during-write", "A fictional kite.")
+      h.sockets[0].message({serverContent: {turnComplete: true}})
+      await waitFor(() => h.requests.some(request => request.url.endsWith("/snapshot/finalize")))
+      storage.setGate = journalGate
+      releaseResponse()
+      await waitFor(() => h.photoRetryChanges.at(-1) === true)
+      const retrying = h.controller.retryImage("retry-during-write")
+      storage.setGate = null
+      releaseJournal()
+      await retrying
+      expect(h.requests.filter(request => request.url.endsWith("/snapshot/finalize"))).toHaveLength(2)
+      expect(h.controller.pendingPhotoIds).toEqual([])
+    } finally { releaseResponse(); releaseJournal(); storage.setGate = null; await h.controller.stop() }
+  })
+
+  test.each(["Mentra snapshot not found", "Mentra session not found"])("unconfirmed upload recovery distinguishes %s", async detail => {
+    const {storage} = recoveryBackup({pendingTranscripts: [], resumption: null, pendingImages: [
+      {imageId: "unconfirmed-photo", mediaRef: "", providerSent: false, generation: 1, sessionId: "original-sitting", retryRequested: true},
+    ]})
+    const h = harness({storage, replayResponses: [Response.json({detail}, {status: 404})]})
+    await start(h)
+    try {
+      if (detail === "Mentra snapshot not found") {
+        await expect(h.controller.retryImage("unconfirmed-photo")).rejects.toThrow("Choose the photo again")
+        expect(h.controller.pendingPhotoIds).toEqual([])
+        expect(JSON.parse(storage.values.get(JOURNAL_KEY) || '{"pendingImages":[]}').pendingImages).toEqual([])
+      } else {
+        await h.controller.retryImage("unconfirmed-photo")
+        expect(h.controller.pendingPhotoIds).toEqual(["unconfirmed-photo"])
+      }
+    } finally { await h.controller.stop() }
+  })
+
+  test.each([200, 503])("unconfirmed-upload Retry uses a failed filing receipt without recaptioning (status=%s)", async filingRetryStatus => {
+    const {storage} = recoveryBackup({pendingTranscripts: [], resumption: null, pendingImages: [
+      {imageId: "unconfirmed-photo", mediaRef: "", providerSent: false, generation: 1, sessionId: "original-sitting", retryRequested: true},
+    ]})
+    const h = harness({storage, filingRetryStatus, replayBodies: [{
+      media_ref: "mentra_media/test-phone/unconfirmed-photo.png", mime_type: "image/png", data: "AQID",
+      filing: {status: "failed", caption: "A fictional kite.", caption_event_id: "original-sitting:photo:unconfirmed-photo"},
+    }]})
+    await start(h)
+    try {
+      await h.controller.retryImage("unconfirmed-photo")
+      expect(h.requests.filter(request => request.url.endsWith("/photos/unconfirmed-photo/retry"))).toHaveLength(1)
+      expect(h.controller.pendingPhotoIds).toEqual(filingRetryStatus === 200 ? [] : ["unconfirmed-photo"])
+      expect(h.sockets[0].sent.some(value => photoTask(JSON.parse(value)))).toBe(false)
+    } finally { await h.controller.stop() }
+  })
+
+  test("Retry while already paused refuses before changing or replaying a photo", async () => {
+    const {storage} = recoveryBackup({pendingTranscripts: [], resumption: null, pendingImages: [
+      {imageId: "paused-photo", mediaRef: "mentra_media/test-phone/paused-photo.png", providerSent: false,
+        generation: 1, sessionId: "original-sitting", retryRequested: true},
+    ]})
+    const h = harness({storage})
+    await start(h)
+    try {
+      h.controller.activityPauseReason = "Memory processing is paused. Retry in the launcher."
+      const before = storage.values.get(JOURNAL_KEY)
+      await expect(h.controller.retryImage("paused-photo")).rejects.toThrow(h.controller.activityPauseReason)
+      expect(storage.values.get(JOURNAL_KEY)).toBe(before)
+      expect(h.requests.some(request => request.url.endsWith("/snapshot/replay"))).toBe(false)
+      await h.controller.discardImage("paused-photo")
+      expect(h.controller.pendingPhotoIds).toEqual([])
+    } finally { await h.controller.stop() }
+  })
+
   test("Stop retains a pending photo for explicit recovery after the next Start", async () => {
     const storage = new FakeStorage()
     const old = harness({storage, finalizeStatuses: Array(100).fill(503)})
@@ -9309,6 +9412,7 @@ describe("GeminiLiveController", () => {
     const heartbeat = () => Reflect.get(h.controller, "heartbeat").call(h.controller)
     await heartbeat()
     expect(h.persistenceErrors.at(-1)).toBe(message)
+    expect(h.events).toContain("photoFilingChange")
     delete heartbeatBody.background_error
     await heartbeat()
     expect(h.persistenceErrors.at(-1)).toBeNull()
