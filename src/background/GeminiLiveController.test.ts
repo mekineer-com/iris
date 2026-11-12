@@ -9422,13 +9422,14 @@ describe("GeminiLiveController", () => {
     expect(h.errors).toEqual([])
   })
 
-  test.each([["audio", false], ["audio", true], ["content", true]] as const)(
+  test.each([["audio", false], ["audio", true], ["content", true], ["input", true], ["output", true]] as const)(
     "malformed known %s fails before executing a co-packet write (write=%s)", async (malformed, withWrite) => {
     const h = harness()
     await start(h)
     try {
       h.sockets[0].message({
-        serverContent: malformed === "audio" ? {modelTurn: {parts: [{inlineData: {data: "bad"}}]}} : null,
+        serverContent: malformed === "audio" ? {modelTurn: {parts: [{inlineData: {data: "bad"}}]}}
+          : malformed === "content" ? null : {[`${malformed}Transcription`]: {languageCode: "en"}},
         ...(withWrite ? {toolCall: {functionCalls: [
           {id: "malformed-packet-write", name: "save_working_thought", args: {thought: "A fictional beacon."}},
         ]}} : {}),
@@ -9437,7 +9438,8 @@ describe("GeminiLiveController", () => {
       expect(h.requests.some(request => request.url.endsWith("/working-thought"))).toBe(false)
       expect(functionResponses(h.sockets[0])).toEqual([])
       expect(h.errors).toEqual([malformed === "audio"
-        ? "Gemini returned malformed audio" : "Gemini returned malformed server content"])
+        ? "Gemini returned malformed audio" : malformed === "content" ? "Gemini returned malformed server content"
+        : `Gemini returned malformed ${malformed} transcription: {"languageCode":"en"}`])
     } finally {
       await h.controller.stop()
     }

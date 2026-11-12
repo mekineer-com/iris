@@ -1870,7 +1870,7 @@ export class GeminiLiveController {
   private transcriptText(value: unknown, label: string): string {
     if (value === undefined) return ""
     if (!value || typeof value !== "object" || typeof (value as {text?: unknown}).text !== "string") {
-      throw new Error(`Gemini returned malformed ${label} transcription`)
+      throw new Error(`Gemini returned malformed ${label} transcription: ${JSON.stringify(value).slice(0, 200)}`)
     }
     return (value as {text: string}).text
   }
